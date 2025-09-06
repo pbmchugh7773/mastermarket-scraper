@@ -90,7 +90,7 @@ jobs:
       
       - name: 📊 Upload Results Summary
         if: always()
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: scraping-logs-${{ matrix.store }}-${{ github.run_number }}
           path: |
