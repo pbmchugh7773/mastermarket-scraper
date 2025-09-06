@@ -88,26 +88,49 @@ class SimpleLocalScraper:
             # User agent
             chrome_options.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
             
-            # Setup driver with webdriver-manager
-            # Fix for GitHub Actions - ensure correct chromedriver path
-            from webdriver_manager.core.os_manager import ChromeType
-            driver_path = ChromeDriverManager(chrome_type=ChromeType.GOOGLE).install()
-            
-            # On GitHub Actions, the actual chromedriver binary may be in a subdirectory
+            # Setup driver - GitHub Actions compatible approach
             import os
-            if not os.path.exists(driver_path) or not os.path.isfile(driver_path):
-                # Look for the actual chromedriver binary
-                possible_paths = [
-                    os.path.join(os.path.dirname(driver_path), 'chromedriver'),
-                    os.path.join(os.path.dirname(driver_path), 'chromedriver-linux64', 'chromedriver'),
-                    driver_path.replace('THIRD_PARTY_NOTICES.chromedriver', 'chromedriver')
-                ]
-                for path in possible_paths:
-                    if os.path.exists(path) and os.path.isfile(path):
-                        driver_path = path
-                        break
             
-            service = Service(driver_path)
+            # Try to use system Chrome driver first (GitHub Actions has Chrome pre-installed)
+            system_chromedriver = '/usr/bin/chromedriver'
+            if os.path.exists(system_chromedriver):
+                logger.info("Using system ChromeDriver from GitHub Actions")
+                service = Service(system_chromedriver)
+            else:
+                # Fallback to webdriver-manager with proper path handling
+                from webdriver_manager.core.os_manager import ChromeType
+                base_path = ChromeDriverManager(chrome_type=ChromeType.GOOGLE).install()
+                
+                # Find the actual chromedriver executable
+                import glob
+                chromedriver_pattern = os.path.join(os.path.dirname(base_path), '**/chromedriver')
+                possible_drivers = glob.glob(chromedriver_pattern, recursive=True)
+                
+                driver_path = None
+                for path in possible_drivers:
+                    if os.path.isfile(path) and os.access(path, os.X_OK):
+                        driver_path = path
+                        logger.info(f"Found executable ChromeDriver at: {path}")
+                        break
+                
+                if not driver_path:
+                    # Last resort: try common locations
+                    common_paths = [
+                        '/usr/local/bin/chromedriver',
+                        '/usr/bin/chromedriver',
+                        base_path.replace('THIRD_PARTY_NOTICES.chromedriver', 'chromedriver'),
+                        os.path.join(os.path.dirname(base_path), 'chromedriver-linux64', 'chromedriver')
+                    ]
+                    
+                    for path in common_paths:
+                        if os.path.exists(path) and os.path.isfile(path):
+                            driver_path = path
+                            break
+                
+                if not driver_path:
+                    raise Exception(f"Could not find ChromeDriver executable. Checked paths: {possible_drivers + common_paths}")
+                
+                service = Service(driver_path)
             driver = webdriver.Chrome(service=service, options=chrome_options)
             
             # Anti-detection script
