@@ -89,7 +89,25 @@ class SimpleLocalScraper:
             chrome_options.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
             
             # Setup driver with webdriver-manager
-            service = Service(ChromeDriverManager().install())
+            # Fix for GitHub Actions - ensure correct chromedriver path
+            from webdriver_manager.core.os_manager import ChromeType
+            driver_path = ChromeDriverManager(chrome_type=ChromeType.GOOGLE).install()
+            
+            # On GitHub Actions, the actual chromedriver binary may be in a subdirectory
+            import os
+            if not os.path.exists(driver_path) or not os.path.isfile(driver_path):
+                # Look for the actual chromedriver binary
+                possible_paths = [
+                    os.path.join(os.path.dirname(driver_path), 'chromedriver'),
+                    os.path.join(os.path.dirname(driver_path), 'chromedriver-linux64', 'chromedriver'),
+                    driver_path.replace('THIRD_PARTY_NOTICES.chromedriver', 'chromedriver')
+                ]
+                for path in possible_paths:
+                    if os.path.exists(path) and os.path.isfile(path):
+                        driver_path = path
+                        break
+            
+            service = Service(driver_path)
             driver = webdriver.Chrome(service=service, options=chrome_options)
             
             # Anti-detection script
