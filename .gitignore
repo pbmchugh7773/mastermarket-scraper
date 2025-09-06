@@ -1,0 +1,75 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+ENV/
+env/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+chromedriver.log
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.backup
+
+# Selenium
+selenium-debug.log
+ghostdriver.log
+
+# Chrome
+chrome_user_data/
+
+# Coverage
+.coverage
+htmlcov/
+.pytest_cache/
+
+# Environment files (use GitHub Secrets instead)
+.env
+.env.local
+.env.production
+
+# Test files
+test_*.py
+*_test.py
+debug_*.py
+
+# Chrome downloads
+downloads/
+screenshots/

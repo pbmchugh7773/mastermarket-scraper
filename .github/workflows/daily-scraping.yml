@@ -1,0 +1,147 @@
+name: Daily Price Scraping
+
+on:
+  # Run daily at 2:00 AM UTC (3:00 AM Irish time)
+  schedule:
+    - cron: '0 2 * * *'
+  
+  # Allow manual triggering for testing
+  workflow_dispatch:
+    inputs:
+      max_products:
+        description: 'Max products per store'
+        required: false
+        default: '67'
+        type: string
+
+jobs:
+  scrape-prices:
+    name: Scrape ${{ matrix.store }}
+    runs-on: ubuntu-latest
+    
+    strategy:
+      # Run all stores in parallel
+      matrix:
+        store: [Aldi, Tesco, SuperValu]
+      
+      # Don't cancel other stores if one fails
+      fail-fast: false
+    
+    steps:
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@v4
+      
+      - name: 🐍 Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+      
+      - name: 🌐 Install Chrome Browser
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            google-chrome-stable \
+            xvfb
+      
+      - name: 📦 Install Python Dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+      
+      - name: 🔧 Setup Chrome Environment
+        run: |
+          # Set Chrome binary path for Selenium
+          export CHROME_BIN=/usr/bin/google-chrome
+          echo "CHROME_BIN=/usr/bin/google-chrome" >> $GITHUB_ENV
+          
+          # Verify Chrome installation
+          google-chrome --version
+      
+      - name: 🛒 Scrape ${{ matrix.store }} Prices
+        env:
+          # API Configuration
+          API_URL: ${{ secrets.API_URL }}
+          SCRAPER_USERNAME: ${{ secrets.SCRAPER_USERNAME }}
+          SCRAPER_PASSWORD: ${{ secrets.SCRAPER_PASSWORD }}
+          
+          # Chrome Configuration
+          CHROME_BIN: /usr/bin/google-chrome
+          DISPLAY: :99
+          
+          # Store Configuration
+          STORE_NAME: ${{ matrix.store }}
+          MAX_PRODUCTS: ${{ github.event.inputs.max_products || '67' }}
+        
+        run: |
+          echo "🏪 Starting ${{ matrix.store }} scraping..."
+          echo "📊 Max products: $MAX_PRODUCTS"
+          echo "🕐 Started at: $(date)"
+          
+          # Start virtual display for headless Chrome
+          Xvfb :99 -screen 0 1920x1080x24 > /dev/null 2>&1 &
+          
+          # Run the scraper
+          python simple_local_to_prod.py \
+            --store "$STORE_NAME" \
+            --products "$MAX_PRODUCTS"
+          
+          echo "✅ ${{ matrix.store }} scraping completed at: $(date)"
+      
+      - name: 📊 Upload Results Summary
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: scraping-logs-${{ matrix.store }}-${{ github.run_number }}
+          path: |
+            *.log
+            logs/
+          retention-days: 7
+
+  # Summary job that runs after all stores complete
+  scraping-summary:
+    name: Scraping Summary
+    needs: scrape-prices
+    runs-on: ubuntu-latest
+    if: always()
+    
+    steps:
+      - name: 📊 Generate Summary
+        run: |
+          echo "🎯 Daily Scraping Summary - $(date)"
+          echo "=================================="
+          
+          # Check results from matrix jobs
+          if [[ "${{ needs.scrape-prices.result }}" == "success" ]]; then
+            echo "✅ All stores completed successfully"
+          elif [[ "${{ needs.scrape-prices.result }}" == "failure" ]]; then
+            echo "❌ Some stores failed - check individual job logs"
+          else
+            echo "⚠️ Mixed results - check individual job logs"
+          fi
+          
+          echo ""
+          echo "📈 Expected Results:"
+          echo "• Aldi: ~67 products in ~6 minutes"  
+          echo "• Tesco: ~67 products in ~2.2 hours"
+          echo "• SuperValu: ~67 products in ~2.2 hours"
+          echo "• Total: ~200 products updated"
+          echo ""
+          echo "🔗 Check results at: https://www.mastermarketapp.com/products"
+      
+      - name: 🚨 Notify on Failure
+        if: needs.scrape-prices.result == 'failure'
+        run: |
+          echo "⚠️ SCRAPING FAILURE DETECTED"
+          echo "Please check the individual job logs for details."
+          echo "Common causes:"
+          echo "• API authentication issues"
+          echo "• Website anti-bot measures"
+          echo "• Network connectivity problems"
+          echo "• Chrome/Selenium configuration issues"
+          echo ""
+          echo "🔧 Troubleshooting:"
+          echo "• Verify GitHub Secrets are set correctly"
+          echo "• Check MasterMarket API status"
+          echo "• Review individual store job logs"
+          echo "• Consider manual re-run if temporary issue"
