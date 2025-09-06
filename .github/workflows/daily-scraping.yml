@@ -55,8 +55,17 @@ jobs:
           export CHROME_BIN=/usr/bin/google-chrome
           echo "CHROME_BIN=/usr/bin/google-chrome" >> $GITHUB_ENV
           
-          # Verify Chrome installation
+          # Setup ChromeDriver for GitHub Actions
+          sudo apt-get update
+          sudo apt-get install -y chromium-chromedriver
+          
+          # Create symlink if needed
+          sudo ln -sf /usr/bin/chromedriver /usr/local/bin/chromedriver || true
+          
+          # Verify installations
           google-chrome --version
+          chromedriver --version || echo "ChromeDriver not found in PATH"
+          which chromedriver || echo "ChromeDriver location unknown"
       
       - name: 🛒 Scrape ${{ matrix.store }} Prices
         env:
