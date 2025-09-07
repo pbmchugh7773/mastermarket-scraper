@@ -102,18 +102,18 @@ class SimpleLocalScraper:
             chrome_options.add_argument("--disable-plugins-discovery")
             chrome_options.add_argument("--disable-ipc-flooding-protection")
             
-            # Randomize viewport size
+            # Use smaller viewport (mobile-ish but not full mobile emulation)
             import random
-            width = random.randint(1200, 1920)
-            height = random.randint(800, 1080)
+            width = random.randint(360, 414)  # Mobile-like width
+            height = random.randint(640, 896)  # Mobile-like height
             chrome_options.add_argument(f"--window-size={width},{height}")
             
-            # More realistic user agent with randomization
+            # Use mobile user agents to avoid Cloudflare (less aggressive on mobile)
             user_agents = [
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+                "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+                "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1",
+                "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36",
+                "Mozilla/5.0 (Linux; Android 13; SM-G998B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Mobile Safari/537.36"
             ]
             user_agent = random.choice(user_agents)
             chrome_options.add_argument(f"--user-agent={user_agent}")
@@ -406,8 +406,8 @@ class SimpleLocalScraper:
             if "Just a moment" in page_title or "Checking your browser" in self.driver.page_source:
                 logger.warning("⚠️ Cloudflare challenge detected, attempting to bypass...")
                 
-                # Wait longer for challenge to resolve
-                max_wait = 60  # Maximum 1 minute
+                # Wait for mobile challenge to resolve (shorter timeout)
+                max_wait = 30  # Maximum 30 seconds for mobile
                 wait_time = 0
                 
                 while wait_time < max_wait:
@@ -423,12 +423,11 @@ class SimpleLocalScraper:
                     
                     logger.info(f"Still waiting for Cloudflare... ({wait_time}s/{max_wait}s)")
                 
-                # If still blocked after max wait, try refreshing
+                # If still blocked after max wait, try alternative approach
                 if "Just a moment" in self.driver.title:
-                    logger.warning("⚠️ Cloudflare challenge persisting, trying page refresh...")
-                    self.driver.refresh()
-                    time.sleep(10)
-                    page_title = self.driver.title
+                    logger.warning("⚠️ Cloudflare challenge persisting, trying alternative approach...")
+                    # Try direct requests approach as fallback
+                    return self._scrape_dunnes_requests_fallback(url, product_name)
             
             # Quick check if we're on the product page
             if "Dunnes Stores" in page_title:
@@ -500,6 +499,61 @@ class SimpleLocalScraper:
             
         except Exception as e:
             logger.error(f"❌ Dunnes scraping error: {e}")
+            return None
+    
+    def _scrape_dunnes_requests_fallback(self, url: str, product_name: str) -> Optional[float]:
+        """Fallback method using requests instead of Selenium for Dunnes"""
+        try:
+            logger.info("🔄 Trying Dunnes requests fallback method...")
+            
+            # Mobile headers to mimic mobile browser
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.5',
+                'Accept-Encoding': 'gzip, deflate',
+                'Connection': 'keep-alive',
+                'Upgrade-Insecure-Requests': '1',
+            }
+            
+            # Make request with timeout
+            response = requests.get(url, headers=headers, timeout=30)
+            
+            if response.status_code == 200:
+                html_content = response.text
+                logger.info("✅ Successfully fetched page with requests")
+                
+                # Try regex patterns on the HTML content
+                price_patterns = [
+                    r'"price"[:\s]*"?(\d+[.,]\d{2})"?',
+                    r'€\s*(\d+[.,]\d{2})',
+                    r'EUR\s*(\d+[.,]\d{2})',
+                    r'"amount"[:\s]*"?(\d+[.,]\d{2})"?',
+                    r'"Price"[:\s]*"?€?(\d+[.,]\d{2})"?',
+                    r'price["\s:]*(\d+[.,]\d{2})',
+                    r'(\d+[.,]\d{2})\s*€'
+                ]
+                
+                for pattern in price_patterns:
+                    matches = re.findall(pattern, html_content, re.IGNORECASE)
+                    for match in matches:
+                        try:
+                            price = float(match.replace(',', '.'))
+                            if 0.01 <= price <= 1000:
+                                logger.info(f"✅ Dunnes price found via requests fallback: €{price}")
+                                return price
+                        except ValueError:
+                            continue
+                
+                logger.warning("⚠️ No valid prices found in requests fallback")
+                return None
+            
+            else:
+                logger.warning(f"⚠️ Requests fallback failed: HTTP {response.status_code}")
+                return None
+                
+        except Exception as e:
+            logger.error(f"❌ Requests fallback error: {e}")
             return None
     
     def get_product_aliases(self, store_name: str = None, limit: int = 5) -> List[Dict]:
