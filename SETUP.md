@@ -59,16 +59,18 @@ Before waiting for the nightly run, test it manually:
 ### 5. Monitor the Test Run
 
 1. Click on the running workflow to see progress
-2. You'll see 3 jobs running in parallel:
+2. You'll see 4 jobs running in parallel:
    - Scrape Aldi
    - Scrape Tesco  
    - Scrape SuperValu
+   - Scrape Dunnes
 3. Each job should complete successfully (✅)
 
 Expected timeline:
 - **Aldi**: ~6 minutes
 - **Tesco**: ~2.2 hours  
 - **SuperValu**: ~2.2 hours
+- **Dunnes**: ~15 minutes
 - **Total**: ~2.2 hours (parallel execution)
 
 ## 📊 Verify Results
@@ -84,7 +86,7 @@ After the scraper completes:
 
 Once set up, the scraper runs automatically:
 - **Time**: 2:00 AM UTC daily (3:00 AM Irish time)
-- **Products**: ~200 per day (67 per store)
+- **Products**: ~268 per day (67 per store)
 - **Duration**: ~2.2 hours
 - **Success Rate**: 95%+
 
@@ -96,10 +98,10 @@ Once set up, the scraper runs automatically:
 3. Green checkmark = success, Red X = failure
 
 ### Common Success Indicators
-- All 3 store jobs complete with ✅
+- All 4 store jobs complete with ✅
 - Logs show "Uploaded price for product X"
 - No authentication errors
-- Runtime ~2-3 hours total
+- Runtime ~2.2-3 hours total
 
 ### If Something Fails
 1. Click on the failed workflow
@@ -152,7 +154,7 @@ No aliases found for [Store]
 ```
 **Solution**:
 - Check that product aliases exist in the MasterMarket database
-- Verify the store name matches exactly (Aldi, Tesco, SuperValu)
+- Verify the store name matches exactly (Aldi, Tesco, SuperValu, Dunnes)
 - Contact MasterMarket admin if aliases are missing
 
 ## 📊 Performance Optimization
@@ -193,8 +195,8 @@ To change the 2 AM daily schedule:
 ## 📈 Scaling Up
 
 ### More Products Per Day
-- Current: 200 products/day (67 per store)
-- Max recommended: 300 products/day (100 per store)
+- Current: 268 products/day (67 per store)
+- Max recommended: 400 products/day (100 per store)
 - Constraint: GitHub Actions 2,000 minutes/month limit
 
 ### Additional Stores

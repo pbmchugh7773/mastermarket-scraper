@@ -15,10 +15,11 @@ This repository contains the automated scraping service that collects prices fro
 | **Aldi** | ✅ Active | ~5 seconds/product | Any |
 | **Tesco** | ✅ Active | ~120 seconds/product | Any |
 | **SuperValu** | ✅ Active | ~120 seconds/product | EU/Ireland |
+| **Dunnes** | ✅ Active | ~15 seconds/product | Any |
 
 ## 📊 Daily Performance
 
-- **Products scraped**: 200+ per day (67 per store)
+- **Products scraped**: 268+ per day (67 per store)
 - **Execution time**: ~2.2 hours (parallel execution)
 - **Success rate**: 95%+
 - **Schedule**: Daily at 2:00 AM UTC
@@ -55,7 +56,7 @@ schedule:
 ```
 
 ### Product Limits
-By default, scrapes 67 products per store (200 total). To adjust:
+By default, scrapes 67 products per store (268 total). To adjust:
 - Edit the `--products` parameter in the workflow file
 - Maximum recommended: 100 products per store
 
@@ -105,9 +106,9 @@ mastermarket-scraper/
 
 ### Performance Metrics
 - **Average runtime**: 2.2 hours per day
-- **Products per minute**: ~1.5 products
+- **Products per minute**: ~1.8 products
 - **Success rate**: 95%+
-- **API calls**: ~600 per day
+- **API calls**: ~800 per day
 
 ## ⚙️ Technical Details
 
@@ -201,6 +202,8 @@ pip install -r requirements.txt
 
 # Test locally (requires Chrome)
 python simple_local_to_prod.py --store Aldi --products 3
+# Or test Dunnes
+python simple_local_to_prod.py --store Dunnes --products 3
 ```
 
 ## 📄 License

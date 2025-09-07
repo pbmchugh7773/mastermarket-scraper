@@ -10,6 +10,7 @@ import json
 import logging
 import requests
 import re
+import os
 from datetime import datetime
 from typing import Optional, Dict, List
 from selenium import webdriver
@@ -28,10 +29,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Production API configuration
-API_URL = "https://api.mastermarketapp.com"
-USERNAME = "testadmin@mastermarket.com" 
-PASSWORD = "testadmin123"
+# Production API configuration with environment variable support
+API_URL = os.getenv('API_URL', 'https://api.mastermarketapp.com')
+USERNAME = os.getenv('SCRAPER_USERNAME', 'testadmin@mastermarket.com')
+PASSWORD = os.getenv('SCRAPER_PASSWORD', 'testadmin123')
 
 class SimpleLocalScraper:
     """
@@ -85,8 +86,13 @@ class SimpleLocalScraper:
             chrome_options.add_argument("--headless")  # Remove this for debugging
             chrome_options.add_argument("--window-size=1920,1080")
             
-            # User agent
-            chrome_options.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+            # Enhanced anti-detection for Cloudflare
+            chrome_options.add_argument("--disable-web-security")
+            chrome_options.add_argument("--disable-features=IsolateOrigins,site-per-process")
+            chrome_options.add_argument("--allow-running-insecure-content")
+            
+            # User agent - Use a more recent one
+            chrome_options.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
             
             # Setup driver - GitHub Actions compatible approach
             import os
@@ -334,6 +340,96 @@ class SimpleLocalScraper:
             logger.error(f"❌ SuperValu scraping error: {e}")
             return None
     
+    def scrape_dunnes(self, url: str, product_name: str) -> Optional[float]:
+        """Scrape Dunnes product - optimized for speed"""
+        try:
+            logger.info(f"🛒 Scraping Dunnes: {product_name}")
+            
+            self.driver.get(url)
+            time.sleep(5)  # Initial wait for page load
+            
+            # Check if we got blocked
+            page_title = self.driver.title
+            logger.info(f"Page title: {page_title}")
+            
+            # Check for Cloudflare challenge
+            if "Just a moment" in page_title or "Checking your browser" in self.driver.page_source:
+                logger.warning("⚠️ Cloudflare challenge detected, waiting...")
+                time.sleep(10)
+                page_title = self.driver.title
+            
+            # Quick check if we're on the product page
+            if "Dunnes Stores" in page_title:
+                logger.info("✅ Product page loaded successfully")
+            
+            # First, try to get price from page source (fastest method)
+            page_source = self.driver.page_source
+            price_patterns = [
+                r'"price"[:\s]*"?(\d+[.,]\d{2})"?',
+                r'€\s*(\d+[.,]\d{2})',
+                r'EUR\s*(\d+[.,]\d{2})',
+                r'"amount"[:\s]*"?(\d+[.,]\d{2})"?',
+                r'"Price"[:\s]*"?€?(\d+[.,]\d{2})"?'
+            ]
+            
+            for pattern in price_patterns:
+                matches = re.findall(pattern, page_source)
+                for match in matches:
+                    try:
+                        price = float(match.replace(',', '.'))
+                        if 0.01 <= price <= 1000:
+                            logger.info(f"✅ Dunnes price found quickly via regex: €{price}")
+                            return price
+                    except ValueError:
+                        continue
+            
+            # If regex didn't work, try a few key selectors (but don't waste time)
+            key_selectors = [
+                '[data-testid*="price"]',
+                '.product-price',
+                'span.price',
+                '[class*="ProductPrice"]'
+            ]
+            
+            for selector in key_selectors:
+                try:
+                    elements = self.driver.find_elements(By.CSS_SELECTOR, selector)
+                    if elements:
+                        for element in elements[:3]:  # Only check first 3 elements
+                            text = element.text
+                            if text and ('€' in text or any(char.isdigit() for char in text)):
+                                price = self.extract_price_from_text(text)
+                                if price:
+                                    logger.info(f"✅ Dunnes price via selector '{selector}': €{price}")
+                                    return price
+                except:
+                    continue
+            
+            # Last resort: Check for JSON-LD structured data
+            try:
+                scripts = self.driver.find_elements(By.XPATH, "//script[@type='application/ld+json']")
+                for script in scripts[:2]:  # Only check first 2 scripts
+                    try:
+                        data = json.loads(script.get_attribute('innerHTML'))
+                        if isinstance(data, dict) and data.get('@type') == 'Product':
+                            offers = data.get('offers', {})
+                            if isinstance(offers, dict) and offers.get('price'):
+                                price = float(offers['price'])
+                                if 0.01 <= price <= 1000:
+                                    logger.info(f"✅ Dunnes price via JSON-LD: €{price}")
+                                    return price
+                    except:
+                        continue
+            except:
+                pass
+            
+            logger.warning(f"⚠️ Could not find Dunnes price for {product_name}")
+            return None
+            
+        except Exception as e:
+            logger.error(f"❌ Dunnes scraping error: {e}")
+            return None
+    
     def get_product_aliases(self, store_name: str = None, limit: int = 5) -> List[Dict]:
         """Get product aliases from production API"""
         try:
@@ -412,6 +508,8 @@ class SimpleLocalScraper:
                 price = self.scrape_tesco(alias['scraper_url'], alias['alias_name'])
             elif store_name.lower() == 'supervalu':
                 price = self.scrape_supervalu(alias['scraper_url'], alias['alias_name'])
+            elif store_name.lower() == 'dunnes':
+                price = self.scrape_dunnes(alias['scraper_url'], alias['alias_name'])
             
             elapsed = time.time() - start_time
             
@@ -457,7 +555,7 @@ class SimpleLocalScraper:
     def run(self, stores: List[str] = None, max_products: int = 5):
         """Main execution method"""
         if stores is None:
-            stores = ['Aldi', 'Tesco', 'SuperValu']
+            stores = ['Aldi', 'Tesco', 'SuperValu', 'Dunnes']
         
         logger.info("🚀 Starting Simple Local to Production Scraper")
         logger.info(f"Target stores: {', '.join(stores)}")
@@ -492,7 +590,7 @@ def main():
     import argparse
     
     parser = argparse.ArgumentParser(description='Simple Local to Production Scraper')
-    parser.add_argument('--store', type=str, help='Store name (Aldi, Tesco, SuperValu)')
+    parser.add_argument('--store', type=str, help='Store name (Aldi, Tesco, SuperValu, Dunnes)')
     parser.add_argument('--all', action='store_true', help='Scrape all stores')
     parser.add_argument('--products', type=int, default=3, help='Max products per store')
     
@@ -500,12 +598,12 @@ def main():
     
     # Determine stores
     if args.all:
-        stores = ['Aldi', 'Tesco', 'SuperValu'] 
+        stores = ['Aldi', 'Tesco', 'SuperValu', 'Dunnes'] 
     elif args.store:
         stores = [args.store]
     else:
         # Default: test all stores with fewer products
-        stores = ['Aldi', 'Tesco', 'SuperValu']
+        stores = ['Aldi', 'Tesco', 'SuperValu', 'Dunnes']
         args.products = 2
     
     # Run scraper

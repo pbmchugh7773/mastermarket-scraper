@@ -22,7 +22,7 @@ jobs:
     strategy:
       # Run all stores in parallel
       matrix:
-        store: [Aldi, Tesco, SuperValu]
+        store: [Aldi, Tesco, SuperValu, Dunnes]
       
       # Don't cancel other stores if one fails
       fail-fast: false
@@ -134,7 +134,8 @@ jobs:
           echo "• Aldi: ~67 products in ~6 minutes"  
           echo "• Tesco: ~67 products in ~2.2 hours"
           echo "• SuperValu: ~67 products in ~2.2 hours"
-          echo "• Total: ~200 products updated"
+          echo "• Dunnes: ~67 products in ~15 minutes"
+          echo "• Total: ~268 products updated"
           echo ""
           echo "🔗 Check results at: https://www.mastermarketapp.com/products"
       
