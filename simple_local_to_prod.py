@@ -84,15 +84,42 @@ class SimpleLocalScraper:
             chrome_options.add_argument("--disable-dev-shm-usage")
             chrome_options.add_argument("--disable-gpu")
             chrome_options.add_argument("--headless")  # Remove this for debugging
-            chrome_options.add_argument("--window-size=1920,1080")
             
-            # Enhanced anti-detection for Cloudflare
+            # Enhanced anti-detection for Cloudflare and GitHub Actions
             chrome_options.add_argument("--disable-web-security")
             chrome_options.add_argument("--disable-features=IsolateOrigins,site-per-process")
             chrome_options.add_argument("--allow-running-insecure-content")
+            chrome_options.add_argument("--disable-features=VizDisplayCompositor")
             
-            # User agent - Use a more recent one
-            chrome_options.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+            # Additional stealth options for GitHub Actions
+            chrome_options.add_argument("--disable-background-timer-throttling")
+            chrome_options.add_argument("--disable-backgrounding-occluded-windows")
+            chrome_options.add_argument("--disable-renderer-backgrounding")
+            chrome_options.add_argument("--disable-features=TranslateUI")
+            chrome_options.add_argument("--no-first-run")
+            chrome_options.add_argument("--no-default-browser-check")
+            chrome_options.add_argument("--disable-logging")
+            chrome_options.add_argument("--disable-plugins-discovery")
+            chrome_options.add_argument("--disable-ipc-flooding-protection")
+            
+            # Randomize viewport size
+            import random
+            width = random.randint(1200, 1920)
+            height = random.randint(800, 1080)
+            chrome_options.add_argument(f"--window-size={width},{height}")
+            
+            # More realistic user agent with randomization
+            user_agents = [
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+            ]
+            user_agent = random.choice(user_agents)
+            chrome_options.add_argument(f"--user-agent={user_agent}")
+            
+            logger.info(f"Using viewport: {width}x{height}")
+            logger.info(f"Using user agent: {user_agent[:50]}...")
             
             # Setup driver - GitHub Actions compatible approach
             import os
@@ -139,11 +166,34 @@ class SimpleLocalScraper:
                 service = Service(driver_path)
             driver = webdriver.Chrome(service=service, options=chrome_options)
             
-            # Anti-detection script
-            driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+            # Enhanced anti-detection scripts
+            stealth_script = """
+                // Hide webdriver property
+                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+                
+                // Override the `plugins` property to use a custom getter.
+                Object.defineProperty(navigator, 'plugins', {
+                    get: () => [1, 2, 3, 4, 5],
+                });
+                
+                // Override the `languages` property to use a custom getter.
+                Object.defineProperty(navigator, 'languages', {
+                    get: () => ['en-US', 'en'],
+                });
+                
+                // Override the `permissions` property to use a custom getter.
+                const originalQuery = window.navigator.permissions.query;
+                window.navigator.permissions.query = (parameters) => (
+                    parameters.name === 'notifications' ?
+                        Promise.resolve({ state: Notification.permission }) :
+                        originalQuery(parameters)
+                );
+            """
             
-            driver.set_page_load_timeout(60)  # Increased from 20s to 60s
-            driver.implicitly_wait(15)     # Increased from 10s to 15s
+            driver.execute_script(stealth_script)
+            
+            driver.set_page_load_timeout(90)  # Increased for Cloudflare
+            driver.implicitly_wait(10)
             
             logger.info("✅ Chrome driver initialized")
             return driver
@@ -352,11 +402,33 @@ class SimpleLocalScraper:
             page_title = self.driver.title
             logger.info(f"Page title: {page_title}")
             
-            # Check for Cloudflare challenge
+            # Handle Cloudflare challenge more aggressively
             if "Just a moment" in page_title or "Checking your browser" in self.driver.page_source:
-                logger.warning("⚠️ Cloudflare challenge detected, waiting...")
-                time.sleep(10)
-                page_title = self.driver.title
+                logger.warning("⚠️ Cloudflare challenge detected, attempting to bypass...")
+                
+                # Wait longer for challenge to resolve
+                max_wait = 60  # Maximum 1 minute
+                wait_time = 0
+                
+                while wait_time < max_wait:
+                    time.sleep(5)
+                    wait_time += 5
+                    
+                    # Check if challenge resolved
+                    current_title = self.driver.title
+                    if "Just a moment" not in current_title and "Dunnes Stores" in current_title:
+                        logger.info(f"✅ Cloudflare challenge resolved after {wait_time}s")
+                        page_title = current_title
+                        break
+                    
+                    logger.info(f"Still waiting for Cloudflare... ({wait_time}s/{max_wait}s)")
+                
+                # If still blocked after max wait, try refreshing
+                if "Just a moment" in self.driver.title:
+                    logger.warning("⚠️ Cloudflare challenge persisting, trying page refresh...")
+                    self.driver.refresh()
+                    time.sleep(10)
+                    page_title = self.driver.title
             
             # Quick check if we're on the product page
             if "Dunnes Stores" in page_title:
