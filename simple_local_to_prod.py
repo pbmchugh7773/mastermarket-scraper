@@ -269,58 +269,74 @@ class SimpleLocalScraper:
             return None
     
     def scrape_tesco(self, url: str, product_name: str) -> Optional[float]:
-        """Scrape Tesco product"""
+        """Scrape Tesco product with multi-step fallback"""
         try:
             logger.info(f"🛒 Scraping Tesco: {product_name}")
             self.driver.get(url)
-            time.sleep(5)  # Tesco needs more time for JS
-            
-            # Wait for price elements to load
-            try:
-                WebDriverWait(self.driver, 90).until(  # Increased from 45s to 90s
-                    EC.presence_of_element_located((By.CSS_SELECTOR, "[data-testid*='price'], .price, .product-price"))
-                )
-            except TimeoutException:
-                logger.warning("⚠️ Tesco price elements not found, continuing...")
-            
-            # Tesco-specific selectors
+            time.sleep(5)  # dar tiempo a que cargue JS
+
+            # === 1. Intentar JSON-LD primero (más confiable) ===
+            scripts = self.driver.find_elements(By.XPATH, "//script[@type='application/ld+json']")
+            for script in scripts:
+                try:
+                    data = json.loads(script.get_attribute('innerHTML'))
+                    if isinstance(data, dict) and data.get('@type') == 'Product':
+                        offers = data.get('offers', {})
+                        if isinstance(offers, dict) and offers.get('price'):
+                            price = float(offers['price'])
+                            if 0.01 <= price <= 1000:
+                                logger.info(f"✅ Tesco price via JSON-LD: €{price}")
+                                return price
+                except Exception:
+                    continue
+
+            # === 2. Intentar con selectores CSS ===
             selectors = [
                 '[data-testid="price-details"]',
                 '[data-testid*="price"]',
-                '.price-per-sellable-unit--now',
                 '.ddsweb-product-price__value',
+                '.price-per-sellable-unit--now',
                 '.product-price',
                 '.price',
                 'span[class*="price"]',
-                'p[class*="price"]',
-                'span'
+                'p[class*="price"]'
+            ]
+
+            for selector in selectors:
+                try:
+                    elements = self.driver.find_elements(By.CSS_SELECTOR, selector)
+                    for element in elements[:5]:  # Solo revisar primeros 5 elementos
+                        text = element.text.strip()
+                        if text and ('€' in text or any(char.isdigit() for char in text)):
+                            price = self.extract_price_from_text(text)
+                            if price:
+                                logger.info(f"✅ Tesco price via selector '{selector}': €{price}")
+                                return price
+                except:
+                    continue
+
+            # === 3. Regex en page_source como último recurso ===
+            page_source = self.driver.page_source
+            price_patterns = [
+                r'"price"\s*[:=]\s*"?(\d+[.,]\d{2})"?',
+                r'€\s*(\d+[.,]\d{2})',
+                r'"amount"\s*[:=]\s*"?(\d+[.,]\d{2})"?'
             ]
             
-            for selector in selectors:
-                elements = self.driver.find_elements(By.CSS_SELECTOR, selector)
-                for element in elements:
-                    text = element.text
-                    if '€' in text or any(char.isdigit() for char in text):
-                        price = self.extract_price_from_text(text)
-                        if price:
-                            logger.info(f"✅ Tesco price via selector '{selector}': €{price}")
+            for pattern in price_patterns:
+                matches = re.findall(pattern, page_source)
+                for match in matches[:10]:  # Solo primeros 10 matches
+                    try:
+                        price = float(match.replace(',', '.'))
+                        if 0.01 <= price <= 1000:
+                            logger.info(f"✅ Tesco price via regex: €{price}")
                             return price
-            
-            # Check page source for JavaScript-loaded prices
-            page_source = self.driver.page_source
-            price_matches = re.findall(r'"price"[:\s]*"?(\d+[.,]\d{2})"?', page_source)
-            for match in price_matches:
-                try:
-                    price = float(match.replace(',', '.'))
-                    if 0.01 <= price <= 1000:
-                        logger.info(f"✅ Tesco price via page source: €{price}")
-                        return price
-                except ValueError:
-                    continue
-            
+                    except ValueError:
+                        continue
+
             logger.warning(f"⚠️ Could not find Tesco price for {product_name}")
             return None
-            
+
         except Exception as e:
             logger.error(f"❌ Tesco scraping error: {e}")
             return None
@@ -608,6 +624,8 @@ class SimpleLocalScraper:
     
     def scrape_store(self, store_name: str, max_products: int = 5):
         """Scrape all products for a specific store"""
+        import random  # Import here for delays
+        
         logger.info(f"\n{'='*50}")
         logger.info(f"🏪 Starting {store_name} scraping (max {max_products} products)")
         logger.info(f"{'='*50}")
@@ -620,9 +638,23 @@ class SimpleLocalScraper:
         
         results = []
         
+        # For Dunnes, use fresh browser session per product to avoid Cloudflare fingerprinting
+        use_fresh_session = store_name.lower() == 'dunnes'
+        
         for i, alias in enumerate(aliases, 1):
             logger.info(f"\n[{i}/{len(aliases)}] Processing: {alias.get('alias_name', 'Unknown')}")
             logger.info(f"URL: {alias['scraper_url'][:80]}...")
+            
+            # For Dunnes, create fresh Chrome session for each product
+            if use_fresh_session and i > 1:
+                logger.info("🔄 Creating fresh Chrome session for Dunnes (Cloudflare avoidance)")
+                if self.driver:
+                    self.driver.quit()
+                    time.sleep(2)  # Brief pause
+                self.driver = self.setup_chrome()
+                if not self.driver:
+                    logger.error("Failed to create fresh Chrome session")
+                    continue
             
             start_time = time.time()
             
@@ -663,8 +695,13 @@ class SimpleLocalScraper:
                 
                 logger.warning(f"❌ Failed to extract price in {elapsed:.2f}s")
             
-            # Delay between products
-            time.sleep(2)
+            # Longer delay for Dunnes to avoid Cloudflare rate limiting
+            if store_name.lower() == 'dunnes':
+                delay = random.randint(15, 25)  # 15-25 seconds for Dunnes
+                logger.info(f"⏱️ Waiting {delay}s before next Dunnes product (Cloudflare avoidance)")
+                time.sleep(delay)
+            else:
+                time.sleep(2)  # Normal delay for other stores
         
         # Summary
         successful = sum(1 for r in results if r['price'] is not None)
