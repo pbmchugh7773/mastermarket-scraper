@@ -681,6 +681,8 @@ class SimpleLocalScraper:
     def run(self, stores: List[str] = None, max_products: int = 5):
         """Main execution method"""
         if stores is None:
+            # Note: Dunnes disabled in GitHub Actions due to Cloudflare blocking
+            # Works locally but fails in CI/CD environment
             stores = ['Aldi', 'Tesco', 'SuperValu', 'Dunnes']
         
         logger.info("🚀 Starting Simple Local to Production Scraper")

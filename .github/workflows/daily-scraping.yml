@@ -22,7 +22,7 @@ jobs:
     strategy:
       # Run all stores in parallel
       matrix:
-        store: [Aldi, Tesco, SuperValu, Dunnes]
+        store: [Aldi, Tesco, SuperValu]  # Dunnes temporarily disabled due to Cloudflare blocking
       
       # Don't cancel other stores if one fails
       fail-fast: false

@@ -15,11 +15,11 @@ This repository contains the automated scraping service that collects prices fro
 | **Aldi** | ✅ Active | ~5 seconds/product | Any |
 | **Tesco** | ✅ Active | ~120 seconds/product | Any |
 | **SuperValu** | ✅ Active | ~120 seconds/product | EU/Ireland |
-| **Dunnes** | ✅ Active | ~15 seconds/product | Any |
+| **Dunnes** | ⚠️ Blocked | Cloudflare protected | GitHub Actions blocked |
 
 ## 📊 Daily Performance
 
-- **Products scraped**: 268+ per day (67 per store)
+- **Products scraped**: 200+ per day (67 per store)
 - **Execution time**: ~2.2 hours (parallel execution)
 - **Success rate**: 95%+
 - **Schedule**: Daily at 2:00 AM UTC
@@ -56,7 +56,7 @@ schedule:
 ```
 
 ### Product Limits
-By default, scrapes 67 products per store (268 total). To adjust:
+By default, scrapes 67 products per store (200 total). To adjust:
 - Edit the `--products` parameter in the workflow file
 - Maximum recommended: 100 products per store
 
