@@ -757,10 +757,18 @@ class SimpleLocalScraper:
             return None
     
     def scrape_dunnes(self, url: str, product_name: str) -> Optional[float]:
-        """Scrape Dunnes product - optimized for speed"""
+        """Scrape Dunnes product - GitHub Actions optimized"""
         try:
             logger.info(f"🛒 Scraping Dunnes: {product_name}")
             
+            # Detect if running in GitHub Actions
+            is_github_actions = os.getenv('GITHUB_ACTIONS') == 'true'
+            if is_github_actions:
+                logger.info("🔧 Detected GitHub Actions environment - using enhanced Cloudflare bypass")
+                # GitHub Actions often gets blocked more aggressively, skip Selenium and go directly to requests
+                return self._scrape_dunnes_requests_fallback(url, product_name)
+            
+            # Local execution - use original Selenium approach
             self.driver.get(url)
             time.sleep(5)  # Initial wait for page load
             
@@ -791,8 +799,7 @@ class SimpleLocalScraper:
                 
                 # If still blocked after max wait, try alternative approach
                 if "Just a moment" in self.driver.title:
-                    logger.warning("⚠️ Cloudflare challenge persisting, trying alternative approach...")
-                    # Try direct requests approach as fallback
+                    logger.warning("⚠️ Cloudflare challenge persisting, trying requests fallback...")
                     return self._scrape_dunnes_requests_fallback(url, product_name)
             
             # Quick check if we're on the product page
@@ -868,59 +875,146 @@ class SimpleLocalScraper:
             return None
     
     def _scrape_dunnes_requests_fallback(self, url: str, product_name: str) -> Optional[float]:
-        """Fallback method using requests instead of Selenium for Dunnes"""
-        try:
-            logger.info("🔄 Trying Dunnes requests fallback method...")
-            
-            # Mobile headers to mimic mobile browser
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                'Accept-Language': 'en-US,en;q=0.5',
-                'Accept-Encoding': 'gzip, deflate',
-                'Connection': 'keep-alive',
-                'Upgrade-Insecure-Requests': '1',
-            }
-            
-            # Make request with timeout
-            response = requests.get(url, headers=headers, timeout=30)
-            
-            if response.status_code == 200:
-                html_content = response.text
-                logger.info("✅ Successfully fetched page with requests")
+        """Enhanced requests fallback for Dunnes - GitHub Actions optimized"""
+        max_retries = 3
+        retry_delay = 5
+        
+        # Multiple user agents to try
+        user_agents = [
+            'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
+            'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1',
+            'Mozilla/5.0 (Linux; Android 13; SM-G998B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Mobile Safari/537.36',
+            'Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36',
+        ]
+        
+        for attempt in range(max_retries):
+            try:
+                logger.info(f"🔄 Trying Dunnes requests fallback method (attempt {attempt + 1}/{max_retries})")
                 
-                # Try regex patterns on the HTML content
-                price_patterns = [
-                    r'"price"[:\s]*"?(\d+[.,]\d{2})"?',
-                    r'€\s*(\d+[.,]\d{2})',
-                    r'EUR\s*(\d+[.,]\d{2})',
-                    r'"amount"[:\s]*"?(\d+[.,]\d{2})"?',
-                    r'"Price"[:\s]*"?€?(\d+[.,]\d{2})"?',
-                    r'price["\s:]*(\d+[.,]\d{2})',
-                    r'(\d+[.,]\d{2})\s*€'
-                ]
+                # Rotate user agent for each attempt
+                user_agent = user_agents[attempt % len(user_agents)]
                 
-                for pattern in price_patterns:
-                    matches = re.findall(pattern, html_content, re.IGNORECASE)
-                    for match in matches:
+                # Enhanced mobile headers to bypass Cloudflare
+                headers = {
+                    'User-Agent': user_agent,
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+                    'Accept-Language': 'en-US,en;q=0.9,ga-IE;q=0.8,ga;q=0.7',
+                    'Accept-Encoding': 'gzip, deflate, br',
+                    'Connection': 'keep-alive',
+                    'Upgrade-Insecure-Requests': '1',
+                    'Sec-Fetch-Dest': 'document',
+                    'Sec-Fetch-Mode': 'navigate',
+                    'Sec-Fetch-Site': 'none',
+                    'Sec-Fetch-User': '?1',
+                    'Cache-Control': 'max-age=0',
+                }
+                
+                # Add delay between attempts to avoid rate limiting
+                if attempt > 0:
+                    logger.info(f"⏱️ Waiting {retry_delay}s before retry...")
+                    time.sleep(retry_delay)
+                
+                # Make request with extended timeout for GitHub Actions
+                response = requests.get(url, headers=headers, timeout=45, allow_redirects=True)
+                
+                if response.status_code == 200:
+                    html_content = response.text
+                    logger.info(f"✅ Successfully fetched Dunnes page with requests ({len(html_content)} chars)")
+                    
+                    # Try regex patterns on the HTML content
+                    price_patterns = [
+                        r'"price"[:\s]*"?(\d+[.,]\d{2})"?',
+                        r'€\s*(\d+[.,]\d{2})',
+                        r'EUR\s*(\d+[.,]\d{2})',
+                        r'"amount"[:\s]*"?(\d+[.,]\d{2})"?',
+                        r'"Price"[:\s]*"?€?(\d+[.,]\d{2})"?',
+                        r'price["\s:]*(\d+[.,]\d{2})',
+                        r'(\d+[.,]\d{2})\s*€',
+                        # Additional patterns for Dunnes specific price formats
+                        r'"unitPrice"[:\s]*"?(\d+[.,]\d{2})"?',
+                        r'"sellingPrice"[:\s]*"?(\d+[.,]\d{2})"?',
+                        r'data-price["\s=]*"(\d+[.,]\d{2})"'
+                    ]
+                    
+                    for pattern in price_patterns:
+                        matches = re.findall(pattern, html_content, re.IGNORECASE)
+                        for match in matches:
+                            try:
+                                price = float(match.replace(',', '.'))
+                                if 0.01 <= price <= 1000:
+                                    logger.info(f"✅ Dunnes price found via requests fallback (pattern: {pattern[:20]}...): €{price}")
+                                    return price
+                            except ValueError:
+                                continue
+                    
+                    # Try JSON-LD extraction from HTML
+                    import re
+                    json_pattern = r'<script type="application/ld\+json"[^>]*>(.*?)</script>'
+                    json_matches = re.findall(json_pattern, html_content, re.DOTALL | re.IGNORECASE)
+                    
+                    for json_text in json_matches:
                         try:
-                            price = float(match.replace(',', '.'))
-                            if 0.01 <= price <= 1000:
-                                logger.info(f"✅ Dunnes price found via requests fallback: €{price}")
-                                return price
-                        except ValueError:
+                            data = json.loads(json_text.strip())
+                            
+                            # Handle different JSON-LD structures
+                            if isinstance(data, list):
+                                for item in data:
+                                    if isinstance(item, dict) and item.get('@type') == 'Product':
+                                        offers = item.get('offers', {})
+                                        if isinstance(offers, dict) and offers.get('price'):
+                                            price = float(offers['price'])
+                                            if 0.01 <= price <= 1000:
+                                                logger.info(f"✅ Dunnes price via JSON-LD (requests): €{price}")
+                                                return price
+                            elif isinstance(data, dict) and data.get('@type') == 'Product':
+                                offers = data.get('offers', {})
+                                if isinstance(offers, dict) and offers.get('price'):
+                                    price = float(offers['price'])
+                                    if 0.01 <= price <= 1000:
+                                        logger.info(f"✅ Dunnes price via JSON-LD (requests): €{price}")
+                                        return price
+                        except (json.JSONDecodeError, ValueError, KeyError):
                             continue
+                    
+                    # If this is not the last attempt, continue to next attempt
+                    if attempt < max_retries - 1:
+                        logger.warning(f"⚠️ No valid prices found in attempt {attempt + 1}, trying different user agent...")
+                        continue
+                    else:
+                        logger.warning("⚠️ No valid prices found in final requests fallback attempt")
+                        return None
                 
-                logger.warning("⚠️ No valid prices found in requests fallback")
+                elif response.status_code == 503 and attempt < max_retries - 1:
+                    logger.warning(f"⚠️ Service unavailable (503), retrying with different user agent...")
+                    continue
+                elif response.status_code == 403 and attempt < max_retries - 1:
+                    logger.warning(f"⚠️ Forbidden (403), retrying with different user agent...")
+                    continue
+                else:
+                    logger.warning(f"⚠️ Requests fallback failed: HTTP {response.status_code}")
+                    if attempt < max_retries - 1:
+                        continue
+                    return None
+                    
+            except requests.exceptions.Timeout:
+                logger.warning(f"⚠️ Timeout on attempt {attempt + 1}/{max_retries}")
+                if attempt < max_retries - 1:
+                    continue
                 return None
-            
-            else:
-                logger.warning(f"⚠️ Requests fallback failed: HTTP {response.status_code}")
+            except requests.exceptions.ConnectionError:
+                logger.warning(f"⚠️ Connection error on attempt {attempt + 1}/{max_retries}")
+                if attempt < max_retries - 1:
+                    continue
                 return None
-                
-        except Exception as e:
-            logger.error(f"❌ Requests fallback error: {e}")
-            return None
+            except Exception as e:
+                logger.error(f"❌ Requests fallback error (attempt {attempt + 1}/{max_retries}): {e}")
+                if attempt < max_retries - 1:
+                    continue
+                return None
+        
+        # All attempts failed
+        logger.error("❌ All Dunnes requests fallback attempts failed")
+        return None
     
     def get_product_aliases(self, store_name: str = None, limit: int = 5) -> List[Dict]:
         """Get product aliases from production API"""
