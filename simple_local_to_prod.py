@@ -31,8 +31,8 @@ logger = logging.getLogger(__name__)
 
 # Production API configuration with environment variable support
 API_URL = os.getenv('API_URL', 'https://api.mastermarketapp.com')
-USERNAME = os.getenv('SCRAPER_USERNAME', 'testadmin@mastermarket.com')
-PASSWORD = os.getenv('SCRAPER_PASSWORD', 'testadmin123')
+USERNAME = os.getenv('SCRAPER_USERNAME', 'pricerIE@mastermarket.com')
+PASSWORD = os.getenv('SCRAPER_PASSWORD', 'pricerIE')
 
 class SimpleLocalScraper:
     """
@@ -223,43 +223,62 @@ class SimpleLocalScraper:
         return None
     
     def scrape_aldi(self, url: str, product_name: str) -> Optional[float]:
-        """Scrape Aldi product"""
+        """Scrape Aldi product - optimized for speed"""
         try:
             logger.info(f"🛒 Scraping Aldi: {product_name}")
             self.driver.get(url)
-            time.sleep(3)
             
-            # Method 1: JSON-LD structured data
+            # Quick initial check - often price is available immediately
+            time.sleep(1)  # Reduced from 3s to 1s
+            
+            # Method 1: JSON-LD structured data (fastest)
             scripts = self.driver.find_elements(By.XPATH, "//script[@type='application/ld+json']")
-            for script in scripts:
+            for script in scripts[:3]:  # Only check first 3 scripts
                 try:
                     data = json.loads(script.get_attribute('innerHTML'))
                     if data.get('@type') == 'Product':
                         offers = data.get('offers', {})
                         if isinstance(offers, dict) and offers.get('price'):
                             price = float(offers['price'])
-                            logger.info(f"✅ Aldi price via JSON-LD: €{price}")
-                            return price
+                            if 0.01 <= price <= 1000:
+                                logger.info(f"✅ Aldi price via JSON-LD: €{price}")
+                                return price
                 except (json.JSONDecodeError, ValueError, KeyError):
                     continue
             
-            # Method 2: CSS selectors
-            selectors = [
+            # Method 2: Prioritized CSS selectors
+            priority_selectors = [
                 '.base-price__regular',
-                '.product-price',
-                '.price',
                 'span[data-testid="price"]',
+                '.product-price'
+            ]
+            
+            fallback_selectors = [
+                '.price',
                 'span'
             ]
             
-            for selector in selectors:
+            # Try priority selectors first
+            for selector in priority_selectors:
                 elements = self.driver.find_elements(By.CSS_SELECTOR, selector)
-                for element in elements:
-                    text = element.text
-                    price = self.extract_price_from_text(text)
-                    if price:
-                        logger.info(f"✅ Aldi price via selector '{selector}': €{price}")
-                        return price
+                for element in elements[:3]:  # Only first 3 elements
+                    text = element.text.strip()
+                    if text:
+                        price = self.extract_price_from_text(text)
+                        if price:
+                            logger.info(f"✅ Aldi price via priority selector '{selector}': €{price}")
+                            return price
+            
+            # Only try fallback if priority failed
+            for selector in fallback_selectors:
+                elements = self.driver.find_elements(By.CSS_SELECTOR, selector)
+                for element in elements[:5]:  # Limit to 5 for generic selectors
+                    text = element.text.strip()
+                    if text and ('€' in text or any(char.isdigit() for char in text)):
+                        price = self.extract_price_from_text(text)
+                        if price:
+                            logger.info(f"✅ Aldi price via fallback selector '{selector}': €{price}")
+                            return price
             
             logger.warning(f"⚠️ Could not find Aldi price for {product_name}")
             return None
@@ -269,76 +288,284 @@ class SimpleLocalScraper:
             return None
     
     def scrape_tesco(self, url: str, product_name: str) -> Optional[float]:
-        """Scrape Tesco product with multi-step fallback"""
+        """Scrape Tesco product with enhanced anti-detection"""
+        start_time = time.time()
+        max_time = 60  # Increased timeout for complex loading
+        
         try:
             logger.info(f"🛒 Scraping Tesco: {product_name}")
-            self.driver.get(url)
-            time.sleep(5)  # dar tiempo a que cargue JS
-
-            # === 1. Intentar JSON-LD primero (más confiable) ===
-            scripts = self.driver.find_elements(By.XPATH, "//script[@type='application/ld+json']")
-            for script in scripts:
+            
+            # Enhanced anti-detection setup
+            self.driver.set_page_load_timeout(30)
+            
+            # Add simple stealth measures
+            try:
+                self.driver.execute_script("window.chrome = {runtime: {}};")
+            except:
+                pass
+            
+            # Navigate with error handling
+            try:
+                logger.info("🔄 Loading Tesco page with enhanced stealth...")
+                self.driver.get(url)
+            except Exception as e:
+                logger.warning(f"⚠️ Tesco page load issue: {e}")
+                # Don't return yet, sometimes partial loads work
+            
+            # Check if we got an error page
+            page_title = self.driver.title
+            if "Error" in page_title or page_title == "Error":
+                logger.warning("⚠️ Tesco returned error page - possible bot detection")
+                # Try one more time with additional delays
+                time.sleep(3)
+                
                 try:
-                    data = json.loads(script.get_attribute('innerHTML'))
-                    if isinstance(data, dict) and data.get('@type') == 'Product':
-                        offers = data.get('offers', {})
-                        if isinstance(offers, dict) and offers.get('price'):
-                            price = float(offers['price'])
-                            if 0.01 <= price <= 1000:
-                                logger.info(f"✅ Tesco price via JSON-LD: €{price}")
-                                return price
+                    logger.info("🔄 Retrying Tesco page load...")
+                    self.driver.refresh()
+                    time.sleep(5)
+                except:
+                    pass
+                
+                # Check again
+                page_title = self.driver.title
+                if "Error" in page_title:
+                    logger.warning("❌ Tesco blocked Selenium access - trying requests fallback")
+                    return self._scrape_tesco_requests_fallback(url, product_name)
+            
+            # Wait for dynamic content
+            time.sleep(8)  # Increased from 5s to 8s
+            
+            # Check time limit
+            if time.time() - start_time > max_time:
+                return None
+
+            # === 1. JSON-LD FIRST (highest priority) ===
+            try:
+                page_source = self.driver.page_source
+                logger.info(f"🔍 Searching JSON-LD in page source ({len(page_source)} chars)")
+                
+                import re
+                json_pattern = r'<script type="application/ld\+json"[^>]*>(.*?)</script>'
+                json_matches = re.findall(json_pattern, page_source, re.DOTALL | re.IGNORECASE)
+                logger.info(f"🔍 Found {len(json_matches)} JSON-LD patterns in source")
+                
+                for i, json_content in enumerate(json_matches[:3]):
+                    try:
+                        logger.info(f"  📄 JSON pattern {i+1} preview: {json_content[:200]}...")
+                        data = json.loads(json_content)
+                        
+                        # Handle @graph structure (common in Tesco)
+                        if isinstance(data, dict) and '@graph' in data:
+                            items = data['@graph']
+                        else:
+                            items = data if isinstance(data, list) else [data]
+                        
+                        for item in items:
+                            if isinstance(item, dict) and item.get('@type') == 'Product':
+                                logger.info(f"    🎯 Found Product in JSON-LD!")
+                                offers = item.get('offers', {})
+                                if isinstance(offers, dict) and 'price' in offers:
+                                    try:
+                                        price = float(offers['price'])
+                                        logger.info(f"    💰 Extracted price: {price}")
+                                        if 0.01 <= price <= 1000:
+                                            elapsed = time.time() - start_time
+                                            logger.info(f"✅ Tesco price via JSON-LD: €{price} (in {elapsed:.1f}s)")
+                                            return price
+                                    except (ValueError, TypeError) as e:
+                                        logger.warning(f"    ⚠️ Price conversion error: {e}")
+                                        continue
+                    except Exception as pattern_e:
+                        logger.warning(f"    ⚠️ JSON pattern {i+1} error: {pattern_e}")
+                        continue
+                        
+            except Exception as json_e:
+                logger.warning(f"  ⚠️ JSON-LD search error: {json_e}")
+
+            # Check time limit before continuing
+            if time.time() - start_time > max_time:
+                return None
+
+            # === 2. Key CSS selectors only (limited) ===
+            priority_selectors = [
+                '[data-testid="price-details"]',
+                '[data-testid*="price"]',
+                '.ddsweb-product-price__value'
+            ]
+            
+            # Try only key selectors (quick check)
+            for selector in priority_selectors:
+                if time.time() - start_time > max_time:
+                    break
+                    
+                try:
+                    elements = self.driver.find_elements(By.CSS_SELECTOR, selector)
+                    logger.info(f"🔍 Selector '{selector}': found {len(elements)} elements")
+                    
+                    for i, element in enumerate(elements[:2]):  # Only check first 2 elements
+                        try:
+                            text = element.text.strip()
+                            if text and ('€' in text or any(char.isdigit() for char in text)):
+                                price = self.extract_price_from_text(text)
+                                if price:
+                                    elapsed = time.time() - start_time
+                                    logger.info(f"✅ Tesco price via selector '{selector}': €{price} (in {elapsed:.1f}s)")
+                                    return price
+                        except Exception:
+                            continue
+                            
                 except Exception:
                     continue
 
-            # === 2. Intentar con selectores CSS ===
-            selectors = [
-                '[data-testid="price-details"]',
-                '[data-testid*="price"]',
-                '.ddsweb-product-price__value',
-                '.price-per-sellable-unit--now',
-                '.product-price',
-                '.price',
-                'span[class*="price"]',
-                'p[class*="price"]'
-            ]
-
-            for selector in selectors:
+            # === 3. Final regex check ===
+            if time.time() - start_time < max_time:
                 try:
-                    elements = self.driver.find_elements(By.CSS_SELECTOR, selector)
-                    for element in elements[:5]:  # Solo revisar primeros 5 elementos
-                        text = element.text.strip()
-                        if text and ('€' in text or any(char.isdigit() for char in text)):
-                            price = self.extract_price_from_text(text)
-                            if price:
-                                logger.info(f"✅ Tesco price via selector '{selector}': €{price}")
-                                return price
-                except:
-                    continue
+                    page_source = self.driver.page_source
+                    logger.info(f"🔍 Searching page source ({len(page_source)} chars)")
+                    
+                    # More comprehensive price patterns
+                    price_patterns = [
+                        r'"price"\s*[:=]\s*"?(\d+[.,]\d{2})"?',
+                        r'€\s*(\d+[.,]\d{2})',
+                        r'(\d+[.,]\d{2})\s*€',
+                        r'"amount"\s*[:=]\s*"?(\d+[.,]\d{2})"?',
+                        r'price["\s:]*(\d+[.,]\d{2})',
+                        r'"currentPrice"[:\s]*"?(\d+[.,]\d{2})"?',
+                        r'"sellPrice"[:\s]*"?(\d+[.,]\d{2})"?',
+                        r'"priceNow"[:\s]*"?(\d+[.,]\d{2})"?',
+                    ]
+                    
+                    for pattern in price_patterns:
+                        matches = re.findall(pattern, page_source, re.IGNORECASE)
+                        logger.info(f"  🔍 Pattern '{pattern[:30]}...': {len(matches)} matches")
+                        
+                        for match in matches[:10]:  # Check first 10 matches
+                            try:
+                                price = float(match.replace(',', '.'))
+                                if 0.01 <= price <= 1000:
+                                    elapsed = time.time() - start_time
+                                    logger.info(f"✅ Tesco price via regex: €{price} (in {elapsed:.1f}s)")
+                                    return price
+                            except ValueError:
+                                continue
+                                
+                except Exception as regex_e:
+                    logger.debug(f"  ⚠️ Regex error: {regex_e}")
 
-            # === 3. Regex en page_source como último recurso ===
-            page_source = self.driver.page_source
-            price_patterns = [
-                r'"price"\s*[:=]\s*"?(\d+[.,]\d{2})"?',
-                r'€\s*(\d+[.,]\d{2})',
-                r'"amount"\s*[:=]\s*"?(\d+[.,]\d{2})"?'
-            ]
+            elapsed = time.time() - start_time
+            logger.warning(f"⚠️ Could not find Tesco price for {product_name} after comprehensive search ({elapsed:.1f}s)")
             
-            for pattern in price_patterns:
-                matches = re.findall(pattern, page_source)
-                for match in matches[:10]:  # Solo primeros 10 matches
-                    try:
-                        price = float(match.replace(',', '.'))
-                        if 0.01 <= price <= 1000:
-                            logger.info(f"✅ Tesco price via regex: €{price}")
-                            return price
-                    except ValueError:
-                        continue
-
-            logger.warning(f"⚠️ Could not find Tesco price for {product_name}")
+            # Debug: Save page source for analysis
+            try:
+                with open(f"tesco_debug_{int(time.time())}.html", "w") as f:
+                    f.write(self.driver.page_source)
+                logger.info("💾 Saved page source for debugging")
+            except:
+                pass
+            
             return None
 
         except Exception as e:
-            logger.error(f"❌ Tesco scraping error: {e}")
+            elapsed = time.time() - start_time
+            logger.error(f"❌ Tesco scraping error after {elapsed:.1f}s: {e}")
+            return None
+        finally:
+            # Reset page load timeout
+            try:
+                self.driver.set_page_load_timeout(90)
+            except:
+                pass
+    
+    def _scrape_tesco_requests_fallback(self, url: str, product_name: str) -> Optional[float]:
+        """Fallback method using requests instead of Selenium for Tesco"""
+        try:
+            logger.info("🔄 Trying Tesco requests fallback method...")
+            
+            # Mobile-like headers to avoid detection
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.5',
+                'Accept-Encoding': 'gzip, deflate',
+                'Connection': 'keep-alive',
+                'Upgrade-Insecure-Requests': '1',
+                'Sec-Fetch-Dest': 'document',
+                'Sec-Fetch-Mode': 'navigate',
+                'Sec-Fetch-Site': 'none'
+            }
+            
+            # Make request with timeout
+            response = requests.get(url, headers=headers, timeout=30)
+            
+            if response.status_code == 200:
+                html_content = response.text
+                logger.info(f"✅ Successfully fetched Tesco page with requests ({len(html_content)} chars)")
+                
+                # Look for JSON-LD in the HTML
+                import re
+                json_pattern = r'<script type="application/ld\+json"[^>]*>(.*?)</script>'
+                json_matches = re.findall(json_pattern, html_content, re.DOTALL | re.IGNORECASE)
+                logger.info(f"🔍 Found {len(json_matches)} JSON-LD patterns via requests")
+                
+                for i, json_content in enumerate(json_matches[:3]):
+                    try:
+                        logger.info(f"  📄 JSON pattern {i+1} preview: {json_content[:100]}...")
+                        data = json.loads(json_content)
+                        
+                        # Handle @graph structure
+                        if isinstance(data, dict) and '@graph' in data:
+                            items = data['@graph']
+                        else:
+                            items = data if isinstance(data, list) else [data]
+                        
+                        for item in items:
+                            if isinstance(item, dict) and item.get('@type') == 'Product':
+                                logger.info(f"    🎯 Found Product in JSON-LD via requests!")
+                                offers = item.get('offers', {})
+                                if isinstance(offers, dict) and 'price' in offers:
+                                    try:
+                                        price = float(offers['price'])
+                                        logger.info(f"    💰 Extracted price: {price}")
+                                        if 0.01 <= price <= 1000:
+                                            logger.info(f"✅ Tesco price found via requests fallback: €{price}")
+                                            return price
+                                    except (ValueError, TypeError) as e:
+                                        logger.warning(f"    ⚠️ Price conversion error: {e}")
+                                        continue
+                    except Exception as pattern_e:
+                        logger.warning(f"    ⚠️ JSON pattern {i+1} error: {pattern_e}")
+                        continue
+                
+                # If JSON-LD fails, try regex patterns
+                price_patterns = [
+                    r'"price"[:\s]*"?(\d+[.,]\d{2})"?',
+                    r'€\s*(\d+[.,]\d{2})',
+                    r'(\d+[.,]\d{2})\s*€',
+                    r'"amount"[:\s]*"?(\d+[.,]\d{2})"?',
+                    r'price["\s:]*(\d+[.,]\d{2})',
+                ]
+                
+                for pattern in price_patterns:
+                    matches = re.findall(pattern, html_content, re.IGNORECASE)
+                    logger.info(f"  🔍 Pattern '{pattern[:30]}...': {len(matches)} matches")
+                    for match in matches[:5]:
+                        try:
+                            price = float(match.replace(',', '.'))
+                            if 0.01 <= price <= 1000:
+                                logger.info(f"✅ Tesco price found via requests regex: €{price}")
+                                return price
+                        except ValueError:
+                            continue
+                
+                logger.warning("⚠️ No valid prices found in requests fallback")
+                return None
+            
+            else:
+                logger.warning(f"⚠️ Requests fallback failed: HTTP {response.status_code}")
+                return None
+                
+        except Exception as e:
+            logger.error(f"❌ Requests fallback error: {e}")
             return None
     
     def scrape_supervalu(self, url: str, product_name: str) -> Optional[float]:
@@ -596,31 +823,55 @@ class SimpleLocalScraper:
             return []
     
     def upload_price(self, alias: Dict, price: float, store_name: str) -> bool:
-        """Upload price to production API"""
-        try:
-            data = {
-                'product_id': alias['product_id'],
-                'store_name': store_name,
-                'store_location': 'IE',  # Ireland location for Irish stores
-                'price': price,
-                'currency': 'EUR',
-                'country': 'IE'
-            }
-            
-            # Use the community prices endpoint
-            response = self.session.post(f'{API_URL}/api/community-prices/submit', json=data)
-            
-            if response.status_code in [200, 201]:
-                logger.info(f"✅ Uploaded price for product {alias['product_id']}: €{price}")
-                return True
-            else:
-                logger.warning(f"⚠️ Upload failed for product {alias['product_id']}: {response.status_code}")
-                logger.warning(f"Response: {response.text}")
-                return False
+        """Upload price to production API with retry logic"""
+        max_retries = 3
+        retry_delay = 2
+        
+        for attempt in range(max_retries):
+            try:
+                data = {
+                    'product_id': alias['product_id'],
+                    'store_name': store_name,
+                    'store_location': 'IE',  # Ireland location for Irish stores
+                    'price': price,
+                    'currency': 'EUR',
+                    'country': 'IE'
+                }
                 
-        except Exception as e:
-            logger.error(f"❌ Upload error for product {alias['product_id']}: {e}")
-            return False
+                # Use the community prices endpoint
+                response = self.session.post(f'{API_URL}/api/community-prices/submit', json=data, timeout=30)
+                
+                if response.status_code in [200, 201]:
+                    logger.info(f"✅ Uploaded price for product {alias['product_id']}: €{price}")
+                    return True
+                elif response.status_code == 429:  # Rate limited
+                    logger.warning(f"⚠️ Rate limited, waiting {retry_delay * 2}s before retry {attempt + 1}/{max_retries}")
+                    time.sleep(retry_delay * 2)
+                    continue
+                else:
+                    logger.warning(f"⚠️ Upload failed for product {alias['product_id']}: {response.status_code}")
+                    if attempt < max_retries - 1:
+                        logger.info(f"♾️ Retrying upload in {retry_delay}s... (attempt {attempt + 2}/{max_retries})")
+                        time.sleep(retry_delay)
+                        continue
+                    else:
+                        logger.warning(f"Response: {response.text}")
+                        return False
+                    
+            except requests.exceptions.Timeout:
+                logger.warning(f"⚠️ Upload timeout for product {alias['product_id']} (attempt {attempt + 1}/{max_retries})")
+                if attempt < max_retries - 1:
+                    time.sleep(retry_delay)
+                    continue
+                return False
+            except Exception as e:
+                logger.error(f"❌ Upload error for product {alias['product_id']} (attempt {attempt + 1}/{max_retries}): {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(retry_delay)
+                    continue
+                return False
+        
+        return False
     
     def scrape_store(self, store_name: str, max_products: int = 5):
         """Scrape all products for a specific store"""
@@ -695,13 +946,17 @@ class SimpleLocalScraper:
                 
                 logger.warning(f"❌ Failed to extract price in {elapsed:.2f}s")
             
-            # Longer delay for Dunnes to avoid Cloudflare rate limiting
+            # Adaptive delays based on store requirements
             if store_name.lower() == 'dunnes':
                 delay = random.randint(15, 25)  # 15-25 seconds for Dunnes
                 logger.info(f"⏱️ Waiting {delay}s before next Dunnes product (Cloudflare avoidance)")
                 time.sleep(delay)
+            elif store_name.lower() in ['tesco', 'supervalu']:
+                delay = random.randint(3, 6)  # 3-6 seconds for heavy JS sites
+                logger.info(f"⏱️ Waiting {delay}s before next {store_name} product")
+                time.sleep(delay)
             else:
-                time.sleep(2)  # Normal delay for other stores
+                time.sleep(1)  # Minimal delay for Aldi (fast scraping)
         
         # Summary
         successful = sum(1 for r in results if r['price'] is not None)

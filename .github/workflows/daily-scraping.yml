@@ -1,9 +1,9 @@
 name: Daily Price Scraping
 
 on:
-  # Run daily at 2:00 AM UTC (3:00 AM Irish time)
+  # Run daily at 5:00 AM UTC (6:00 AM Irish time)
   schedule:
-    - cron: '0 2 * * *'
+    - cron: '0 5 * * *'
   
   # Allow manual triggering for testing
   workflow_dispatch:
@@ -22,7 +22,7 @@ jobs:
     strategy:
       # Run all stores in parallel
       matrix:
-        store: [Aldi, Tesco, SuperValu]  # Dunnes temporarily disabled due to Cloudflare blocking
+        store: [Aldi, Tesco, SuperValu, Dunnes]  # Re-enabled Dunnes with improved handling
       
       # Don't cancel other stores if one fails
       fail-fast: false
@@ -66,6 +66,23 @@ jobs:
           google-chrome --version
           chromedriver --version || echo "ChromeDriver not found in PATH"
           which chromedriver || echo "ChromeDriver location unknown"
+      
+      - name: 🐛 Debug Environment
+        run: |
+          echo "🔍 Environment Debug Information"
+          echo "================================"
+          google-chrome --version
+          chromedriver --version
+          echo "User: $(whoami)"
+          echo "Working directory: $(pwd)"
+          echo "Python version: $(python --version)"
+          echo "Pip version: $(pip --version)"
+          echo "CHROME_BIN: $CHROME_BIN"
+          echo "DISPLAY: $DISPLAY"
+          echo "Available display processes:"
+          ps aux | grep -i xvfb || echo "No Xvfb processes found"
+          echo "Environment variables:"
+          env | grep -E "(CHROME|DISPLAY|API)" || echo "No relevant env vars found"
       
       - name: 🛒 Scrape ${{ matrix.store }} Prices
         env:
