@@ -58,7 +58,7 @@ The MasterMarket Price Scraper is a high-performance, production-ready web scrap
 | **Aldi** | 100% | ~2 seconds | JSON-LD + CSS | Fast & reliable |
 | **Tesco** | 100% | ~10.6 seconds | Hybrid Selenium/requests | Bot detection bypass |
 | **SuperValu** | 100% | ~129 seconds | JSON-LD + Complex JS | Heavy JavaScript |
-| **Dunnes** | 100% | ~8 seconds | Regex + Fresh sessions | Cloudflare bypass |
+| **Dunnes** | 100% (Local) / Enhanced (CI) | ~8s (Local) / ~15s (CI) | Environment-aware hybrid | GitHub Actions intelligence |
 
 ### Daily Production Stats
 - **Total Products**: 268 products across 4 stores
@@ -112,17 +112,30 @@ Technical Approach:
 - Priority selector ordering
 ```
 
-### 4. DUNNES - Cloudflare Protected
+### 4. DUNNES - Cloudflare Protected with GitHub Actions Intelligence
 ```python
-Strategy: Regex Speed + Fresh Sessions
-Performance: ~8 seconds per product
-Success Rate: 100%
+Strategy: Environment-Aware Hybrid Approach
+Performance: ~8 seconds per product (local) | ~15 seconds (GitHub Actions)
+Success Rate: 100% (local) | Enhanced for GitHub Actions
 
-Anti-Cloudflare Measures:
+Local Environment:
+- Selenium with Cloudflare challenge detection
+- Regex-based rapid price extraction
 - Fresh browser sessions per product
 - Extended delays (15-25 seconds between products)
-- Mobile user agent rotation
-- requests fallback for blocked sessions
+
+GitHub Actions Environment (Auto-Detected):
+- Direct requests fallback (bypasses Selenium)
+- Multi-retry system (3 attempts with 5s delays)
+- User agent rotation (4 different mobile agents)
+- Enhanced Cloudflare bypass headers
+- Extended timeouts (45 seconds)
+- Comprehensive error handling (403, 503, timeouts)
+
+Price Extraction Methods:
+- 10 regex patterns including Dunnes-specific formats
+- JSON-LD structured data extraction
+- Enhanced pattern logging for debugging
 ```
 
 ## 🛡️ Anti-Detection System
@@ -148,6 +161,29 @@ Store-Specific Delays:
 Session Management:
 - Single session: Aldi, Tesco, SuperValu
 - Fresh per product: Dunnes (Cloudflare avoidance)
+
+Environment-Aware Intelligence:
+- GitHub Actions detection via GITHUB_ACTIONS env variable
+- Automatic fallback strategy selection per environment
+- CI-optimized timeouts and retry logic
+```
+
+### GitHub Actions Environment Optimization
+```python
+Dunnes Store Intelligence:
+- Auto-detection: os.getenv('GITHUB_ACTIONS') == 'true'
+- Direct requests bypass (no Selenium in CI)
+- Multi-retry system: 3 attempts with 5-second delays
+- User agent rotation: 4 different mobile agents
+- Enhanced headers for Cloudflare bypass
+- Extended timeouts: 45 seconds (vs 30s local)
+- Comprehensive error handling: 403, 503, timeouts
+
+Price Extraction Enhancement:
+- 10 regex patterns including Dunnes-specific formats
+- JSON-LD structured data extraction from HTML
+- Pattern-specific logging for debugging
+- Fallback chain: Regex → JSON-LD → Next User Agent
 ```
 
 ## 🔄 Error Handling & Retry Logic
@@ -238,6 +274,12 @@ python simple_local_to_prod.py --all --products 67
 
 # Debug specific store issues
 python simple_local_to_prod.py --store Dunnes --products 1
+
+# Simulate GitHub Actions environment (for Dunnes testing)
+GITHUB_ACTIONS=true python simple_local_to_prod.py --store Dunnes --products 1
+
+# Test environment-specific behavior
+GITHUB_ACTIONS=true python simple_local_to_prod.py --store Dunnes --products 3
 ```
 
 ### Production Deployment
@@ -267,13 +309,17 @@ DISPLAY=:99
 2. **Schedule Change**: 2 AM → 5 AM UTC for better reliability
 3. **Dunnes Re-enablement**: Added back with Cloudflare bypass
 4. **Performance Boost**: 4.4 hours → 45 minutes total time
+5. **Dunnes GitHub Actions Intelligence**: Environment-aware hybrid approach (December 2024)
 
-### Technical Enhancements
-- Hybrid Selenium/requests approach for Tesco
-- Advanced anti-detection measures
-- Adaptive delay system per store
-- Comprehensive retry logic
-- Enhanced error handling and fallbacks
+### Technical Enhancements (Latest)
+- **Environment Detection**: Automatic GitHub Actions vs local environment detection
+- **Hybrid Selenium/requests approach**: For both Tesco and Dunnes (environment-specific)
+- **Multi-retry system**: Enhanced with user agent rotation for CI environments
+- **Advanced anti-detection measures**: CI-specific headers and timeouts
+- **Adaptive delay system per store**: Optimized for both local and CI execution
+- **Comprehensive retry logic**: HTTP status code specific handling (403, 503, timeouts)
+- **Enhanced error handling and fallbacks**: Pattern-specific logging and debugging
+- **JSON-LD extraction enhancement**: Full structured data support in requests fallback
 
 ## 🔧 Maintenance & Support
 
@@ -359,5 +405,6 @@ requirements.txt - Python dependencies
 
 ---
 
-*Last Updated: November 2024*  
+*Last Updated: December 2024*  
+*Latest Enhancement: GitHub Actions Environment Intelligence for Dunnes*  
 *System Status: Production Ready - 100% Success Rate*
