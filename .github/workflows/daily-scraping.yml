@@ -72,7 +72,31 @@ jobs:
           pip install webdriver-manager
           
           # Use webdriver-manager for reliable ChromeDriver installation
-          python3 -c "from webdriver_manager.chrome import ChromeDriverManager; import os, shutil; driver_path = ChromeDriverManager().install(); shutil.copy2(driver_path, '/tmp/chromedriver'); os.chmod('/tmp/chromedriver', 0o755); print(f'ChromeDriver copied from: {driver_path}')"
+          python3 -c "
+from webdriver_manager.chrome import ChromeDriverManager
+import os, shutil
+driver_path = ChromeDriverManager().install()
+print(f'WebDriver path: {driver_path}')
+
+# The WebDriver path might point to a directory, find the actual chromedriver executable
+import glob
+if os.path.isdir(driver_path):
+    chromedriver_files = glob.glob(os.path.join(driver_path, '**/chromedriver'), recursive=True)
+    if chromedriver_files:
+        driver_path = chromedriver_files[0]
+    else:
+        # Try without directory structure
+        driver_path = os.path.join(driver_path, 'chromedriver')
+
+print(f'Using ChromeDriver at: {driver_path}')
+if os.path.exists(driver_path):
+    shutil.copy2(driver_path, '/tmp/chromedriver')
+    os.chmod('/tmp/chromedriver', 0o755)
+    print('ChromeDriver copied successfully')
+else:
+    print(f'Error: ChromeDriver not found at {driver_path}')
+    exit(1)
+"
           
           # Install ChromeDriver to system path
           sudo mv /tmp/chromedriver /usr/local/bin/chromedriver
