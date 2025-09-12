@@ -227,8 +227,9 @@ Retention: 7 days for debugging logs
 ### Environment Setup
 ```yaml
 Chrome Installation:
-- google-chrome-stable
-- chromium-chromedriver
+- google-chrome-stable (from Google repository)
+- ChromeDriver via Chrome for Testing API
+- webdriver-manager fallback for reliability
 - Xvfb virtual display
 
 Python Dependencies:
@@ -327,9 +328,20 @@ DISPLAY=:99
 
 #### Chrome Driver Issues
 ```bash
-# GitHub Actions auto-installs Chrome
-# Local development may need manual setup
+# GitHub Actions auto-installs Chrome with improved reliability
+# Uses Chrome for Testing API with webdriver-manager fallback
+
+# Local development setup
 sudo apt-get install google-chrome-stable
+
+# If ChromeDriver version mismatch occurs:
+pip install webdriver-manager
+python3 -c "from webdriver_manager.chrome import ChromeDriverManager; ChromeDriverManager().install()"
+
+# Common GitHub Actions Chrome issues:
+# 1. Snap connectivity failures - Fixed with direct Chrome repository
+# 2. ChromeDriver version mismatch - Fixed with Chrome for Testing API
+# 3. Missing dependencies - Fixed with comprehensive package installation
 ```
 
 #### API Authentication Failures

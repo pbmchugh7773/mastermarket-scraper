@@ -39,10 +39,17 @@ jobs:
       
       - name: 🌐 Install Chrome Browser
         run: |
+          # Add Google Chrome repository
+          wget -q -O - https://dl.google.com/linux/linux_signing_key.pub | sudo apt-key add -
+          sudo sh -c 'echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" >> /etc/apt/sources.list.d/google-chrome.list'
+          
+          # Update and install Chrome and Xvfb
           sudo apt-get update
           sudo apt-get install -y \
             google-chrome-stable \
-            xvfb
+            xvfb \
+            wget \
+            unzip
       
       - name: 📦 Install Python Dependencies
         run: |
@@ -55,17 +62,50 @@ jobs:
           export CHROME_BIN=/usr/bin/google-chrome
           echo "CHROME_BIN=/usr/bin/google-chrome" >> $GITHUB_ENV
           
-          # Setup ChromeDriver for GitHub Actions
-          sudo apt-get update
-          sudo apt-get install -y chromium-chromedriver
+          # Get Chrome version
+          CHROME_VERSION=$(google-chrome --version | sed 's/Google Chrome //' | cut -d'.' -f1-3)
+          echo "Chrome version: $CHROME_VERSION"
           
-          # Create symlink if needed
-          sudo ln -sf /usr/bin/chromedriver /usr/local/bin/chromedriver || true
+          # Use Chrome for Testing ChromeDriver (more reliable for CI)
+          # First try the new Chrome for Testing API
+          CHROMEDRIVER_URL=$(curl -s "https://googlechromelabs.github.io/chrome-for-testing/known-good-versions-with-downloads.json" | \
+            python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+for version in data['versions']:
+    if version['version'].startswith('$CHROME_VERSION'):
+        for download in version['downloads'].get('chromedriver', []):
+            if download['platform'] == 'linux64':
+                print(download['url'])
+                break
+        break
+" 2>/dev/null)
+          
+          # Fallback to webdriver-manager approach if Chrome for Testing fails
+          if [ -z "$CHROMEDRIVER_URL" ]; then
+            echo "Using webdriver-manager fallback..."
+            pip install webdriver-manager
+            python3 -c "
+from webdriver_manager.chrome import ChromeDriverManager
+import os, shutil
+driver_path = ChromeDriverManager().install()
+shutil.copy2(driver_path, '/tmp/chromedriver')
+os.chmod('/tmp/chromedriver', 0o755)
+print(f'ChromeDriver copied from: {driver_path}')
+"
+            sudo mv /tmp/chromedriver /usr/local/bin/chromedriver
+          else
+            echo "Using Chrome for Testing ChromeDriver: $CHROMEDRIVER_URL"
+            wget -O /tmp/chromedriver.zip "$CHROMEDRIVER_URL"
+            sudo unzip -o /tmp/chromedriver.zip -d /tmp/ -j
+            sudo mv /tmp/chromedriver /usr/local/bin/chromedriver
+            sudo chmod +x /usr/local/bin/chromedriver
+          fi
           
           # Verify installations
           google-chrome --version
-          chromedriver --version || echo "ChromeDriver not found in PATH"
-          which chromedriver || echo "ChromeDriver location unknown"
+          chromedriver --version
+          which chromedriver
       
       - name: 🐛 Debug Environment
         run: |
