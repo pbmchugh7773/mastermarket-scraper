@@ -47,11 +47,25 @@ def find_chromedriver_executable(base_path):
         elif 'THIRD_PARTY_NOTICES.chromedriver' in base_path:
             # webdriver-manager returned the wrong file, find the actual chromedriver
             parent_dir = os.path.dirname(base_path)
+            print(f'Looking for chromedriver in: {parent_dir}')
+            
+            # List all files in the directory for debugging
+            if os.path.exists(parent_dir):
+                files = os.listdir(parent_dir)
+                print(f'Files in directory: {files}')
+            
             chromedriver_path = os.path.join(parent_dir, 'chromedriver')
             if os.path.exists(chromedriver_path) and os.access(chromedriver_path, os.X_OK):
                 return chromedriver_path
             else:
                 print(f'Error: Actual chromedriver not found in {parent_dir}')
+                # Try to find any chromedriver file recursively
+                for root, dirs, files in os.walk(parent_dir):
+                    for file in files:
+                        if file == 'chromedriver' and os.access(os.path.join(root, file), os.X_OK):
+                            found_path = os.path.join(root, file)
+                            print(f'Found chromedriver at: {found_path}')
+                            return found_path
                 return None
         else:
             print(f'Error: Invalid chromedriver path: {base_path}')
