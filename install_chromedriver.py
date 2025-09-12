@@ -55,17 +55,13 @@ def find_chromedriver_executable(base_path):
                 print(f'Files in directory: {files}')
             
             chromedriver_path = os.path.join(parent_dir, 'chromedriver')
-            if os.path.exists(chromedriver_path) and os.access(chromedriver_path, os.X_OK):
+            if os.path.exists(chromedriver_path):
+                # Make it executable if it exists
+                os.chmod(chromedriver_path, 0o755)
+                print(f'Found and made executable: {chromedriver_path}')
                 return chromedriver_path
             else:
-                print(f'Error: Actual chromedriver not found in {parent_dir}')
-                # Try to find any chromedriver file recursively
-                for root, dirs, files in os.walk(parent_dir):
-                    for file in files:
-                        if file == 'chromedriver' and os.access(os.path.join(root, file), os.X_OK):
-                            found_path = os.path.join(root, file)
-                            print(f'Found chromedriver at: {found_path}')
-                            return found_path
+                print(f'Error: chromedriver file not found in {parent_dir}')
                 return None
         else:
             print(f'Error: Invalid chromedriver path: {base_path}')
