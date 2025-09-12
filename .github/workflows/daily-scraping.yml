@@ -67,40 +67,15 @@ jobs:
           echo "Chrome version: $CHROME_VERSION"
           
           # Use Chrome for Testing ChromeDriver (more reliable for CI)
-          # First try the new Chrome for Testing API
-          CHROMEDRIVER_URL=$(curl -s "https://googlechromelabs.github.io/chrome-for-testing/known-good-versions-with-downloads.json" | \
-            python3 -c "
-import sys, json
-data = json.load(sys.stdin)
-for version in data['versions']:
-    if version['version'].startswith('$CHROME_VERSION'):
-        for download in version['downloads'].get('chromedriver', []):
-            if download['platform'] == 'linux64':
-                print(download['url'])
-                break
-        break
-" 2>/dev/null)
+          # Simplified approach to avoid YAML multiline issues
+          echo "Installing ChromeDriver via webdriver-manager..."
+          pip install webdriver-manager
           
-          # Fallback to webdriver-manager approach if Chrome for Testing fails
-          if [ -z "$CHROMEDRIVER_URL" ]; then
-            echo "Using webdriver-manager fallback..."
-            pip install webdriver-manager
-            python3 -c "
-from webdriver_manager.chrome import ChromeDriverManager
-import os, shutil
-driver_path = ChromeDriverManager().install()
-shutil.copy2(driver_path, '/tmp/chromedriver')
-os.chmod('/tmp/chromedriver', 0o755)
-print(f'ChromeDriver copied from: {driver_path}')
-"
-            sudo mv /tmp/chromedriver /usr/local/bin/chromedriver
-          else
-            echo "Using Chrome for Testing ChromeDriver: $CHROMEDRIVER_URL"
-            wget -O /tmp/chromedriver.zip "$CHROMEDRIVER_URL"
-            sudo unzip -o /tmp/chromedriver.zip -d /tmp/ -j
-            sudo mv /tmp/chromedriver /usr/local/bin/chromedriver
-            sudo chmod +x /usr/local/bin/chromedriver
-          fi
+          # Use webdriver-manager for reliable ChromeDriver installation
+          python3 -c "from webdriver_manager.chrome import ChromeDriverManager; import os, shutil; driver_path = ChromeDriverManager().install(); shutil.copy2(driver_path, '/tmp/chromedriver'); os.chmod('/tmp/chromedriver', 0o755); print(f'ChromeDriver copied from: {driver_path}')"
+          
+          # Install ChromeDriver to system path
+          sudo mv /tmp/chromedriver /usr/local/bin/chromedriver
           
           # Verify installations
           google-chrome --version
