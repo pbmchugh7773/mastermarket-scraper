@@ -67,65 +67,11 @@ jobs:
           echo "Chrome version: $CHROME_VERSION"
           
           # Use Chrome for Testing ChromeDriver (more reliable for CI)
-          # Simplified approach to avoid YAML multiline issues
           echo "Installing ChromeDriver via webdriver-manager..."
           pip install webdriver-manager
           
-          # Use webdriver-manager for reliable ChromeDriver installation
-          python3 -c "
-from webdriver_manager.chrome import ChromeDriverManager
-import os, shutil, glob
-
-# Get the base directory path from webdriver-manager
-base_path = ChromeDriverManager().install()
-print(f'Base path from webdriver-manager: {base_path}')
-
-# Find the actual chromedriver executable
-if os.path.isdir(base_path):
-    # Look for chromedriver executable (not THIRD_PARTY_NOTICES)
-    chromedriver_files = []
-    for root, dirs, files in os.walk(base_path):
-        for file in files:
-            if file == 'chromedriver' and not file.endswith('.chromedriver'):
-                full_path = os.path.join(root, file)
-                # Verify it's an executable, not a text file
-                if os.path.isfile(full_path) and os.access(full_path, os.X_OK):
-                    chromedriver_files.append(full_path)
-    
-    if chromedriver_files:
-        driver_path = chromedriver_files[0]
-    else:
-        print('No executable chromedriver found, trying alternative locations...')
-        # Try parent directory
-        parent_dir = os.path.dirname(base_path)
-        alt_paths = [
-            os.path.join(parent_dir, 'chromedriver-linux64', 'chromedriver'),
-            os.path.join(os.path.dirname(parent_dir), 'chromedriver-linux64', 'chromedriver')
-        ]
-        driver_path = next((p for p in alt_paths if os.path.isfile(p) and os.access(p, os.X_OK)), None)
-        
-        if not driver_path:
-            print(f'Error: No executable chromedriver found in {base_path} or alternatives')
-            exit(1)
-else:
-    # base_path is a file, check if it's the actual chromedriver
-    if base_path.endswith('chromedriver') and not 'THIRD_PARTY' in base_path:
-        driver_path = base_path
-    else:
-        print(f'Error: Invalid chromedriver path: {base_path}')
-        exit(1)
-
-print(f'Using ChromeDriver at: {driver_path}')
-
-# Verify the file is executable
-if os.path.exists(driver_path) and os.access(driver_path, os.X_OK):
-    shutil.copy2(driver_path, '/tmp/chromedriver')
-    os.chmod('/tmp/chromedriver', 0o755)
-    print('ChromeDriver copied successfully')
-else:
-    print(f'Error: ChromeDriver not found or not executable at {driver_path}')
-    exit(1)
-"
+          # Use dedicated script to avoid YAML multiline issues
+          python3 install_chromedriver.py
           
           # Install ChromeDriver to system path
           sudo mv /tmp/chromedriver /usr/local/bin/chromedriver
