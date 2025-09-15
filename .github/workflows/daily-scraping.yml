@@ -11,7 +11,7 @@ on:
       max_products:
         description: 'Max products per store'
         required: false
-        default: '67'
+        default: '300'
         type: string
 
 jobs:
@@ -111,7 +111,7 @@ jobs:
           
           # Store Configuration
           STORE_NAME: ${{ matrix.store }}
-          MAX_PRODUCTS: ${{ github.event.inputs.max_products || '67' }}
+          MAX_PRODUCTS: ${{ github.event.inputs.max_products || '300' }}
         
         run: |
           echo "🏪 Starting ${{ matrix.store }} scraping..."
@@ -162,11 +162,11 @@ jobs:
           
           echo ""
           echo "📈 Expected Results:"
-          echo "• Aldi: ~67 products in ~6 minutes"  
-          echo "• Tesco: ~67 products in ~2.2 hours"
-          echo "• SuperValu: ~67 products in ~2.2 hours"
-          echo "• Dunnes: ~67 products in ~15 minutes"
-          echo "• Total: ~268 products updated"
+          echo "• Aldi: ~300 products in ~30 minutes"
+          echo "• Tesco: ~300 products in ~10 hours"
+          echo "• SuperValu: ~300 products in ~10 hours"
+          echo "• Dunnes: ~300 products in ~70 minutes"
+          echo "• Total: ~1200 products updated"
           echo ""
           echo "🔗 Check results at: https://www.mastermarketapp.com/products"
       
