@@ -3,7 +3,7 @@
 MasterMarket Price Scraper - Production Ready
 
 A high-performance, anti-detection web scraper for Irish supermarket prices.
-Extracts product prices from Aldi, Tesco, SuperValu, and Dunnes Stores,
+Extracts product prices from Aldi, Tesco, SuperValu, Dunnes Stores, and Lidl,
 then uploads them to the MasterMarket production API.
 
 Key Features:
@@ -19,6 +19,7 @@ Performance Metrics (per product):
 - Tesco: ~10.6 seconds (hybrid Selenium/requests)
 - SuperValu: ~129 seconds (complex JS-heavy site)
 - Dunnes: ~8 seconds (regex-optimized with Cloudflare bypass)
+- Lidl: ~2-3 seconds (JSON-LD priority, similar to Aldi)
 
 Architecture:
 - Chrome WebDriver with mobile emulation for stealth
@@ -30,6 +31,8 @@ Architecture:
 Usage:
     python simple_local_to_prod.py --store Tesco --products 10
     python simple_local_to_prod.py --all --products 67
+    python simple_local_to_prod.py --product-id 4573 --store Tesco
+    python simple_local_to_prod.py --product-id 4573  # All stores
 """
 
 import time
@@ -99,12 +102,19 @@ class SimpleLocalScraper:
     - Fallback: requests with mobile user agents
     - Anti-Cloudflare: Fresh browser sessions per product
     - Performance: ~8s per product, 100% success rate
+
+    LIDL (Fast & Reliable):
+    - Primary: requests with JSON-LD extraction
+    - Secondary: Selenium fallback if requests fails
+    - URL cleaning: Removes tracking parameters after #
+    - Performance: ~2-3s per product, expected 95%+ success rate
     """
     
-    def __init__(self):
+    def __init__(self, debug_prices=False):
         self.driver = None
         self.api_token = None
         self.session = requests.Session()
+        self.debug_prices = debug_prices
         
     def authenticate(self) -> bool:
         """
@@ -301,14 +311,22 @@ class SimpleLocalScraper:
             return None
     
     def extract_price_from_text(self, text: str) -> Optional[float]:
-        """Extract price from text using regex"""
+        """Extract price from text using regex, excluding per-unit prices"""
+        # Skip text that contains per-unit indicators
+        per_unit_indicators = ['/kg', '/100g', '/ml', '/l', '/litre', 'per kg', 'per 100g', 'per litre', 'each']
+        text_lower = text.lower()
+
+        # If this is clearly a per-unit price, skip it
+        if any(indicator in text_lower for indicator in per_unit_indicators):
+            return None
+
         # European price patterns
         patterns = [
             r'€\s*(\d+[.,]\d{2})',  # €7.25 or €7,25
             r'(\d+[.,]\d{2})\s*€',  # 7.25€ or 7,25€
             r'(\d+[.,]\d{2})',      # Just the number
         ]
-        
+
         for pattern in patterns:
             matches = re.findall(pattern, text)
             for match in matches:
@@ -319,7 +337,164 @@ class SimpleLocalScraper:
                 except ValueError:
                     continue
         return None
-    
+
+    def extract_tesco_all_prices(self, html_content: str) -> dict:
+        """
+        Extract all Tesco prices (regular, clubcard, per-unit) for analysis
+
+        Returns:
+            dict: {
+                'regular': float or None,
+                'clubcard': float or None,
+                'per_unit': float or None,
+                'analysis': list of found prices with context
+            }
+        """
+        from bs4 import BeautifulSoup
+
+        result = {
+            'regular': None,
+            'clubcard': None,
+            'per_unit': None,
+            'analysis': []
+        }
+
+        try:
+            soup = BeautifulSoup(html_content, 'html.parser')
+
+            # All possible price selectors for Tesco
+            all_price_selectors = [
+                'p.ddsweb-text[class*="priceText"]',
+                '.a59700_FKk1BW_priceText',
+                'p[class*="priceText"]',
+                '[class*="price"]',
+                '.ddsweb-price__subtext',  # Per-unit prices
+            ]
+
+            found_prices = []
+
+            for selector in all_price_selectors:
+                elements = soup.select(selector)
+                for element in elements:
+                    text = element.get_text(strip=True)
+                    parent_text = element.parent.get_text(strip=True) if element.parent else ""
+
+                    # Extract price value
+                    price_match = re.search(r'[€â¬]\s*(\d+[.,]\d{2})', text)
+                    if price_match:
+                        try:
+                            price_value = float(price_match.group(1).replace(',', '.'))
+                            price_info = {
+                                'value': price_value,
+                                'text': text,
+                                'context': parent_text[:200],
+                                'selector': selector,
+                                'type': 'unknown'
+                            }
+
+                            # Classify price type with more precise logic
+                            text_lower = text.lower()
+                            combined_context = (text + " " + parent_text).lower()
+
+                            # Check for per-unit price (look for indicators directly in the text first)
+                            per_unit_indicators = ['/kg', '/100g', '/ml', '/l', '/litre', 'per kg', 'per 100g', 'per litre']
+                            clubcard_indicators = ['clubcard', 'better than half price', 'half price', 'value-bar']
+
+                            # Priority 1: If the text itself contains per-unit indicators, it's definitely per-unit
+                            if any(indicator in text_lower for indicator in per_unit_indicators):
+                                price_info['type'] = 'per_unit'
+                                if not result['per_unit'] or price_value > result['per_unit']:
+                                    result['per_unit'] = price_value
+                            # Priority 2: If context suggests Clubcard but text doesn't have per-unit indicators
+                            elif any(indicator in combined_context for indicator in clubcard_indicators):
+                                price_info['type'] = 'clubcard'
+                                if not result['clubcard'] or price_value < result['clubcard']:
+                                    result['clubcard'] = price_value
+                            # Priority 3: Check for common per-unit price ranges
+                            elif price_value > 20:  # €33.23/kg would be high, likely per-unit
+                                # But only if there are per-unit indicators in broader context
+                                if any(indicator in combined_context for indicator in per_unit_indicators):
+                                    price_info['type'] = 'per_unit'
+                                    if not result['per_unit'] or price_value > result['per_unit']:
+                                        result['per_unit'] = price_value
+                                else:
+                                    # High price but no per-unit context - treat as regular (might be expensive item)
+                                    price_info['type'] = 'regular'
+                                    if not result['regular']:
+                                        result['regular'] = price_value
+                            else:
+                                # Regular price (default for prices €3.15, etc.)
+                                price_info['type'] = 'regular'
+                                if not result['regular']:
+                                    result['regular'] = price_value
+
+                            found_prices.append(price_info)
+
+                        except ValueError:
+                            continue
+
+            result['analysis'] = found_prices
+            return result
+
+        except Exception as e:
+            logger.warning(f"Error in extract_tesco_all_prices: {e}")
+            return result
+
+    def extract_tesco_product_price(self, text: str, context: str = "") -> Optional[float]:
+        """
+        Extract Tesco product price specifically, excluding per-unit prices and Clubcard prices
+
+        Args:
+            text: Text containing price
+            context: Additional context around the price for validation
+
+        Returns:
+            Product price if valid, None if per-unit price, Clubcard price, or invalid
+        """
+        # Skip if this is clearly a per-unit price based on context or text
+        combined_text = (text + " " + context).lower()
+        per_unit_indicators = [
+            '/kg', '/100g', '/ml', '/l', '/litre', 'per kg', 'per 100g', 'per litre',
+            'each', 'per unit', 'unit price', 'price per', '/each', '€/kg'
+        ]
+
+        # Be more specific: only filter if the text itself contains per-unit indicators
+        # Don't filter based on broader context that might contain both regular and per-unit prices
+        text_lower = text.lower()
+        if any(indicator in text_lower for indicator in per_unit_indicators):
+            logger.info(f"    ⏭️ Skipping per-unit price in text: {text}")
+            return None
+
+        # Skip if this is a Clubcard price based on context or text
+        clubcard_indicators = [
+            'clubcard', 'better than half price', 'half price', 'value-bar',
+            'club card', 'member price', 'loyalty price', 'special offer',
+            'tesco clubcard price', 'exclusive offer'
+        ]
+
+        if any(indicator in combined_text for indicator in clubcard_indicators):
+            return None
+
+        # Look for product price patterns (handle both € and encoded â¬)
+        price_patterns = [
+            r'[€â¬]\s*(\d+[.,]\d{2})',      # €7.25 or â¬7.25 or €7,25
+            r'(\d+[.,]\d{2})\s*[€â¬]',      # 7.25€ or 7.25â¬ or 7,25€
+            r'(\d+[.,]\d{2})',              # Just the number
+        ]
+
+        for pattern in price_patterns:
+            matches = re.findall(pattern, text)
+            for match in matches:
+                try:
+                    price = float(match.replace(',', '.'))
+                    # For Tesco, product prices are typically under €50 for single items
+                    # Prices over €50 are often per-kg prices (like €33.23/kg)
+                    if 0.01 <= price <= 50:  # Reasonable range for product prices
+                        return price
+                except ValueError:
+                    continue
+        return None
+
     def scrape_aldi(self, url: str, product_name: str) -> Optional[float]:
         """Scrape Aldi product - optimized for speed"""
         try:
@@ -441,14 +616,14 @@ class SimpleLocalScraper:
                 logger.warning("⚠️ Tesco returned error page - possible bot detection")
                 # Try one more time with additional delays
                 time.sleep(3)
-                
+
                 try:
                     logger.info("🔄 Retrying Tesco page load...")
                     self.driver.refresh()
                     time.sleep(5)
                 except:
                     pass
-                
+
                 # Check again
                 page_title = self.driver.title
                 if "Error" in page_title:
@@ -462,27 +637,97 @@ class SimpleLocalScraper:
             if time.time() - start_time > max_time:
                 return None
 
-            # === 1. JSON-LD FIRST (highest priority) ===
+            # === 1. CSS SELECTORS FIRST for Tesco (to target regular price specifically) ===
+            # Priority: Regular product price selectors (not Clubcard or per-unit prices)
+            priority_selectors = [
+                # Primary: Regular price with specific Tesco classes
+                'p.ddsweb-text[class*="priceText"]:not([class*="subtext"])',  # Regular price element
+                '.a59700_FKk1BW_priceText',  # Direct class for regular price
+                'p.ddsweb-text.a59700_FKk1BW_priceText',  # Full selector for regular price
+            ]
+
+            # Try priority selectors first (target regular price)
+            for selector in priority_selectors:
+                if time.time() - start_time > max_time:
+                    break
+
+                try:
+                    elements = self.driver.find_elements(By.CSS_SELECTOR, selector)
+                    logger.info(f"🔍 Priority selector '{selector}': found {len(elements)} elements")
+
+                    for i, element in enumerate(elements[:2]):  # Only check first 2 elements
+                        try:
+                            text = element.text.strip()
+                            # Get parent element text for context
+                            try:
+                                parent_text = element.find_element(By.XPATH, "..").text
+                            except:
+                                parent_text = ""
+
+                            if text and ('€' in text or any(char.isdigit() for char in text)):
+                                # Skip if this is clearly a Clubcard price
+                                if 'clubcard' in parent_text.lower() or 'better than half price' in parent_text.lower():
+                                    logger.info(f"  ⏭️ Skipping Clubcard price: {text}")
+                                    continue
+
+                                price = self.extract_tesco_product_price(text, parent_text)
+                                if price:
+                                    elapsed = time.time() - start_time
+                                    logger.info(f"✅ Tesco regular price via selector '{selector}': €{price} (in {elapsed:.1f}s)")
+
+                                    # If debug mode is enabled, show comprehensive analysis before returning
+                                    if self.debug_prices:
+                                        try:
+                                            logger.info("🔍 === DEBUG MODE: COMPREHENSIVE PRICE ANALYSIS ===")
+                                            page_source = self.driver.page_source
+                                            all_prices = self.extract_tesco_all_prices(page_source)
+
+                                            logger.info(f"📊 Regular Price: €{all_prices['regular']}" if all_prices['regular'] else "📊 Regular Price: Not found")
+                                            logger.info(f"🎟️ Clubcard Price: €{all_prices['clubcard']}" if all_prices['clubcard'] else "🎟️ Clubcard Price: Not found")
+                                            logger.info(f"⚖️ Per-Unit Price: €{all_prices['per_unit']}" if all_prices['per_unit'] else "⚖️ Per-Unit Price: Not found")
+
+                                            if all_prices['analysis']:
+                                                logger.info(f"📋 Found {len(all_prices['analysis'])} total price elements:")
+                                                for i, price_info in enumerate(all_prices['analysis'][:10]):
+                                                    logger.info(f"  {i+1}. Type: {price_info['type']}, Value: €{price_info['value']}, Text: '{price_info['text']}'")
+
+                                            logger.info(f"✅ Selected for upload: €{price} (regular price)")
+                                            logger.info("🔍 === END DEBUG ANALYSIS ===")
+                                        except Exception as debug_e:
+                                            logger.warning(f"Debug analysis error: {debug_e}")
+
+                                    return price
+                        except Exception:
+                            continue
+
+                except Exception:
+                    continue
+
+            # Check time limit before continuing
+            if time.time() - start_time > max_time:
+                return None
+
+            # === 2. JSON-LD as fallback (may contain Clubcard prices) ===
             try:
                 page_source = self.driver.page_source
                 logger.info(f"🔍 Searching JSON-LD in page source ({len(page_source)} chars)")
-                
+
                 import re
                 json_pattern = r'<script type="application/ld\+json"[^>]*>(.*?)</script>'
                 json_matches = re.findall(json_pattern, page_source, re.DOTALL | re.IGNORECASE)
                 logger.info(f"🔍 Found {len(json_matches)} JSON-LD patterns in source")
-                
+
                 for i, json_content in enumerate(json_matches[:3]):
                     try:
                         logger.info(f"  📄 JSON pattern {i+1} preview: {json_content[:200]}...")
                         data = json.loads(json_content)
-                        
+
                         # Handle @graph structure (common in Tesco)
                         if isinstance(data, dict) and '@graph' in data:
                             items = data['@graph']
                         else:
                             items = data if isinstance(data, list) else [data]
-                        
+
                         for item in items:
                             if isinstance(item, dict) and item.get('@type') == 'Product':
                                 logger.info(f"    🎯 Found Product in JSON-LD!")
@@ -491,9 +736,10 @@ class SimpleLocalScraper:
                                     try:
                                         price = float(offers['price'])
                                         logger.info(f"    💰 Extracted price: {price}")
-                                        if 0.01 <= price <= 1000:
+                                        # Be more restrictive for JSON-LD prices since they might be Clubcard
+                                        if 0.01 <= price <= 50:
                                             elapsed = time.time() - start_time
-                                            logger.info(f"✅ Tesco price via JSON-LD: €{price} (in {elapsed:.1f}s)")
+                                            logger.info(f"⚠️ Tesco price via JSON-LD (may be Clubcard): €{price} (in {elapsed:.1f}s)")
                                             return price
                                     except (ValueError, TypeError) as e:
                                         logger.warning(f"    ⚠️ Price conversion error: {e}")
@@ -501,7 +747,7 @@ class SimpleLocalScraper:
                     except Exception as pattern_e:
                         logger.warning(f"    ⚠️ JSON pattern {i+1} error: {pattern_e}")
                         continue
-                        
+
             except Exception as json_e:
                 logger.warning(f"  ⚠️ JSON-LD search error: {json_e}")
 
@@ -509,53 +755,21 @@ class SimpleLocalScraper:
             if time.time() - start_time > max_time:
                 return None
 
-            # === 2. Key CSS selectors only (limited) ===
-            priority_selectors = [
-                '[data-testid="price-details"]',
-                '[data-testid*="price"]',
-                '.ddsweb-product-price__value'
-            ]
-            
-            # Try only key selectors (quick check)
-            for selector in priority_selectors:
-                if time.time() - start_time > max_time:
-                    break
-                    
-                try:
-                    elements = self.driver.find_elements(By.CSS_SELECTOR, selector)
-                    logger.info(f"🔍 Selector '{selector}': found {len(elements)} elements")
-                    
-                    for i, element in enumerate(elements[:2]):  # Only check first 2 elements
-                        try:
-                            text = element.text.strip()
-                            if text and ('€' in text or any(char.isdigit() for char in text)):
-                                price = self.extract_price_from_text(text)
-                                if price:
-                                    elapsed = time.time() - start_time
-                                    logger.info(f"✅ Tesco price via selector '{selector}': €{price} (in {elapsed:.1f}s)")
-                                    return price
-                        except Exception:
-                            continue
-                            
-                except Exception:
-                    continue
-
             # === 3. Final regex check ===
             if time.time() - start_time < max_time:
                 try:
                     page_source = self.driver.page_source
                     logger.info(f"🔍 Searching page source ({len(page_source)} chars)")
                     
-                    # More comprehensive price patterns
+                    # More comprehensive price patterns, excluding per-unit prices
                     price_patterns = [
-                        r'"price"\s*[:=]\s*"?(\d+[.,]\d{2})"?',
-                        r'€\s*(\d+[.,]\d{2})',
-                        r'(\d+[.,]\d{2})\s*€',
-                        r'"amount"\s*[:=]\s*"?(\d+[.,]\d{2})"?',
-                        r'price["\s:]*(\d+[.,]\d{2})',
-                        r'"currentPrice"[:\s]*"?(\d+[.,]\d{2})"?',
-                        r'"sellPrice"[:\s]*"?(\d+[.,]\d{2})"?',
-                        r'"priceNow"[:\s]*"?(\d+[.,]\d{2})"?',
+                        r'"price"\s*[:=]\s*"?(\d+[.,]\d{2})"?(?![^"]*(?:/kg|/100g|per))',  # Exclude per-unit
+                        r'"currentPrice"[:\s]*"?(\d+[.,]\d{2})"?(?![^"]*(?:/kg|/100g|per))',
+                        r'"sellPrice"[:\s]*"?(\d+[.,]\d{2})"?(?![^"]*(?:/kg|/100g|per))',
+                        r'"priceNow"[:\s]*"?(\d+[.,]\d{2})"?(?![^"]*(?:/kg|/100g|per))',
+                        r'"amount"\s*[:=]\s*"?(\d+[.,]\d{2})"?(?![^"]*(?:/kg|/100g|per))',
+                        r'(?<!per[^€]*?)€\s*(\d+[.,]\d{2})(?![^<]*(?:/kg|/100g|per))',  # €X.XX not preceded by "per"
+                        r'(?<!per[^€]*?)(\d+[.,]\d{2})\s*€(?![^<]*(?:/kg|/100g|per))',  # X.XX€ not preceded by "per"
                     ]
                     
                     for pattern in price_patterns:
@@ -659,26 +873,66 @@ class SimpleLocalScraper:
                         logger.warning(f"    ⚠️ JSON pattern {i+1} error: {pattern_e}")
                         continue
                 
-                # If JSON-LD fails, try regex patterns
+                # Extract and analyze ALL Tesco prices for comprehensive logging (only in debug mode)
+                try:
+                    all_prices = self.extract_tesco_all_prices(html_content)
+
+                    # Only show comprehensive analysis in debug mode
+                    if self.debug_prices:
+                        logger.info("🔍 === TESCO PRICE ANALYSIS ===")
+                        logger.info(f"📊 Regular Price: €{all_prices['regular']}" if all_prices['regular'] else "📊 Regular Price: Not found")
+                        logger.info(f"🎟️ Clubcard Price: €{all_prices['clubcard']}" if all_prices['clubcard'] else "🎟️ Clubcard Price: Not found")
+                        logger.info(f"⚖️ Per-Unit Price: €{all_prices['per_unit']}" if all_prices['per_unit'] else "⚖️ Per-Unit Price: Not found")
+
+                        # Detailed analysis for debugging
+                        if all_prices['analysis']:
+                            logger.info(f"📋 Found {len(all_prices['analysis'])} total price elements:")
+                            for i, price_info in enumerate(all_prices['analysis'][:10]):  # Limit to 10 for readability
+                                logger.info(f"  {i+1}. Type: {price_info['type']}, Value: €{price_info['value']}, Text: '{price_info['text']}'")
+
+                    # Return the regular price if found
+                    if all_prices['regular']:
+                        if self.debug_prices:
+                            logger.info(f"✅ Tesco regular price selected for upload: €{all_prices['regular']}")
+                        else:
+                            logger.info(f"✅ Tesco regular price found via requests: €{all_prices['regular']}")
+                        return all_prices['regular']
+                    else:
+                        logger.warning("⚠️ No regular price found, checking fallback methods...")
+
+                except ImportError:
+                    logger.warning("BeautifulSoup not available, falling back to regex")
+                except Exception as e:
+                    logger.warning(f"Comprehensive price analysis error: {e}")
+
+                # Fallback: improved regex patterns targeting regular prices
                 price_patterns = [
-                    r'"price"[:\s]*"?(\d+[.,]\d{2})"?',
-                    r'€\s*(\d+[.,]\d{2})',
-                    r'(\d+[.,]\d{2})\s*€',
-                    r'"amount"[:\s]*"?(\d+[.,]\d{2})"?',
-                    r'price["\s:]*(\d+[.,]\d{2})',
+                    # Target specific Tesco price classes and avoid Clubcard contexts
+                    r'class="[^"]*priceText[^"]*"[^>]*>€?\s*(\d+[.,]\d{2})',  # Tesco priceText class
+                    r'priceText[^>]*€\s*(\d+[.,]\d{2})',  # Price in priceText context
+                    r'"price"\s*[:=]\s*"?(\d+[.,]\d{2})"?(?![^"]*(?:/kg|/100g|per|clubcard))',  # JSON price not per-unit or clubcard
                 ]
-                
+
                 for pattern in price_patterns:
-                    matches = re.findall(pattern, html_content, re.IGNORECASE)
+                    matches = re.findall(pattern, html_content, re.IGNORECASE | re.DOTALL)
                     logger.info(f"  🔍 Pattern '{pattern[:30]}...': {len(matches)} matches")
                     for match in matches[:5]:
-                        try:
-                            price = float(match.replace(',', '.'))
-                            if 0.01 <= price <= 1000:
-                                logger.info(f"✅ Tesco price found via requests regex: €{price}")
+                        # Extract surrounding context for additional validation
+                        match_index = html_content.find(str(match))
+                        if match_index != -1:
+                            context_start = max(0, match_index - 200)
+                            context_end = min(len(html_content), match_index + 200)
+                            context = html_content[context_start:context_end]
+
+                            # Skip if context contains Clubcard indicators
+                            if any(indicator in context.lower() for indicator in ['clubcard', 'better than half price', 'value-bar']):
+                                logger.info(f"    ⏭️ Skipping price in Clubcard context: €{match}")
+                                continue
+
+                            price = self.extract_tesco_product_price(f"€{match}", context)
+                            if price:
+                                logger.info(f"✅ Tesco regular price found via requests regex: €{price}")
                                 return price
-                        except ValueError:
-                            continue
                 
                 logger.warning("⚠️ No valid prices found in requests fallback")
                 return None
@@ -1170,6 +1424,236 @@ class SimpleLocalScraper:
             logger.error(f"❌ Dunnes scraping error: {e}")
             return None
     
+    def scrape_lidl(self, url: str, product_name: str) -> Optional[float]:
+        """
+        Scrape Lidl Product with Enhanced Approach
+
+        Lidl Implementation Strategy:
+        1. Primary: requests with JSON-LD extraction (fastest)
+        2. Fallback: Selenium if requests fails
+        3. Extraction: JSON-LD priority with regex patterns as backup
+
+        Technical Approach:
+        - Similar to Aldi's fast JSON-LD approach
+        - Clean URL by removing tracking parameters
+        - Mobile user agent for better compatibility
+        - Comprehensive price pattern matching
+
+        Args:
+            url (str): Lidl product URL
+            product_name (str): Product name for logging
+
+        Returns:
+            Optional[float]: Extracted price in EUR or None if extraction fails
+
+        Performance:
+        - Expected: ~2-3 seconds per product (similar to Aldi)
+        - Success Rate Target: 95%+
+        """
+        try:
+            logger.info(f"🛒 Scraping Lidl: {product_name}")
+
+            # Clean URL - remove search tracking parameters after #
+            clean_url = url.split('#')[0] if '#' in url else url
+            logger.info(f"📍 Clean URL: {clean_url}")
+
+            # Try requests first (faster than Selenium)
+            return self._scrape_lidl_requests(clean_url, product_name)
+
+        except Exception as e:
+            logger.error(f"❌ Lidl scraping error: {e}")
+            # Try Selenium fallback
+            return self._scrape_lidl_selenium_fallback(clean_url, product_name)
+
+    def _scrape_lidl_requests(self, url: str, product_name: str) -> Optional[float]:
+        """Primary method using requests for Lidl"""
+        try:
+            logger.info("🔄 Trying Lidl requests method...")
+
+            # Mobile headers for better compatibility
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                'Accept-Language': 'en-IE,en;q=0.9',
+                'Accept-Encoding': 'gzip, deflate, br',
+                'Connection': 'keep-alive',
+            }
+
+            response = requests.get(url, headers=headers, timeout=15, allow_redirects=True)
+
+            if response.status_code == 200:
+                html_content = response.text
+                logger.info(f"✅ Successfully fetched Lidl page ({len(html_content)} chars)")
+
+                # === 1. JSON-LD EXTRACTION (PRIMARY METHOD) ===
+                import re
+                json_pattern = r'<script type="application/ld\+json"[^>]*>(.*?)</script>'
+                json_matches = re.findall(json_pattern, html_content, re.DOTALL | re.IGNORECASE)
+                logger.info(f"🔍 Found {len(json_matches)} JSON-LD patterns")
+
+                for i, json_content in enumerate(json_matches[:3]):
+                    try:
+                        data = json.loads(json_content.strip())
+
+                        # Check if it's a Product type
+                        if isinstance(data, dict) and data.get('@type') == 'Product':
+                            logger.info(f"    🎯 Found Product in JSON-LD!")
+                            offers = data.get('offers', {})
+
+                            # Handle both single offer and array of offers
+                            if isinstance(offers, list) and len(offers) > 0:
+                                offers = offers[0]
+
+                            if isinstance(offers, dict) and 'price' in offers:
+                                try:
+                                    price = float(offers['price'])
+                                    if 0.01 <= price <= 1000:
+                                        logger.info(f"✅ Lidl price via JSON-LD: €{price}")
+                                        return price
+                                except (ValueError, TypeError):
+                                    continue
+
+                        # Handle @graph structure if present
+                        elif isinstance(data, dict) and '@graph' in data:
+                            items = data['@graph']
+                            for item in items:
+                                if isinstance(item, dict) and item.get('@type') == 'Product':
+                                    offers = item.get('offers', {})
+                                    if isinstance(offers, dict) and 'price' in offers:
+                                        try:
+                                            price = float(offers['price'])
+                                            if 0.01 <= price <= 1000:
+                                                logger.info(f"✅ Lidl price via JSON-LD @graph: €{price}")
+                                                return price
+                                        except (ValueError, TypeError):
+                                            continue
+
+                    except (json.JSONDecodeError, ValueError) as e:
+                        logger.debug(f"    ⚠️ JSON pattern {i+1} error: {e}")
+                        continue
+
+                # === 2. REGEX PRICE EXTRACTION (FALLBACK) ===
+                logger.info("🔍 Trying regex patterns...")
+                price_patterns = [
+                    r'€\s*(\d+[.,]\d{2})',  # €3.99
+                    r'"price"[:\s]*"?(\d+[.,]\d{2})"?',  # "price": "3.99"
+                    r'(\d+[.,]\d{2})\s*€',  # 3.99€
+                    r'"amount"[:\s]*"?(\d+[.,]\d{2})"?',  # "amount": "3.99"
+                    r'data-price="(\d+[.,]\d{2})"',  # data-price="3.99"
+                    r'pricebox[^}]*?(\d+[.,]\d{2})',  # pricebox patterns
+                ]
+
+                found_prices = []
+                for pattern in price_patterns:
+                    matches = re.findall(pattern, html_content, re.IGNORECASE)
+                    for match in matches:
+                        try:
+                            price = float(match.replace(',', '.'))
+                            if 0.50 <= price <= 100:  # Reasonable grocery price range
+                                found_prices.append(price)
+                        except ValueError:
+                            continue
+
+                if found_prices:
+                    # Remove duplicates and sort
+                    unique_prices = sorted(list(set(found_prices)))
+                    logger.info(f"Found potential prices: {unique_prices[:5]}")
+
+                    # Take the first reasonable price
+                    if unique_prices:
+                        price = unique_prices[0]
+                        logger.info(f"✅ Lidl price via regex: €{price}")
+                        return price
+
+                logger.warning("⚠️ No valid prices found in Lidl page")
+                return None
+
+            else:
+                logger.warning(f"⚠️ Lidl requests failed: HTTP {response.status_code}")
+                return None
+
+        except Exception as e:
+            logger.error(f"❌ Lidl requests error: {e}")
+            return None
+
+    def _scrape_lidl_selenium_fallback(self, url: str, product_name: str) -> Optional[float]:
+        """Selenium fallback method for Lidl"""
+        try:
+            logger.info("🔄 Trying Lidl Selenium fallback...")
+
+            if not self.driver:
+                logger.warning("⚠️ No Selenium driver available")
+                return None
+
+            self.driver.get(url)
+            time.sleep(3)  # Wait for page load
+
+            # Check for JSON-LD in page source
+            page_source = self.driver.page_source
+
+            # Try JSON-LD extraction
+            scripts = self.driver.find_elements(By.XPATH, "//script[@type='application/ld+json']")
+            for script in scripts[:3]:
+                try:
+                    data = json.loads(script.get_attribute('innerHTML'))
+                    if data.get('@type') == 'Product':
+                        offers = data.get('offers', {})
+                        if isinstance(offers, dict) and offers.get('price'):
+                            price = float(offers['price'])
+                            if 0.01 <= price <= 1000:
+                                logger.info(f"✅ Lidl price via Selenium JSON-LD: €{price}")
+                                return price
+                except (json.JSONDecodeError, ValueError, KeyError):
+                    continue
+
+            # Try CSS selectors
+            selectors = [
+                '.pricebox__price',
+                '.price-now',
+                '.pricebox__basic-quantity-price',
+                '.pricebox__highlight',
+                '.price',
+                '[data-testid*="price"]',
+                'span[class*="price"]'
+            ]
+
+            for selector in selectors:
+                try:
+                    elements = self.driver.find_elements(By.CSS_SELECTOR, selector)
+                    for element in elements[:3]:
+                        text = element.text.strip()
+                        if text and '€' in text:
+                            price = self.extract_price_from_text(text)
+                            if price:
+                                logger.info(f"✅ Lidl price via Selenium selector '{selector}': €{price}")
+                                return price
+                except Exception:
+                    continue
+
+            # Final regex on page source
+            price_patterns = [
+                r'€\s*(\d+[.,]\d{2})',
+                r'"price"[:\s]*"?(\d+[.,]\d{2})"?',
+            ]
+
+            for pattern in price_patterns:
+                matches = re.findall(pattern, page_source)
+                for match in matches[:5]:
+                    try:
+                        price = float(match.replace(',', '.'))
+                        if 0.01 <= price <= 1000:
+                            logger.info(f"✅ Lidl price via Selenium regex: €{price}")
+                            return price
+                    except ValueError:
+                        continue
+
+            logger.warning(f"⚠️ Could not find Lidl price for {product_name}")
+            return None
+
+        except Exception as e:
+            logger.error(f"❌ Lidl Selenium fallback error: {e}")
+            return None
+
     def _scrape_dunnes_requests_fallback(self, url: str, product_name: str) -> Optional[float]:
         """Enhanced requests fallback for Dunnes - GitHub Actions optimized"""
         max_retries = 3
@@ -1312,13 +1796,17 @@ class SimpleLocalScraper:
         logger.error("❌ All Dunnes requests fallback attempts failed")
         return None
     
-    def get_product_aliases(self, store_name: str = None, limit: int = 5) -> List[Dict]:
+    def get_product_aliases(self, store_name: str = None, limit: int = 5, product_id: int = None) -> List[Dict]:
         """Get product aliases from production API"""
         try:
             params = {'limit': limit}
             if store_name:
                 params['store_name'] = store_name
-            
+            if product_id:
+                params['product_id'] = product_id
+                # When targeting specific product, set limit to ensure we get it
+                params['limit'] = 1000
+
             response = self.session.get(f'{API_URL}/api/product-aliases/', params=params)
             
             if response.status_code == 200:
@@ -1386,7 +1874,7 @@ class SimpleLocalScraper:
         
         return False
     
-    def scrape_store(self, store_name: str, max_products: int = 5):
+    def scrape_store(self, store_name: str, max_products: int = 5, product_id: int = None):
         """
         Execute Store-Specific Scraping with Adaptive Performance
         
@@ -1424,7 +1912,7 @@ class SimpleLocalScraper:
         logger.info(f"{'='*50}")
         
         # Get product aliases for this store
-        aliases = self.get_product_aliases(store_name, max_products)
+        aliases = self.get_product_aliases(store_name, max_products, product_id)
         if not aliases:
             logger.error(f"No aliases found for {store_name}")
             return
@@ -1461,6 +1949,8 @@ class SimpleLocalScraper:
                 price = self.scrape_supervalu(alias['scraper_url'], alias['alias_name'])
             elif store_name.lower() == 'dunnes':
                 price = self.scrape_dunnes(alias['scraper_url'], alias['alias_name'])
+            elif store_name.lower() == 'lidl':
+                price = self.scrape_lidl(alias['scraper_url'], alias['alias_name'])
             
             elapsed = time.time() - start_time
             
@@ -1512,12 +2002,12 @@ class SimpleLocalScraper:
         logger.info(f"   Success Rate: {(successful/len(results)*100):.1f}%")
         logger.info(f"{'='*50}")
     
-    def run(self, stores: List[str] = None, max_products: int = 5):
+    def run(self, stores: List[str] = None, max_products: int = 5, product_id: int = None):
         """Main execution method"""
         if stores is None:
             # Note: Dunnes disabled in GitHub Actions due to Cloudflare blocking
             # Works locally but fails in CI/CD environment
-            stores = ['Aldi', 'Tesco', 'SuperValu', 'Dunnes']
+            stores = ['Aldi', 'Tesco', 'SuperValu', 'Dunnes', 'Lidl']
         
         logger.info("🚀 Starting Simple Local to Production Scraper")
         logger.info(f"Target stores: {', '.join(stores)}")
@@ -1537,7 +2027,7 @@ class SimpleLocalScraper:
         try:
             # Scrape each store
             for store in stores:
-                self.scrape_store(store, max_products)
+                self.scrape_store(store, max_products, product_id)
                 
         finally:
             # Cleanup
@@ -1550,27 +2040,42 @@ class SimpleLocalScraper:
 def main():
     """CLI interface"""
     import argparse
-    
+
     parser = argparse.ArgumentParser(description='Simple Local to Production Scraper')
-    parser.add_argument('--store', type=str, help='Store name (Aldi, Tesco, SuperValu, Dunnes)')
+    parser.add_argument('--store', type=str, help='Store name (Aldi, Tesco, SuperValu, Dunnes, Lidl)')
     parser.add_argument('--all', action='store_true', help='Scrape all stores')
     parser.add_argument('--products', type=int, default=3, help='Max products per store')
-    
+    parser.add_argument('--product-id', type=int, help='Scrape specific product ID only')
+    parser.add_argument('--debug-prices', action='store_true', help='Enable comprehensive price analysis for debugging (shows all price types found)')
+
     args = parser.parse_args()
-    
-    # Determine stores
-    if args.all:
-        stores = ['Aldi', 'Tesco', 'SuperValu', 'Dunnes'] 
-    elif args.store:
-        stores = [args.store]
+
+    # Handle product-specific scraping
+    if args.product_id:
+        logger.info(f"🎯 Targeting specific product ID: {args.product_id}")
+        # When scraping specific product, we need to check all stores
+        if args.store:
+            stores = [args.store]
+        else:
+            stores = ['Aldi', 'Tesco', 'SuperValu', 'Dunnes', 'Lidl']
+
+        # Run scraper for specific product
+        scraper = SimpleLocalScraper(debug_prices=args.debug_prices)
+        scraper.run(stores=stores, max_products=1000, product_id=args.product_id)
     else:
-        # Default: test all stores with fewer products
-        stores = ['Aldi', 'Tesco', 'SuperValu', 'Dunnes']
-        args.products = 2
-    
-    # Run scraper
-    scraper = SimpleLocalScraper()
-    scraper.run(stores=stores, max_products=args.products)
+        # Normal operation - determine stores
+        if args.all:
+            stores = ['Aldi', 'Tesco', 'SuperValu', 'Dunnes', 'Lidl']
+        elif args.store:
+            stores = [args.store]
+        else:
+            # Default: test all stores with fewer products
+            stores = ['Aldi', 'Tesco', 'SuperValu', 'Dunnes', 'Lidl']
+            args.products = 2
+
+        # Run scraper normally
+        scraper = SimpleLocalScraper(debug_prices=args.debug_prices)
+        scraper.run(stores=stores, max_products=args.products)
 
 if __name__ == '__main__':
     main()

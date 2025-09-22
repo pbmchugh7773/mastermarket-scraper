@@ -22,8 +22,8 @@ jobs:
     strategy:
       # Run all stores in parallel
       matrix:
-        store: [Aldi, Tesco, SuperValu, Dunnes]  # Re-enabled Dunnes with improved handling
-      
+        store: [Aldi, Tesco, SuperValu, Dunnes, Lidl]  # Added Lidl support
+
       # Don't cancel other stores if one fails
       fail-fast: false
     
@@ -166,7 +166,8 @@ jobs:
           echo "• Tesco: ~300 products in ~10 hours"
           echo "• SuperValu: ~300 products in ~10 hours"
           echo "• Dunnes: ~300 products in ~70 minutes"
-          echo "• Total: ~1200 products updated"
+          echo "• Lidl: ~300 products in ~30 minutes"
+          echo "• Total: ~1500 products updated"
           echo ""
           echo "🔗 Check results at: https://www.mastermarketapp.com/products"
       
