@@ -369,6 +369,8 @@ class SimpleLocalScraper:
                 'p[class*="priceText"]',
                 '[class*="price"]',
                 '.ddsweb-price__subtext',  # Per-unit prices
+                '.ddsweb-value-bar__content-text',  # Clubcard prices
+                'p.ddsweb-text.ddsweb-value-bar__content-text',  # Specific Clubcard selector
             ]
 
             found_prices = []
@@ -398,15 +400,31 @@ class SimpleLocalScraper:
 
                             # Check for per-unit price (look for indicators directly in the text first)
                             per_unit_indicators = ['/kg', '/100g', '/ml', '/l', '/litre', 'per kg', 'per 100g', 'per litre']
-                            clubcard_indicators = ['clubcard', 'better than half price', 'half price', 'value-bar']
+                            clubcard_indicators = [
+                                'clubcard', 'better than half price', 'half price', 'value-bar',
+                                'club card', 'member price', 'loyalty price', 'special offer',
+                                'tesco clubcard price', 'exclusive offer', 'club-card', 'tesco club',
+                                'member', 'loyalty', 'discount', 'offer', 'deal', 'promo', 'save',
+                                'was', 'now', 'reduced', 'multibuy', 'any.*for', 'buy.*get'
+                            ]
 
                             # Priority 1: If the text itself contains per-unit indicators, it's definitely per-unit
                             if any(indicator in text_lower for indicator in per_unit_indicators):
                                 price_info['type'] = 'per_unit'
                                 if not result['per_unit'] or price_value > result['per_unit']:
                                     result['per_unit'] = price_value
-                            # Priority 2: If context suggests Clubcard but text doesn't have per-unit indicators
-                            elif any(indicator in combined_context for indicator in clubcard_indicators):
+                            # Priority 2: If text specifically mentions "clubcard price", it's definitely clubcard
+                            elif 'clubcard price' in text_lower or 'clubcard' in text_lower:
+                                price_info['type'] = 'clubcard'
+                                if not result['clubcard'] or price_value < result['clubcard']:
+                                    result['clubcard'] = price_value
+                            # Priority 3: Check for strong clubcard indicators in text itself
+                            elif any(indicator in text_lower for indicator in ['better than half', 'member price', 'special offer', 'value-bar']):
+                                price_info['type'] = 'clubcard'
+                                if not result['clubcard'] or price_value < result['clubcard']:
+                                    result['clubcard'] = price_value
+                            # Priority 4: If broader context suggests Clubcard but text doesn't have strong indicators
+                            elif any(indicator in combined_context for indicator in ['clubcard price', 'better than half price', 'member price', 'special offer']):
                                 price_info['type'] = 'clubcard'
                                 if not result['clubcard'] or price_value < result['clubcard']:
                                     result['clubcard'] = price_value
@@ -469,7 +487,9 @@ class SimpleLocalScraper:
         clubcard_indicators = [
             'clubcard', 'better than half price', 'half price', 'value-bar',
             'club card', 'member price', 'loyalty price', 'special offer',
-            'tesco clubcard price', 'exclusive offer'
+            'tesco clubcard price', 'exclusive offer', 'club-card', 'tesco club',
+            'member', 'loyalty', 'discount', 'offer', 'deal', 'promo', 'save',
+            'was', 'now', 'reduced', 'multibuy', 'any.*for', 'buy.*get'
         ]
 
         if any(indicator in combined_text for indicator in clubcard_indicators):
@@ -673,6 +693,9 @@ class SimpleLocalScraper:
                                     elapsed = time.time() - start_time
                                     logger.info(f"✅ Tesco regular price via selector '{selector}': €{price} (in {elapsed:.1f}s)")
 
+                                    # Store HTML content for promotion analysis
+                                    self._last_html_content = self.driver.page_source
+
                                     # If debug mode is enabled, show comprehensive analysis before returning
                                     if self.debug_prices:
                                         try:
@@ -835,6 +858,9 @@ class SimpleLocalScraper:
             if response.status_code == 200:
                 html_content = response.text
                 logger.info(f"✅ Successfully fetched Tesco page with requests ({len(html_content)} chars)")
+
+                # Store HTML content for promotion analysis
+                self._last_html_content = html_content
                 
                 # Look for JSON-LD in the HTML
                 import re
@@ -1849,7 +1875,8 @@ class SimpleLocalScraper:
 
     def update_scraping_status(self, alias_id: int, success: bool, price: float = None,
                              error_message: str = None, promotion_type: str = None,
-                             promotion_text: str = None, promotion_discount_value: float = None) -> bool:
+                             promotion_text: str = None, promotion_discount_value: float = None,
+                             original_price: float = None) -> bool:
         """Update scraping status for an alias"""
         try:
             data = {
@@ -1859,7 +1886,8 @@ class SimpleLocalScraper:
                 'error_message': error_message,
                 'promotion_type': promotion_type,
                 'promotion_text': promotion_text,
-                'promotion_discount_value': promotion_discount_value
+                'promotion_discount_value': promotion_discount_value,
+                'original_price': original_price
             }
 
             response = self.session.post(f'{API_URL}/api/scraping/update-status', json=data, timeout=30)
@@ -2020,13 +2048,39 @@ class SimpleLocalScraper:
             elapsed = time.time() - start_time
             
             if price:
+                # Detect if this is a promotion price by checking if we found clubcard/promotion info
+                promotion_type = None
+                promotion_text = None
+                promotion_discount_value = None
+                original_price = None
+
+                # For Tesco, check if we detected a clubcard price
+                if store_name == 'Tesco':
+                    # Get comprehensive price analysis to check for promotions
+                    try:
+                        if hasattr(self, '_last_html_content'):
+                            all_prices = self.extract_tesco_all_prices(self._last_html_content)
+                            if all_prices.get('clubcard') and all_prices.get('regular'):
+                                if abs(price - all_prices['clubcard']) < 0.01:  # This is the clubcard price
+                                    promotion_type = 'membership_price'  # Use correct enum value
+                                    promotion_text = 'Clubcard Price'
+                                    promotion_discount_value = all_prices['regular'] - all_prices['clubcard']
+                                    original_price = all_prices['regular']
+                                    logger.info(f"🎟️ Detected Clubcard promotion: €{promotion_discount_value:.2f} savings (was €{original_price:.2f}, now €{price:.2f})")
+                    except Exception as e:
+                        logger.warning(f"Failed to detect promotion info: {e}")
+
                 # Update scraping status and upload price
                 if retry_mode:
-                    # Use new endpoint that tracks status
+                    # Use new endpoint that tracks status with promotion info
                     success = self.update_scraping_status(
                         alias_id=alias['id'],
                         success=True,
-                        price=price
+                        price=price,
+                        promotion_type=promotion_type,
+                        promotion_text=promotion_text,
+                        promotion_discount_value=promotion_discount_value,
+                        original_price=original_price
                     )
                 else:
                     # Normal mode: use existing upload method
