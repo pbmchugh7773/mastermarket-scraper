@@ -665,10 +665,8 @@ class SimpleLocalScraper:
                                 parent_text = ""
 
                             if text and ('€' in text or any(char.isdigit() for char in text)):
-                                # Skip if this is clearly a Clubcard price
-                                if 'clubcard' in parent_text.lower() or 'better than half price' in parent_text.lower():
-                                    logger.info(f"  ⏭️ Skipping Clubcard price: {text}")
-                                    continue
+                                # NOW INCLUDING Clubcard prices - removed exclusion logic
+                                # This allows capture of ALL promotional pricing
 
                                 price = self.extract_tesco_product_price(text, parent_text)
                                 if price:
