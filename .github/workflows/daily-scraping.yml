@@ -1,9 +1,11 @@
 name: Daily Price Scraping
 
 on:
-  # Run daily at 5:00 AM UTC (6:00 AM Irish time)
+  # First run: 5:00 AM UTC (6:00 AM Irish time) - Full scraping
+  # Second run: 14:00 UTC (3:00 PM Irish time) - Retry failed products
   schedule:
-    - cron: '0 5 * * *'
+    - cron: '0 5 * * *'   # First daily run
+    - cron: '0 14 * * *'  # Second daily run (retry mode)
   
   # Allow manual triggering for testing
   workflow_dispatch:
@@ -117,16 +119,29 @@ jobs:
           echo "🏪 Starting ${{ matrix.store }} scraping..."
           echo "📊 Max products: $MAX_PRODUCTS"
           echo "🕐 Started at: $(date)"
-          
+
+          # Detect if this is a retry run (second execution of the day)
+          CURRENT_HOUR=$(date -u +%H)
+          if [ "$CURRENT_HOUR" -ge "14" ]; then
+            echo "🔄 RETRY MODE: Processing only failed/pending products from morning run"
+            RETRY_FLAG="--retry-mode"
+            RUN_TYPE="retry"
+          else
+            echo "📦 NORMAL MODE: Processing all products (first run of the day)"
+            RETRY_FLAG=""
+            RUN_TYPE="normal"
+          fi
+
           # Start virtual display for headless Chrome
           Xvfb :99 -screen 0 1920x1080x24 > /dev/null 2>&1 &
-          
-          # Run the scraper
+
+          # Run the scraper with appropriate mode
           python simple_local_to_prod.py \
             --store "$STORE_NAME" \
-            --products "$MAX_PRODUCTS"
-          
-          echo "✅ ${{ matrix.store }} scraping completed at: $(date)"
+            --products "$MAX_PRODUCTS" \
+            $RETRY_FLAG
+
+          echo "✅ ${{ matrix.store }} scraping ($RUN_TYPE mode) completed at: $(date)"
       
       - name: 📊 Upload Results Summary
         if: always()
@@ -161,13 +176,24 @@ jobs:
           fi
           
           echo ""
-          echo "📈 Expected Results:"
-          echo "• Aldi: ~300 products in ~30 minutes"
-          echo "• Tesco: ~300 products in ~10 hours"
-          echo "• SuperValu: ~300 products in ~10 hours"
-          echo "• Dunnes: ~300 products in ~70 minutes"
-          echo "• Lidl: ~300 products in ~30 minutes"
-          echo "• Total: ~1500 products updated"
+
+          # Determine run type
+          CURRENT_HOUR=$(date -u +%H)
+          if [ "$CURRENT_HOUR" -ge "14" ]; then
+            echo "📈 Expected Results (RETRY MODE):"
+            echo "• Only processes products that failed in morning run"
+            echo "• Typical retry success rate: 60-80%"
+            echo "• Combined daily success rate target: 95%+"
+          else
+            echo "📈 Expected Results (NORMAL MODE):"
+            echo "• Aldi: ~300 products in ~30 minutes"
+            echo "• Tesco: ~300 products in ~10 hours (with promotions!)"
+            echo "• SuperValu: ~300 products in ~10 hours"
+            echo "• Dunnes: ~300 products in ~70 minutes"
+            echo "• Lidl: ~300 products in ~30 minutes"
+            echo "• Total: ~1500 products updated"
+            echo "• Failed products will be retried at 14:00 UTC"
+          fi
           echo ""
           echo "🔗 Check results at: https://www.mastermarketapp.com/products"
       

@@ -1820,7 +1820,66 @@ class SimpleLocalScraper:
         except Exception as e:
             logger.error(f"❌ Error getting aliases: {e}")
             return []
-    
+
+    def get_pending_aliases(self, store_name: str, limit: int = 100) -> List[Dict]:
+        """Get pending aliases that need scraping (retry mode)"""
+        try:
+            params = {
+                'store_name': store_name,
+                'limit': limit,
+                'retry_mode': True
+            }
+
+            response = self.session.get(f'{API_URL}/api/scraping/pending-aliases', params=params)
+
+            if response.status_code == 200:
+                data = response.json()
+                aliases = data.get('aliases', [])
+                total_pending = data.get('total_pending', 0)
+                logger.info(f"🔄 Retrieved {len(aliases)} pending aliases for {store_name} (total pending: {total_pending})")
+                return aliases
+            else:
+                logger.error(f"❌ Failed to get pending aliases: {response.status_code}")
+                logger.error(f"Response: {response.text}")
+                return []
+
+        except Exception as e:
+            logger.error(f"❌ Error getting pending aliases: {e}")
+            return []
+
+    def update_scraping_status(self, alias_id: int, success: bool, price: float = None,
+                             error_message: str = None, promotion_type: str = None,
+                             promotion_text: str = None, promotion_discount_value: float = None) -> bool:
+        """Update scraping status for an alias"""
+        try:
+            data = {
+                'alias_id': alias_id,
+                'success': success,
+                'price': price,
+                'error_message': error_message,
+                'promotion_type': promotion_type,
+                'promotion_text': promotion_text,
+                'promotion_discount_value': promotion_discount_value
+            }
+
+            response = self.session.post(f'{API_URL}/api/scraping/update-status', json=data, timeout=30)
+
+            if response.status_code == 200:
+                result = response.json()
+                if success and price:
+                    logger.info(f"✅ Updated status: Alias {alias_id} success, price €{price}")
+                else:
+                    logger.info(f"❌ Updated status: Alias {alias_id} failed - {error_message}")
+                return True
+            else:
+                logger.warning(f"⚠️ Failed to update status for alias {alias_id}: {response.status_code}")
+                logger.warning(f"Response: {response.text}")
+                return False
+
+        except Exception as e:
+            logger.error(f"❌ Error updating scraping status for alias {alias_id}: {e}")
+            return False
+
     def upload_price(self, alias: Dict, price: float, store_name: str) -> bool:
         """Upload price to production API with retry logic"""
         max_retries = 3
@@ -1872,7 +1931,7 @@ class SimpleLocalScraper:
         
         return False
     
-    def scrape_store(self, store_name: str, max_products: int = 5, product_id: int = None):
+    def scrape_store(self, store_name: str, max_products: int = 5, product_id: int = None, retry_mode: bool = False):
         """
         Execute Store-Specific Scraping with Adaptive Performance
         
@@ -1910,10 +1969,18 @@ class SimpleLocalScraper:
         logger.info(f"{'='*50}")
         
         # Get product aliases for this store
-        aliases = self.get_product_aliases(store_name, max_products, product_id)
-        if not aliases:
-            logger.error(f"No aliases found for {store_name}")
-            return
+        if retry_mode and not product_id:
+            # In retry mode, only get pending aliases
+            aliases = self.get_pending_aliases(store_name, max_products)
+            if not aliases:
+                logger.info(f"✅ No pending aliases found for {store_name} - all products up to date!")
+                return
+        else:
+            # Normal mode or specific product
+            aliases = self.get_product_aliases(store_name, max_products, product_id)
+            if not aliases:
+                logger.error(f"No aliases found for {store_name}")
+                return
         
         results = []
         
@@ -1953,9 +2020,18 @@ class SimpleLocalScraper:
             elapsed = time.time() - start_time
             
             if price:
-                # Upload to production
-                success = self.upload_price(alias, price, store_name)
-                
+                # Update scraping status and upload price
+                if retry_mode:
+                    # Use new endpoint that tracks status
+                    success = self.update_scraping_status(
+                        alias_id=alias['id'],
+                        success=True,
+                        price=price
+                    )
+                else:
+                    # Normal mode: use existing upload method
+                    success = self.upload_price(alias, price, store_name)
+
                 results.append({
                     'alias_id': alias['id'],
                     'name': alias['alias_name'],
@@ -1963,9 +2039,18 @@ class SimpleLocalScraper:
                     'uploaded': success,
                     'time': elapsed
                 })
-                
+
                 logger.info(f"✅ Success: €{price:.2f} ({'uploaded' if success else 'upload failed'}) in {elapsed:.2f}s")
             else:
+                # Failed to get price
+                if retry_mode:
+                    # Update status as failed
+                    self.update_scraping_status(
+                        alias_id=alias['id'],
+                        success=False,
+                        error_message="Failed to extract price"
+                    )
+
                 results.append({
                     'alias_id': alias['id'],
                     'name': alias['alias_name'],
@@ -1973,7 +2058,7 @@ class SimpleLocalScraper:
                     'uploaded': False,
                     'time': elapsed
                 })
-                
+
                 logger.warning(f"❌ Failed to extract price in {elapsed:.2f}s")
             
             # Adaptive delays based on store requirements
@@ -2000,16 +2085,18 @@ class SimpleLocalScraper:
         logger.info(f"   Success Rate: {(successful/len(results)*100):.1f}%")
         logger.info(f"{'='*50}")
     
-    def run(self, stores: List[str] = None, max_products: int = 5, product_id: int = None):
-        """Main execution method"""
+    def run(self, stores: List[str] = None, max_products: int = 5, product_id: int = None, retry_mode: bool = False):
+        """Main execution method with retry mode support"""
         if stores is None:
             # Note: Dunnes disabled in GitHub Actions due to Cloudflare blocking
             # Works locally but fails in CI/CD environment
             stores = ['Aldi', 'Tesco', 'SuperValu', 'Dunnes', 'Lidl']
-        
+
         logger.info("🚀 Starting Simple Local to Production Scraper")
         logger.info(f"Target stores: {', '.join(stores)}")
         logger.info(f"Max products per store: {max_products}")
+        if retry_mode:
+            logger.info("🔄 RETRY MODE ENABLED - Only processing failed/pending products")
         
         # Authenticate
         if not self.authenticate():
@@ -2025,7 +2112,7 @@ class SimpleLocalScraper:
         try:
             # Scrape each store
             for store in stores:
-                self.scrape_store(store, max_products, product_id)
+                self.scrape_store(store, max_products, product_id, retry_mode=retry_mode)
                 
         finally:
             # Cleanup
@@ -2045,6 +2132,7 @@ def main():
     parser.add_argument('--products', type=int, default=3, help='Max products per store')
     parser.add_argument('--product-id', type=int, help='Scrape specific product ID only')
     parser.add_argument('--debug-prices', action='store_true', help='Enable comprehensive price analysis for debugging (shows all price types found)')
+    parser.add_argument('--retry-mode', action='store_true', help='Only scrape products that failed or have no price today (for second daily run)')
 
     args = parser.parse_args()
 
@@ -2059,7 +2147,7 @@ def main():
 
         # Run scraper for specific product
         scraper = SimpleLocalScraper(debug_prices=args.debug_prices)
-        scraper.run(stores=stores, max_products=1000, product_id=args.product_id)
+        scraper.run(stores=stores, max_products=1000, product_id=args.product_id, retry_mode=args.retry_mode)
     else:
         # Normal operation - determine stores
         if args.all:
@@ -2073,7 +2161,7 @@ def main():
 
         # Run scraper normally
         scraper = SimpleLocalScraper(debug_prices=args.debug_prices)
-        scraper.run(stores=stores, max_products=args.products)
+        scraper.run(stores=stores, max_products=args.products, retry_mode=args.retry_mode)
 
 if __name__ == '__main__':
     main()
