@@ -152,7 +152,7 @@ jobs:
             RUN_TYPE="final-retry"
           else
             echo "📦 NORMAL MODE: Processing all products (first run of the day)"
-            EXTRA_FLAGS=""
+            EXTRA_FLAGS="--retry-mode"
             RUN_TYPE="normal"
           fi
 
