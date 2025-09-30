@@ -2394,7 +2394,7 @@ def main():
     parser = argparse.ArgumentParser(description='Simple Local to Production Scraper')
     parser.add_argument('--store', type=str, help='Store name (Aldi, Tesco, SuperValu, Dunnes, Lidl)')
     parser.add_argument('--all', action='store_true', help='Scrape all stores')
-    parser.add_argument('--products', type=int, default=3, help='Max products per store')
+    parser.add_argument('--products', type=int, default=100, help='Max products per store')
     parser.add_argument('--product-id', type=int, help='Scrape specific product ID only')
     parser.add_argument('--debug-prices', action='store_true', help='Enable comprehensive price analysis for debugging (shows all price types found)')
     parser.add_argument('--retry-mode', action='store_true', help='Only scrape products that failed or have no price today (for second daily run)')
