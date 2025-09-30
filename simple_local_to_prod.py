@@ -830,10 +830,23 @@ class SimpleLocalScraper:
                                 price = self.extract_tesco_product_price(text, parent_text)
                                 if price:
                                     elapsed = time.time() - start_time
-                                    logger.info(f"✅ Tesco regular price via selector '{selector}': €{price} (in {elapsed:.1f}s)")
 
                                     # Store HTML content for promotion analysis
                                     self._last_html_content = self.driver.page_source
+
+                                    # Check if there's a better price available (Clubcard)
+                                    page_source = self.driver.page_source
+                                    all_prices = self.extract_tesco_all_prices(page_source)
+
+                                    # If Clubcard price is available and lower, use it instead
+                                    final_price = price
+                                    price_type = "regular price"
+                                    if all_prices.get('clubcard') and all_prices['clubcard'] < price:
+                                        final_price = all_prices['clubcard']
+                                        price_type = "Clubcard price"
+                                        logger.info(f"🎟️ Better Clubcard price found: €{final_price} (was €{price})")
+
+                                    logger.info(f"✅ Tesco {price_type} via selector '{selector}': €{final_price} (in {elapsed:.1f}s)")
 
                                     # If debug mode is enabled, show comprehensive analysis before returning
                                     if self.debug_prices:
@@ -851,12 +864,12 @@ class SimpleLocalScraper:
                                                 for i, price_info in enumerate(all_prices['analysis'][:10]):
                                                     logger.info(f"  {i+1}. Type: {price_info['type']}, Value: €{price_info['value']}, Text: '{price_info['text']}'")
 
-                                            logger.info(f"✅ Selected for upload: €{price} (regular price)")
+                                            logger.info(f"✅ Selected for upload: €{final_price} ({price_type})")
                                             logger.info("🔍 === END DEBUG ANALYSIS ===")
                                         except Exception as debug_e:
                                             logger.warning(f"Debug analysis error: {debug_e}")
 
-                                    return price
+                                    return final_price
                         except Exception:
                             continue
 
@@ -2234,12 +2247,20 @@ class SimpleLocalScraper:
 
                             # Check for regular clubcard price promotion
                             elif all_prices.get('clubcard') and all_prices.get('regular'):
+                                # Check if we're uploading the Clubcard price (better price was selected)
                                 if abs(price - all_prices['clubcard']) < 0.01:  # This is the clubcard price
                                     promotion_type = 'membership_price'  # Use correct enum value
                                     promotion_text = 'Clubcard Price'
                                     promotion_discount_value = all_prices['regular'] - all_prices['clubcard']
                                     original_price = all_prices['regular']
                                     logger.info(f"🎟️ Detected Clubcard promotion: €{promotion_discount_value:.2f} savings (was €{original_price:.2f}, now €{price:.2f})")
+                                # Or if we're uploading regular price but Clubcard exists (promotion available but not taken)
+                                elif abs(price - all_prices['regular']) < 0.01 and all_prices['clubcard'] < all_prices['regular']:
+                                    promotion_type = 'membership_price'
+                                    promotion_text = 'Clubcard Price Available'
+                                    promotion_discount_value = all_prices['regular'] - all_prices['clubcard']
+                                    original_price = all_prices['regular']
+                                    logger.info(f"🎟️ Detected available Clubcard promotion: €{promotion_discount_value:.2f} potential savings (Clubcard: €{all_prices['clubcard']}, Regular: €{price:.2f})")
                     except Exception as e:
                         logger.warning(f"Failed to detect promotion info: {e}")
 
