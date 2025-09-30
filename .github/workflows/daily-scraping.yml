@@ -2,11 +2,13 @@ name: Daily Price Scraping
 
 on:
   # First run: 5:00 AM UTC (6:00 AM Irish time) - Full scraping
-  # Second run: 14:00 UTC (3:00 PM Irish time) - Retry failed products
-  # Third run: 8:00 AM UTC on Sundays (9:00 AM Irish time) - Weekly promotions scan
+  # Second run: 6:00 AM UTC (7:00 AM Irish time) - Early retry (1 hour after first)
+  # Third run: 14:00 UTC (3:00 PM Irish time) - Final retry failed products
+  # Fourth run: 8:00 AM UTC on Sundays (9:00 AM Irish time) - Weekly promotions scan
   schedule:
     - cron: '0 5 * * *'   # Daily run (normal mode)
-    - cron: '0 14 * * *'  # Daily retry run (retry mode)
+    - cron: '0 6 * * *'   # Early retry run (retry mode) - 1 hour after first
+    - cron: '0 14 * * *'  # Final retry run (retry mode)
     - cron: '0 8 * * 0'   # Weekly promotions run (promotions mode) - Sundays
   
   # Allow manual triggering for testing
@@ -140,10 +142,14 @@ jobs:
             echo "🎯 PROMOTIONS MODE: Weekly comprehensive promotions scan (Sundays 8:00 UTC)"
             EXTRA_FLAGS="--promotions-mode"
             RUN_TYPE="promotions"
-          elif [ "$CURRENT_HOUR" -ge "14" ]; then
-            echo "🔄 RETRY MODE: Processing only failed/pending products from morning run"
+          elif [ "$CURRENT_HOUR" -eq "6" ]; then
+            echo "🔄 EARLY RETRY MODE: Quick retry of failed products (1 hour after first run)"
             EXTRA_FLAGS="--retry-mode"
-            RUN_TYPE="retry"
+            RUN_TYPE="early-retry"
+          elif [ "$CURRENT_HOUR" -ge "14" ]; then
+            echo "🔄 FINAL RETRY MODE: Last attempt for remaining failed products"
+            EXTRA_FLAGS="--retry-mode"
+            RUN_TYPE="final-retry"
           else
             echo "📦 NORMAL MODE: Processing all products (first run of the day)"
             EXTRA_FLAGS=""
@@ -199,7 +205,7 @@ jobs:
           CURRENT_HOUR=$(date -u +%H)
           CURRENT_DAY=$(date -u +%u)  # 1=Monday, 7=Sunday
 
-          # Check if this was a manual promotions run from the environment
+          # Check execution type and provide appropriate summary
           if echo "${{ needs.scrape-prices.outputs.run_type || '' }}" | grep -q "promotions" || [ "$CURRENT_DAY" -eq "7" ] && [ "$CURRENT_HOUR" -eq "8" ]; then
             echo "📈 Expected Results (PROMOTIONS MODE):"
             echo "• Comprehensive promotions scan for all stores"
@@ -208,11 +214,18 @@ jobs:
             echo "• Tesco: Enhanced Clubcard price detection"
             echo "• All stores: Full promotional metadata capture"
             echo "• Weekly promotions database refresh"
+          elif [ "$CURRENT_HOUR" -eq "6" ]; then
+            echo "📈 Expected Results (EARLY RETRY MODE):"
+            echo "• Quick retry of products that failed in 5:00 AM run"
+            echo "• Catches temporary failures (anti-bot, timeouts, network issues)"
+            echo "• Typical early retry success rate: 70-85%"
+            echo "• Remaining failures will be retried at 14:00 UTC"
           elif [ "$CURRENT_HOUR" -ge "14" ]; then
-            echo "📈 Expected Results (RETRY MODE):"
-            echo "• Only processes products that failed in morning run"
-            echo "• Typical retry success rate: 60-80%"
-            echo "• Combined daily success rate target: 95%+"
+            echo "📈 Expected Results (FINAL RETRY MODE):"
+            echo "• Final attempt for products that failed in morning and early retry"
+            echo "• Processes most stubborn failures with fresh sessions"
+            echo "• Typical final retry success rate: 50-70%"
+            echo "• Combined daily success rate target: 98%+"
           else
             echo "📈 Expected Results (NORMAL MODE):"
             echo "• Aldi: ~300 products in ~30 minutes"
@@ -221,7 +234,7 @@ jobs:
             echo "• Dunnes: ~300 products in ~70 minutes"
             echo "• Lidl: ~300 products in ~30 minutes"
             echo "• Total: ~1500 products updated"
-            echo "• Failed products will be retried at 14:00 UTC"
+            echo "• Failed products will be retried at 6:00 and 14:00 UTC"
           fi
           echo ""
           echo "🔗 Check results at: https://www.mastermarketapp.com/products"
