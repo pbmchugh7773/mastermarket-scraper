@@ -3,9 +3,11 @@ name: Daily Price Scraping
 on:
   # First run: 5:00 AM UTC (6:00 AM Irish time) - Full scraping
   # Second run: 14:00 UTC (3:00 PM Irish time) - Retry failed products
+  # Third run: 8:00 AM UTC on Sundays (9:00 AM Irish time) - Weekly promotions scan
   schedule:
-    - cron: '0 5 * * *'   # First daily run
-    - cron: '0 14 * * *'  # Second daily run (retry mode)
+    - cron: '0 5 * * *'   # Daily run (normal mode)
+    - cron: '0 14 * * *'  # Daily retry run (retry mode)
+    - cron: '0 8 * * 0'   # Weekly promotions run (promotions mode) - Sundays
   
   # Allow manual triggering for testing
   workflow_dispatch:
@@ -15,6 +17,11 @@ on:
         required: false
         default: '300'
         type: string
+      promotions_mode:
+        description: 'Enable promotions mode (captures promotional data)'
+        required: false
+        default: false
+        type: boolean
 
 jobs:
   scrape-prices:
@@ -114,21 +121,32 @@ jobs:
           # Store Configuration
           STORE_NAME: ${{ matrix.store }}
           MAX_PRODUCTS: ${{ github.event.inputs.max_products || '300' }}
+          MANUAL_PROMOTIONS_MODE: ${{ github.event.inputs.promotions_mode || 'false' }}
         
         run: |
           echo "🏪 Starting ${{ matrix.store }} scraping..."
           echo "📊 Max products: $MAX_PRODUCTS"
           echo "🕐 Started at: $(date)"
 
-          # Detect if this is a retry run (second execution of the day)
+          # Detect execution mode based on time, day, and manual inputs
           CURRENT_HOUR=$(date -u +%H)
-          if [ "$CURRENT_HOUR" -ge "14" ]; then
+          CURRENT_DAY=$(date -u +%u)  # 1=Monday, 7=Sunday
+
+          if [ "$MANUAL_PROMOTIONS_MODE" = "true" ]; then
+            echo "🎯 PROMOTIONS MODE: Manual promotions scan triggered"
+            EXTRA_FLAGS="--promotions-mode"
+            RUN_TYPE="promotions"
+          elif [ "$CURRENT_DAY" -eq "7" ] && [ "$CURRENT_HOUR" -eq "8" ]; then
+            echo "🎯 PROMOTIONS MODE: Weekly comprehensive promotions scan (Sundays 8:00 UTC)"
+            EXTRA_FLAGS="--promotions-mode"
+            RUN_TYPE="promotions"
+          elif [ "$CURRENT_HOUR" -ge "14" ]; then
             echo "🔄 RETRY MODE: Processing only failed/pending products from morning run"
-            RETRY_FLAG="--retry-mode"
+            EXTRA_FLAGS="--retry-mode"
             RUN_TYPE="retry"
           else
             echo "📦 NORMAL MODE: Processing all products (first run of the day)"
-            RETRY_FLAG=""
+            EXTRA_FLAGS=""
             RUN_TYPE="normal"
           fi
 
@@ -139,7 +157,7 @@ jobs:
           python simple_local_to_prod.py \
             --store "$STORE_NAME" \
             --products "$MAX_PRODUCTS" \
-            $RETRY_FLAG
+            $EXTRA_FLAGS
 
           echo "✅ ${{ matrix.store }} scraping ($RUN_TYPE mode) completed at: $(date)"
       
@@ -177,9 +195,20 @@ jobs:
           
           echo ""
 
-          # Determine run type
+          # Determine run type for summary
           CURRENT_HOUR=$(date -u +%H)
-          if [ "$CURRENT_HOUR" -ge "14" ]; then
+          CURRENT_DAY=$(date -u +%u)  # 1=Monday, 7=Sunday
+
+          # Check if this was a manual promotions run from the environment
+          if echo "${{ needs.scrape-prices.outputs.run_type || '' }}" | grep -q "promotions" || [ "$CURRENT_DAY" -eq "7" ] && [ "$CURRENT_HOUR" -eq "8" ]; then
+            echo "📈 Expected Results (PROMOTIONS MODE):"
+            echo "• Comprehensive promotions scan for all stores"
+            echo "• Captures Clubcard prices, multi-buy deals, discounts"
+            echo "• Updates promotion_type, promotion_text, original_price fields"
+            echo "• Tesco: Enhanced Clubcard price detection"
+            echo "• All stores: Full promotional metadata capture"
+            echo "• Weekly promotions database refresh"
+          elif [ "$CURRENT_HOUR" -ge "14" ]; then
             echo "📈 Expected Results (RETRY MODE):"
             echo "• Only processes products that failed in morning run"
             echo "• Typical retry success rate: 60-80%"
