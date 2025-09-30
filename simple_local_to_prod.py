@@ -375,6 +375,41 @@ class SimpleLocalScraper:
 
             found_prices = []
 
+            # First, look for promotion text elements without specific prices
+            promotion_selectors = [
+                '.ddsweb-value-bar__content-text',  # Clubcard/promotion text
+                'p.ddsweb-text.ddsweb-value-bar__content-text'
+            ]
+
+            for selector in promotion_selectors:
+                elements = soup.select(selector)
+                for element in elements:
+                    text = element.get_text(strip=True)
+                    text_lower = text.lower()
+
+                    # Check for multi-buy promotions without extracting a specific price
+                    multibuy_patterns = [
+                        'any 2 for', 'any 3 for', 'any 4 for', '2 for €', '3 for €', '4 for €',
+                        'buy 2 get', 'buy 3 get', '2x1', '3x2', 'multibuy'
+                    ]
+
+                    if any(pattern in text_lower for pattern in multibuy_patterns):
+                        promotion_info = {
+                            'value': None,  # No specific price
+                            'text': text,
+                            'context': '',
+                            'selector': selector,
+                            'type': 'multi_buy',
+                            'promotion_text': text
+                        }
+                        found_prices.append(promotion_info)
+
+                        # Store multi-buy promotions separately
+                        if 'multi_buy_promotions' not in result:
+                            result['multi_buy_promotions'] = []
+                        result['multi_buy_promotions'].append(promotion_info)
+
+            # Then look for price elements
             for selector in all_price_selectors:
                 elements = soup.select(selector)
                 for element in elements:
@@ -400,12 +435,19 @@ class SimpleLocalScraper:
 
                             # Check for per-unit price (look for indicators directly in the text first)
                             per_unit_indicators = ['/kg', '/100g', '/ml', '/l', '/litre', 'per kg', 'per 100g', 'per litre']
+
+                            # Multi-buy promotion patterns
+                            multibuy_patterns = [
+                                'any 2 for', 'any 3 for', 'any 4 for', '2 for €', '3 for €', '4 for €',
+                                'buy 2 get', 'buy 3 get', '2x1', '3x2', 'multibuy'
+                            ]
+
                             clubcard_indicators = [
                                 'clubcard', 'better than half price', 'half price', 'value-bar',
                                 'club card', 'member price', 'loyalty price', 'special offer',
                                 'tesco clubcard price', 'exclusive offer', 'club-card', 'tesco club',
                                 'member', 'loyalty', 'discount', 'offer', 'deal', 'promo', 'save',
-                                'was', 'now', 'reduced', 'multibuy', 'any.*for', 'buy.*get'
+                                'was', 'now', 'reduced'
                             ]
 
                             # Priority 1: If the text itself contains per-unit indicators, it's definitely per-unit
@@ -413,7 +455,15 @@ class SimpleLocalScraper:
                                 price_info['type'] = 'per_unit'
                                 if not result['per_unit'] or price_value > result['per_unit']:
                                     result['per_unit'] = price_value
-                            # Priority 2: If text specifically mentions "clubcard price", it's definitely clubcard
+                            # Priority 2: Check for multi-buy promotions
+                            elif any(pattern in text_lower for pattern in multibuy_patterns):
+                                price_info['type'] = 'multi_buy'
+                                price_info['promotion_text'] = text
+                                # Store this as a promotion but don't use it as the main price
+                                if 'multi_buy_promotions' not in result:
+                                    result['multi_buy_promotions'] = []
+                                result['multi_buy_promotions'].append(price_info)
+                            # Priority 3: If text specifically mentions "clubcard price", it's definitely clubcard
                             elif 'clubcard price' in text_lower or 'clubcard' in text_lower:
                                 price_info['type'] = 'clubcard'
                                 if not result['clubcard'] or price_value < result['clubcard']:
@@ -458,6 +508,104 @@ class SimpleLocalScraper:
             logger.warning(f"Error in extract_tesco_all_prices: {e}")
             return result
 
+    def detect_promotion_data(self, price_element_text: str, parent_element_text: str) -> dict:
+        """
+        Detect and extract promotion information from price elements
+
+        Args:
+            price_element_text: Text from the price element
+            parent_element_text: Text from parent/context element
+
+        Returns:
+            dict: Promotion data with keys: original_price, promotion_type, promotion_text,
+                  clubcard_price, promotion_discount_value
+        """
+        promotion_data = {
+            'original_price': None,
+            'promotion_type': None,
+            'promotion_text': None,
+            'clubcard_price': None,
+            'promotion_discount_value': None
+        }
+
+        combined_text = (price_element_text + " " + parent_element_text).lower()
+
+        # Detect Clubcard prices
+        if 'clubcard' in combined_text or 'club card' in combined_text:
+            promotion_data['promotion_type'] = 'membership_price'
+            promotion_data['promotion_text'] = 'Clubcard Price'
+
+            # Extract clubcard price from price element
+            clubcard_price = self.extract_price_value_from_text(price_element_text)
+            if clubcard_price:
+                promotion_data['clubcard_price'] = clubcard_price
+
+            # Look for original price in combined text
+            import re
+            was_price_patterns = [
+                r'was[^\d]*([£€$]?[\d.]+)',
+                r'originally[^\d]*([£€$]?[\d.]+)',
+                r'regular[^\d]*([£€$]?[\d.]+)'
+            ]
+
+            for pattern in was_price_patterns:
+                match = re.search(pattern, combined_text)
+                if match:
+                    try:
+                        original_price = float(match.group(1).replace('£', '').replace('€', '').replace('$', ''))
+                        promotion_data['original_price'] = original_price
+                        if clubcard_price:
+                            promotion_data['promotion_discount_value'] = original_price - clubcard_price
+                        break
+                    except ValueError:
+                        continue
+
+        # Detect "Was/Now" promotions
+        elif ('was' in combined_text and 'now' in combined_text) or 'reduced' in combined_text:
+            promotion_data['promotion_type'] = 'temporary_discount'
+            promotion_data['promotion_text'] = parent_element_text.strip()
+
+            # Extract was price
+            import re
+            was_match = re.search(r'was[^\d]*([£€$]?[\d.]+)', combined_text)
+            if was_match:
+                try:
+                    promotion_data['original_price'] = float(was_match.group(1).replace('£', '').replace('€', '').replace('$', ''))
+                except ValueError:
+                    pass
+
+        # Detect multi-buy offers
+        elif re.search(r'\d+\s*for\s*[£€$]?[\d.]+', combined_text) or 'any' in combined_text and 'for' in combined_text:
+            promotion_data['promotion_type'] = 'multi_buy'
+            promotion_data['promotion_text'] = parent_element_text.strip()
+
+        # Detect percentage discounts
+        elif 'better than half price' in combined_text:
+            promotion_data['promotion_type'] = 'percentage_off'
+            promotion_data['promotion_text'] = 'Better than half price'
+            promotion_data['promotion_discount_value'] = 50.0
+
+        return promotion_data
+
+    def extract_price_value_from_text(self, text: str) -> Optional[float]:
+        """Extract price value from text containing currency symbols"""
+        import re
+
+        # Handle both € and encoded â¬
+        price_patterns = [
+            r'[€â¬]\s*(\d+[.,]\d{2})',
+            r'(\d+[.,]\d{2})\s*[€â¬]',
+        ]
+
+        for pattern in price_patterns:
+            match = re.search(pattern, text)
+            if match:
+                try:
+                    return float(match.group(1).replace(',', '.'))
+                except ValueError:
+                    continue
+        return None
+
     def extract_tesco_product_price(self, text: str, context: str = "") -> Optional[float]:
         """
         Extract Tesco product price specifically, excluding per-unit prices and Clubcard prices
@@ -483,17 +631,8 @@ class SimpleLocalScraper:
             logger.info(f"    ⏭️ Skipping per-unit price in text: {text}")
             return None
 
-        # Skip if this is a Clubcard price based on context or text
-        clubcard_indicators = [
-            'clubcard', 'better than half price', 'half price', 'value-bar',
-            'club card', 'member price', 'loyalty price', 'special offer',
-            'tesco clubcard price', 'exclusive offer', 'club-card', 'tesco club',
-            'member', 'loyalty', 'discount', 'offer', 'deal', 'promo', 'save',
-            'was', 'now', 'reduced', 'multibuy', 'any.*for', 'buy.*get'
-        ]
-
-        if any(indicator in combined_text for indicator in clubcard_indicators):
-            return None
+        # REMOVED: Previous exclusion of Clubcard prices - now we CAPTURE all prices including promotions
+        # This allows the system to detect and save promotional pricing data
 
         # Look for product price patterns (handle both € and encoded â¬)
         price_patterns = [
@@ -948,10 +1087,8 @@ class SimpleLocalScraper:
                             context_end = min(len(html_content), match_index + 200)
                             context = html_content[context_start:context_end]
 
-                            # Skip if context contains Clubcard indicators
-                            if any(indicator in context.lower() for indicator in ['clubcard', 'better than half price', 'value-bar']):
-                                logger.info(f"    ⏭️ Skipping price in Clubcard context: €{match}")
-                                continue
+                            # REMOVED: Previous exclusion of Clubcard prices - now we CAPTURE promotional prices
+                            # This enables promotion detection and data collection
 
                             price = self.extract_tesco_product_price(f"€{match}", context)
                             if price:
@@ -1908,11 +2045,11 @@ class SimpleLocalScraper:
             logger.error(f"❌ Error updating scraping status for alias {alias_id}: {e}")
             return False
 
-    def upload_price(self, alias: Dict, price: float, store_name: str) -> bool:
-        """Upload price to production API with retry logic"""
+    def upload_price(self, alias: Dict, price: float, store_name: str, promotion_data: dict = None) -> bool:
+        """Upload price with optional promotion data to production API with retry logic"""
         max_retries = 3
         retry_delay = 2
-        
+
         for attempt in range(max_retries):
             try:
                 data = {
@@ -1923,6 +2060,29 @@ class SimpleLocalScraper:
                     'currency': 'EUR',
                     'country': 'IE'
                 }
+
+                # Add promotion data if available
+                if promotion_data:
+                    if promotion_data.get('original_price'):
+                        data['original_price'] = promotion_data['original_price']
+                    if promotion_data.get('promotion_type'):
+                        data['promotion_type'] = promotion_data['promotion_type']
+                    if promotion_data.get('promotion_text'):
+                        data['promotion_text'] = promotion_data['promotion_text']
+                    if promotion_data.get('clubcard_price'):
+                        data['clubcard_price'] = promotion_data['clubcard_price']
+                    if promotion_data.get('promotion_discount_value'):
+                        data['promotion_discount_value'] = promotion_data['promotion_discount_value']
+
+                    # Add promotion metadata
+                    from datetime import datetime
+                    data['promotion_details'] = {
+                        'detected_at': datetime.now().isoformat(),
+                        'detection_method': 'enhanced_css_selector_analysis',
+                        'confidence_level': 'high'
+                    }
+
+                    logger.info(f"🎉 Promotion detected: {promotion_data['promotion_type']} - {promotion_data.get('promotion_text', 'N/A')}")
                 
                 # Use the community prices endpoint
                 response = self.session.post(f'{API_URL}/api/community-prices/submit', json=data, timeout=30)
@@ -1959,7 +2119,7 @@ class SimpleLocalScraper:
         
         return False
     
-    def scrape_store(self, store_name: str, max_products: int = 5, product_id: int = None, retry_mode: bool = False):
+    def scrape_store(self, store_name: str, max_products: int = 5, product_id: int = None, retry_mode: bool = False, promotions_mode: bool = False):
         """
         Execute Store-Specific Scraping with Adaptive Performance
         
@@ -2054,13 +2214,26 @@ class SimpleLocalScraper:
                 promotion_discount_value = None
                 original_price = None
 
-                # For Tesco, check if we detected a clubcard price
+                # For Tesco, check if we detected a clubcard price or multi-buy promotion
                 if store_name == 'Tesco':
                     # Get comprehensive price analysis to check for promotions
                     try:
                         if hasattr(self, '_last_html_content'):
                             all_prices = self.extract_tesco_all_prices(self._last_html_content)
-                            if all_prices.get('clubcard') and all_prices.get('regular'):
+
+                            # Check for multi-buy promotions first
+                            if all_prices.get('multi_buy_promotions'):
+                                # Found multi-buy promotion
+                                promo = all_prices['multi_buy_promotions'][0]  # Take first multi-buy promotion
+                                promotion_type = 'multi_buy'  # Use multi_buy enum for multi-buy
+                                promotion_text = promo['text']
+                                # For multi-buy, we don't have individual discount value
+                                promotion_discount_value = None
+                                original_price = price  # Regular price is the original
+                                logger.info(f"🛒 Detected multi-buy promotion: {promotion_text}")
+
+                            # Check for regular clubcard price promotion
+                            elif all_prices.get('clubcard') and all_prices.get('regular'):
                                 if abs(price - all_prices['clubcard']) < 0.01:  # This is the clubcard price
                                     promotion_type = 'membership_price'  # Use correct enum value
                                     promotion_text = 'Clubcard Price'
@@ -2071,8 +2244,9 @@ class SimpleLocalScraper:
                         logger.warning(f"Failed to detect promotion info: {e}")
 
                 # Update scraping status and upload price
-                if retry_mode:
+                if retry_mode or (promotions_mode and promotion_type):
                     # Use new endpoint that tracks status with promotion info
+                    # This ensures promotion data is properly saved in database
                     success = self.update_scraping_status(
                         alias_id=alias['id'],
                         success=True,
@@ -2083,8 +2257,21 @@ class SimpleLocalScraper:
                         original_price=original_price
                     )
                 else:
-                    # Normal mode: use existing upload method
-                    success = self.upload_price(alias, price, store_name)
+                    # Normal mode: use existing upload method with promotion detection
+                    # Create promotion data structure for upload
+                    upload_promotion_data = None
+                    if promotion_type:
+                        upload_promotion_data = {
+                            'promotion_type': promotion_type,
+                            'promotion_text': promotion_text,
+                            'promotion_discount_value': promotion_discount_value,
+                            'original_price': original_price
+                        }
+                        # For clubcard prices, add the clubcard price field
+                        if promotion_type == 'membership_price' and original_price and promotion_discount_value:
+                            upload_promotion_data['clubcard_price'] = original_price - promotion_discount_value
+
+                    success = self.upload_price(alias, price, store_name, promotion_data=upload_promotion_data)
 
                 results.append({
                     'alias_id': alias['id'],
@@ -2139,8 +2326,8 @@ class SimpleLocalScraper:
         logger.info(f"   Success Rate: {(successful/len(results)*100):.1f}%")
         logger.info(f"{'='*50}")
     
-    def run(self, stores: List[str] = None, max_products: int = 5, product_id: int = None, retry_mode: bool = False):
-        """Main execution method with retry mode support"""
+    def run(self, stores: List[str] = None, max_products: int = 5, product_id: int = None, retry_mode: bool = False, promotions_mode: bool = False):
+        """Main execution method with retry mode and promotions mode support"""
         if stores is None:
             # Note: Dunnes disabled in GitHub Actions due to Cloudflare blocking
             # Works locally but fails in CI/CD environment
@@ -2151,6 +2338,9 @@ class SimpleLocalScraper:
         logger.info(f"Max products per store: {max_products}")
         if retry_mode:
             logger.info("🔄 RETRY MODE ENABLED - Only processing failed/pending products")
+        if promotions_mode:
+            logger.info("🎁 PROMOTIONS MODE ENABLED - Comprehensive promotion detection and capture")
+            logger.info("📊 This mode prioritizes promotion data collection for weekly analysis")
         
         # Authenticate
         if not self.authenticate():
@@ -2166,7 +2356,7 @@ class SimpleLocalScraper:
         try:
             # Scrape each store
             for store in stores:
-                self.scrape_store(store, max_products, product_id, retry_mode=retry_mode)
+                self.scrape_store(store, max_products, product_id, retry_mode=retry_mode, promotions_mode=promotions_mode)
                 
         finally:
             # Cleanup
@@ -2187,6 +2377,7 @@ def main():
     parser.add_argument('--product-id', type=int, help='Scrape specific product ID only')
     parser.add_argument('--debug-prices', action='store_true', help='Enable comprehensive price analysis for debugging (shows all price types found)')
     parser.add_argument('--retry-mode', action='store_true', help='Only scrape products that failed or have no price today (for second daily run)')
+    parser.add_argument('--promotions-mode', action='store_true', help='Weekly promotions scraping mode - comprehensive promotion detection across all products')
 
     args = parser.parse_args()
 
@@ -2201,7 +2392,7 @@ def main():
 
         # Run scraper for specific product
         scraper = SimpleLocalScraper(debug_prices=args.debug_prices)
-        scraper.run(stores=stores, max_products=1000, product_id=args.product_id, retry_mode=args.retry_mode)
+        scraper.run(stores=stores, max_products=1000, product_id=args.product_id, retry_mode=args.retry_mode, promotions_mode=args.promotions_mode)
     else:
         # Normal operation - determine stores
         if args.all:
@@ -2215,7 +2406,7 @@ def main():
 
         # Run scraper normally
         scraper = SimpleLocalScraper(debug_prices=args.debug_prices)
-        scraper.run(stores=stores, max_products=args.products, retry_mode=args.retry_mode)
+        scraper.run(stores=stores, max_products=args.products, retry_mode=args.retry_mode, promotions_mode=args.promotions_mode)
 
 if __name__ == '__main__':
     main()
