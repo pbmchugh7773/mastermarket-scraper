@@ -61,6 +61,7 @@ logger = logging.getLogger(__name__)
 
 # Production API configuration with environment variable support
 API_URL = os.getenv('API_URL', 'https://api.mastermarketapp.com')
+# API_URL = os.getenv('API_URL', 'http://192.168.1.25:8000')
 USERNAME = os.getenv('SCRAPER_USERNAME', 'pricerIE@mastermarket.com')
 PASSWORD = os.getenv('SCRAPER_PASSWORD', 'pricerIE')
 
@@ -2098,8 +2099,8 @@ class SimpleLocalScraper:
                     logger.info(f"🎉 Promotion detected: {promotion_data['promotion_type']} - {promotion_data.get('promotion_text', 'N/A')}")
                 
                 # Use the community prices endpoint
-                response = self.session.post(f'{API_URL}/api/community-prices/submit', json=data, timeout=30)
-                
+                # response = self.session.post(f'{API_URL}/api/community-prices/submit', json=data, timeout=30)
+                response = self.session.post(f'{API_URL}/api/community-prices/submit-scraped', json=data, timeout=30)
                 if response.status_code in [200, 201]:
                     logger.info(f"✅ Uploaded price for product {alias['product_id']}: €{price}")
                     return True
