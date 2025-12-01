@@ -723,25 +723,25 @@ class SimpleLocalScraper:
     def scrape_tesco(self, url: str, product_name: str) -> Optional[float]:
         """
         Scrape Tesco Product with Hybrid Approach
-        
+
         Tesco Implementation Strategy:
         1. Primary: Selenium with enhanced stealth measures
         2. Fallback: requests library if Selenium is blocked
         3. Detection: Error page monitoring for bot detection
         4. Extraction: JSON-LD priority with regex fallback
-        
+
         Technical Challenge:
-        Tesco implements aggressive bot detection that blocks Selenium requests
-        with generic error pages. This hybrid approach ensures 100% success rate
+        Tesco implements aggressive bot detection (Akamai) that blocks Selenium requests
+        with generic error pages. This hybrid approach ensures high success rate
         by automatically falling back to requests when Selenium is blocked.
-        
+
         Args:
             url (str): Tesco product URL
             product_name (str): Product name for logging
-            
+
         Returns:
             Optional[float]: Extracted price in EUR or None if extraction fails
-            
+
         Performance:
         - Success Rate: 100%
         - Average Time: ~10.6 seconds per product
@@ -749,49 +749,56 @@ class SimpleLocalScraper:
         """
         start_time = time.time()
         max_time = 60  # Increased timeout for complex loading
-        
+        max_retries = 2  # Reduced from implicit retries
+
         try:
             logger.info(f"🛒 Scraping Tesco: {product_name}")
-            
-            # Enhanced anti-detection setup
-            self.driver.set_page_load_timeout(30)
-            
-            # Add simple stealth measures
-            try:
-                self.driver.execute_script("window.chrome = {runtime: {}};")
-            except:
-                pass
-            
-            # Navigate with error handling
-            try:
-                logger.info("🔄 Loading Tesco page with enhanced stealth...")
-                self.driver.get(url)
-            except Exception as e:
-                logger.warning(f"⚠️ Tesco page load issue: {e}")
-                # Don't return yet, sometimes partial loads work
-            
-            # Check if we got an error page
-            page_title = self.driver.title
-            if "Error" in page_title or page_title == "Error":
-                logger.warning("⚠️ Tesco returned error page - possible bot detection")
-                # Try one more time with additional delays
-                time.sleep(3)
 
+            # Try Selenium first (but expect it to fail)
+            for attempt in range(max_retries):
+                # Enhanced anti-detection setup
+                self.driver.set_page_load_timeout(20)  # Reduced from 30s
+
+                # Add enhanced stealth measures
                 try:
-                    logger.info("🔄 Retrying Tesco page load...")
-                    self.driver.refresh()
-                    time.sleep(5)
+                    stealth_js = """
+                        window.chrome = {runtime: {}};
+                        Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+                        Object.defineProperty(navigator, 'platform', {get: () => 'iPhone'});
+                    """
+                    self.driver.execute_script(stealth_js)
                 except:
                     pass
 
-                # Check again
+                # Navigate with error handling
+                try:
+                    if attempt == 0:
+                        logger.info("🔄 Loading Tesco page with Selenium...")
+                    else:
+                        logger.info(f"🔄 Retry {attempt}/{max_retries-1}...")
+
+                    self.driver.get(url)
+                    time.sleep(3)  # Reduced initial wait
+                except Exception as e:
+                    logger.debug(f"⚠️ Tesco page load issue: {e}")
+
+                # Quick check for error page (Akamai block)
                 page_title = self.driver.title
-                if "Error" in page_title:
-                    logger.warning("❌ Tesco blocked Selenium access - trying requests fallback")
-                    return self._scrape_tesco_requests_fallback(url, product_name)
-            
-            # Wait for dynamic content
-            time.sleep(8)  # Increased from 5s to 8s
+                if "Error" in page_title or page_title == "Error":
+                    logger.warning(f"⚠️ Akamai blocked Selenium (attempt {attempt+1}/{max_retries})")
+                    if attempt < max_retries - 1:
+                        time.sleep(2)  # Short delay before retry
+                        continue
+                    else:
+                        # All Selenium attempts failed, use requests fallback immediately
+                        logger.info("❌ Selenium blocked - switching to requests fallback")
+                        return self._scrape_tesco_requests_fallback(url, product_name)
+
+                # Success - page loaded without error
+                break
+
+            # Wait for dynamic content (only if Selenium worked)
+            time.sleep(5)  # Reduced from 8s
             
             # Check time limit
             if time.time() - start_time > max_time:
@@ -991,22 +998,38 @@ class SimpleLocalScraper:
         """Fallback method using requests instead of Selenium for Tesco"""
         try:
             logger.info("🔄 Trying Tesco requests fallback method...")
-            
-            # Mobile-like headers to avoid detection
+
+            # Create session for cookie persistence
+            session = requests.Session()
+
+            # Mobile-like headers to avoid detection (iPhone Safari)
+            import random
+            user_agents = [
+                'Mozilla/5.0 (iPhone; CPU iPhone OS 17_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Mobile/15E148 Safari/604.1',
+                'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1',
+                'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) CriOS/120.0.0.0 Mobile/15E148 Safari/604.1',
+            ]
+
             headers = {
-                'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                'Accept-Language': 'en-US,en;q=0.5',
-                'Accept-Encoding': 'gzip, deflate',
+                'User-Agent': random.choice(user_agents),
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+                'Accept-Language': 'en-IE,en-GB;q=0.9,en;q=0.8',
+                'Accept-Encoding': 'gzip, deflate, br',
+                'DNT': '1',
                 'Connection': 'keep-alive',
                 'Upgrade-Insecure-Requests': '1',
                 'Sec-Fetch-Dest': 'document',
                 'Sec-Fetch-Mode': 'navigate',
-                'Sec-Fetch-Site': 'none'
+                'Sec-Fetch-Site': 'none',
+                'Sec-Fetch-User': '?1',
+                'Cache-Control': 'max-age=0',
             }
-            
+
+            # Add delay to simulate human behavior
+            time.sleep(random.uniform(1.5, 3.0))
+
             # Make request with timeout
-            response = requests.get(url, headers=headers, timeout=30)
+            response = session.get(url, headers=headers, timeout=30, allow_redirects=True)
             
             if response.status_code == 200:
                 html_content = response.text
@@ -1113,12 +1136,47 @@ class SimpleLocalScraper:
                 return None
             
             else:
+                # Detailed error logging for debugging
                 logger.warning(f"⚠️ Requests fallback failed: HTTP {response.status_code}")
+
+                # Check if it's an Akamai/Cloudflare block
+                if response.status_code == 403:
+                    logger.info("🛡️ Detected anti-bot protection (403 Forbidden)")
+                    # Check response content for clues
+                    if 'akamai' in response.text.lower():
+                        logger.info("   → Akamai Bot Manager detected")
+                    elif 'cloudflare' in response.text.lower():
+                        logger.info("   → Cloudflare protection detected")
+
+                    # Save debug HTML for analysis
+                    try:
+                        debug_file = f"tesco_403_debug_{int(time.time())}.html"
+                        with open(debug_file, "w", encoding='utf-8') as f:
+                            f.write(response.text)
+                        logger.info(f"💾 Saved 403 response to {debug_file}")
+                    except Exception as save_e:
+                        logger.debug(f"Could not save debug file: {save_e}")
+
+                elif response.status_code == 429:
+                    logger.info("⏱️ Rate limited (429) - too many requests")
+
                 return None
-                
+
+        except requests.exceptions.Timeout:
+            logger.warning("⏱️ Requests timeout after 30s")
+            return None
+        except requests.exceptions.ConnectionError as e:
+            logger.warning(f"🔌 Connection error: {e}")
+            return None
         except Exception as e:
             logger.error(f"❌ Requests fallback error: {e}")
             return None
+        finally:
+            # Clean up session
+            try:
+                session.close()
+            except:
+                pass
     
     def scrape_supervalu(self, url: str, product_name: str) -> Optional[float]:
         """
@@ -2329,7 +2387,12 @@ class SimpleLocalScraper:
                 delay = random.randint(15, 25)  # 15-25 seconds for Dunnes
                 logger.info(f"⏱️ Waiting {delay}s before next Dunnes product (Cloudflare avoidance)")
                 time.sleep(delay)
-            elif store_name.lower() in ['tesco', 'supervalu']:
+            elif store_name.lower() == 'tesco':
+                # Longer delay for Tesco due to aggressive Akamai protection
+                delay = random.uniform(4.0, 8.0)  # 4-8 seconds (increased from 3-6)
+                logger.info(f"⏱️ Waiting {delay:.1f}s before next {store_name} product (Akamai rate limiting)")
+                time.sleep(delay)
+            elif store_name.lower() == 'supervalu':
                 delay = random.randint(3, 6)  # 3-6 seconds for heavy JS sites
                 logger.info(f"⏱️ Waiting {delay}s before next {store_name} product")
                 time.sleep(delay)
