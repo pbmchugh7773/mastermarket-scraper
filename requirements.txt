@@ -13,3 +13,6 @@ fake-useragent==1.4.0
 # Logging and utilities
 python-dateutil==2.8.2
 pytz==2023.3
+
+# Apify API client (for Tesco scraper)
+apify-client>=1.6.0

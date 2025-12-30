@@ -1,0 +1,112 @@
+name: Apify Tesco Scraper
+
+on:
+  schedule:
+    # Martes y Viernes a las 6:00 AM UTC
+    - cron: '0 6 * * 2'   # Tuesday
+    - cron: '0 6 * * 5'   # Friday
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: 'Maximum number of products to scrape (empty = all)'
+        required: false
+        default: ''
+      dry_run:
+        description: 'Run without uploading prices'
+        required: false
+        type: boolean
+        default: false
+      token_override:
+        description: 'Which Apify token to use (auto = based on day)'
+        required: false
+        type: choice
+        options:
+          - auto
+          - tuesday
+          - friday
+        default: 'auto'
+
+jobs:
+  scrape-tesco:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install apify-client requests
+
+      - name: Select Apify Token based on day
+        id: select-token
+        run: |
+          # Get day of week (1=Monday, 2=Tuesday, ..., 5=Friday)
+          DAY_OF_WEEK=$(date +%u)
+          TOKEN_OVERRIDE="${{ github.event.inputs.token_override }}"
+
+          echo "Day of week: $DAY_OF_WEEK"
+          echo "Token override: $TOKEN_OVERRIDE"
+
+          # Determine which token to use
+          if [ "$TOKEN_OVERRIDE" == "tuesday" ]; then
+            echo "token_key=APIFY_API_TOKEN_TUESDAY" >> $GITHUB_OUTPUT
+            echo "Using Tuesday token (manual override)"
+          elif [ "$TOKEN_OVERRIDE" == "friday" ]; then
+            echo "token_key=APIFY_API_TOKEN_FRIDAY" >> $GITHUB_OUTPUT
+            echo "Using Friday token (manual override)"
+          elif [ "$DAY_OF_WEEK" == "2" ]; then
+            echo "token_key=APIFY_API_TOKEN_TUESDAY" >> $GITHUB_OUTPUT
+            echo "Using Tuesday token (scheduled)"
+          elif [ "$DAY_OF_WEEK" == "5" ]; then
+            echo "token_key=APIFY_API_TOKEN_FRIDAY" >> $GITHUB_OUTPUT
+            echo "Using Friday token (scheduled)"
+          else
+            # Default to Tuesday token for manual runs on other days
+            echo "token_key=APIFY_API_TOKEN_TUESDAY" >> $GITHUB_OUTPUT
+            echo "Using Tuesday token (default)"
+          fi
+
+      - name: Run Apify Tesco Scraper
+        env:
+          # Select token based on day (with fallback to single token)
+          APIFY_API_TOKEN: ${{ steps.select-token.outputs.token_key == 'APIFY_API_TOKEN_FRIDAY' && secrets.APIFY_API_TOKEN_FRIDAY || secrets.APIFY_API_TOKEN_TUESDAY || secrets.APIFY_API_TOKEN }}
+          API_URL: ${{ secrets.API_URL }}
+          SCRAPER_USERNAME: ${{ secrets.SCRAPER_USERNAME }}
+          SCRAPER_PASSWORD: ${{ secrets.SCRAPER_PASSWORD }}
+        run: |
+          ARGS=""
+
+          # Add limit if specified
+          if [ -n "${{ github.event.inputs.limit }}" ]; then
+            ARGS="$ARGS --limit ${{ github.event.inputs.limit }}"
+          fi
+
+          # Add dry-run if specified
+          if [ "${{ github.event.inputs.dry_run }}" == "true" ]; then
+            ARGS="$ARGS --dry-run"
+          fi
+
+          echo "Selected token: ${{ steps.select-token.outputs.token_key }}"
+          python apify_tesco_scraper.py $ARGS 2>&1 | tee apify_scraper.log
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: apify-scraper-logs-${{ github.run_number }}
+          path: '*.log'
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: Notify on failure
+        if: failure()
+        run: |
+          echo "::error::Apify Tesco Scraper failed. Check logs for details."
