@@ -310,7 +310,9 @@ class ApifyTescoScraper:
             try:
                 clubcard_price = float(clubcard_price)
                 if 0.01 <= clubcard_price < price:
-                    result['promotion_type'] = 'clubcard_price'
+                    # Use valid enum value 'membership_price' for Clubcard promotions
+                    result['promotion_type'] = 'membership_price'
+                    result['promotion_text'] = 'Clubcard Price'  # Required for has_clubcard_price detection
                     result['clubcard_price'] = clubcard_price
                     result['original_price'] = price
             except (TypeError, ValueError):
@@ -345,6 +347,8 @@ class ApifyTescoScraper:
         # Add promotion data if available
         if 'promotion_type' in price_data:
             payload['promotion_type'] = price_data['promotion_type']
+        if 'promotion_text' in price_data:
+            payload['promotion_text'] = price_data['promotion_text']
         if 'clubcard_price' in price_data:
             payload['clubcard_price'] = price_data['clubcard_price']
         if 'original_price' in price_data:
