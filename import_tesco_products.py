@@ -249,7 +249,12 @@ class TescoImporter:
 
         # Add promotion info if available
         if item.get('promotion'):
-            promo_text = str(item.get('promotion'))
+            promotion = item.get('promotion')
+            # Extract description from promotion dict, or convert to string if it's already a string
+            if isinstance(promotion, dict):
+                promo_text = promotion.get('description', str(promotion))
+            else:
+                promo_text = str(promotion)
             price_data['promotion_text'] = promo_text
 
             # Detect correct promotion_type based on text
