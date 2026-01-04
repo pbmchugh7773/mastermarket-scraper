@@ -32,8 +32,11 @@ jobs:
     
     strategy:
       # Run all stores in parallel
+      # NOTE: Dunnes and Tesco removed due to aggressive anti-bot protection
+      # (Cloudflare Turnstile and Akamai) that blocks GitHub Actions IPs.
+      # These stores can be scraped locally where residential IPs work.
       matrix:
-        store: [Aldi, Tesco, SuperValu, Dunnes, Lidl]  # Added Lidl support
+        store: [Aldi, SuperValu, Lidl]
 
       # Don't cancel other stores if one fails
       fail-fast: false
@@ -228,12 +231,11 @@ jobs:
             echo "• Combined daily success rate target: 98%+"
           else
             echo "📈 Expected Results (NORMAL MODE):"
-            echo "• Aldi: ~300 products in ~30 minutes"
-            echo "• Tesco: ~300 products in ~10 hours (with promotions!)"
-            echo "• SuperValu: ~300 products in ~10 hours"
-            echo "• Dunnes: ~300 products in ~70 minutes"
-            echo "• Lidl: ~300 products in ~30 minutes"
-            echo "• Total: ~1500 products updated"
+            echo "• Aldi: ~300 products in ~2 minutes"
+            echo "• SuperValu: ~300 products in ~1 minute"
+            echo "• Lidl: ~300 products in ~1 minute"
+            echo "• Total: ~900 products updated"
+            echo "• NOTE: Dunnes/Tesco disabled (anti-bot blocks GitHub IPs)"
             echo "• Failed products will be retried at 6:00 and 14:00 UTC"
           fi
           echo ""
