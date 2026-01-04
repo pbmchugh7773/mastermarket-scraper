@@ -42,7 +42,7 @@ import requests
 import re
 import os
 from datetime import datetime
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Tuple
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
@@ -116,7 +116,43 @@ class SimpleLocalScraper:
         self.api_token = None
         self.session = requests.Session()
         self.debug_prices = debug_prices
-        
+
+    def normalize_text_encoding(self, text: str) -> str:
+        """
+        Fix common UTF-8 encoding issues in scraped text.
+
+        The euro symbol € (UTF-8: 0xE2 0x82 0xAC) often appears as 'â¬' when
+        incorrectly decoded as Latin-1. This method fixes such encoding issues.
+
+        Args:
+            text: Text that may contain encoding issues
+
+        Returns:
+            str: Text with fixed encoding
+        """
+        if not text:
+            return text
+
+        # Common encoding fixes
+        replacements = {
+            'â¬': '€',      # Euro symbol (most common issue)
+            'â‚¬': '€',     # Alternative euro corruption
+            'Â£': '£',      # Pound symbol
+            'Ã©': 'é',      # Accented e
+            'Ã¨': 'è',      # Accented e
+            'Ã¢': 'â',      # Accented a
+            'â€™': "'",     # Right single quote
+            'â€œ': '"',     # Left double quote
+            'â€': '"',      # Right double quote (partial)
+            '\xa0': ' ',    # Non-breaking space
+        }
+
+        result = text
+        for bad, good in replacements.items():
+            result = result.replace(bad, good)
+
+        return result
+
     def authenticate(self) -> bool:
         """
         Authenticate with MasterMarket Production API
@@ -385,7 +421,7 @@ class SimpleLocalScraper:
             for selector in promotion_selectors:
                 elements = soup.select(selector)
                 for element in elements:
-                    text = element.get_text(strip=True)
+                    text = self.normalize_text_encoding(element.get_text(strip=True))
                     text_lower = text.lower()
 
                     # Check for multi-buy promotions without extracting a specific price
@@ -414,10 +450,10 @@ class SimpleLocalScraper:
             for selector in all_price_selectors:
                 elements = soup.select(selector)
                 for element in elements:
-                    text = element.get_text(strip=True)
-                    parent_text = element.parent.get_text(strip=True) if element.parent else ""
+                    text = self.normalize_text_encoding(element.get_text(strip=True))
+                    parent_text = self.normalize_text_encoding(element.parent.get_text(strip=True)) if element.parent else ""
 
-                    # Extract price value
+                    # Extract price value (include â¬ for any remaining encoding issues)
                     price_match = re.search(r'[€â¬]\s*(\d+[.,]\d{2})', text)
                     if price_match:
                         try:
@@ -521,6 +557,8 @@ class SimpleLocalScraper:
             dict: Promotion data with keys: original_price, promotion_type, promotion_text,
                   clubcard_price, promotion_discount_value
         """
+        import re  # Import at the start of the method to avoid UnboundLocalError
+
         promotion_data = {
             'original_price': None,
             'promotion_type': None,
@@ -542,7 +580,6 @@ class SimpleLocalScraper:
                 promotion_data['clubcard_price'] = clubcard_price
 
             # Look for original price in combined text
-            import re
             was_price_patterns = [
                 r'was[^\d]*([£€$]?[\d.]+)',
                 r'originally[^\d]*([£€$]?[\d.]+)',
@@ -564,10 +601,9 @@ class SimpleLocalScraper:
         # Detect "Was/Now" promotions
         elif ('was' in combined_text and 'now' in combined_text) or 'reduced' in combined_text:
             promotion_data['promotion_type'] = 'temporary_discount'
-            promotion_data['promotion_text'] = parent_element_text.strip()
+            promotion_data['promotion_text'] = self.normalize_text_encoding(parent_element_text.strip())
 
             # Extract was price
-            import re
             was_match = re.search(r'was[^\d]*([£€$]?[\d.]+)', combined_text)
             if was_match:
                 try:
@@ -578,13 +614,372 @@ class SimpleLocalScraper:
         # Detect multi-buy offers
         elif re.search(r'\d+\s*for\s*[£€$]?[\d.]+', combined_text) or 'any' in combined_text and 'for' in combined_text:
             promotion_data['promotion_type'] = 'multi_buy'
-            promotion_data['promotion_text'] = parent_element_text.strip()
+            promotion_data['promotion_text'] = self.normalize_text_encoding(parent_element_text.strip())
 
         # Detect percentage discounts
         elif 'better than half price' in combined_text:
             promotion_data['promotion_type'] = 'percentage_off'
             promotion_data['promotion_text'] = 'Better than half price'
             promotion_data['promotion_discount_value'] = 50.0
+
+        return promotion_data
+
+    def detect_aldi_promotion_data(self, page_source: str, current_price: float = None) -> dict:
+        """
+        Detect and extract promotion information from Aldi Ireland product pages
+
+        Aldi Ireland promotion types:
+        - Super Savers: Reduced price items with special "Super Saver" badge
+        - Was/Now: Original price crossed out with new lower price
+        - Special Buy: Limited time special offers
+        - Price Drop: Recently reduced prices
+
+        Args:
+            page_source: HTML content of the product page
+            current_price: The current price already extracted (for calculating discount)
+
+        Returns:
+            dict: Promotion data with keys: original_price, promotion_type, promotion_text,
+                  promotion_discount_value
+        """
+        import re
+
+        promotion_data = {
+            'original_price': None,
+            'promotion_type': None,
+            'promotion_text': None,
+            'promotion_discount_value': None
+        }
+
+        page_lower = page_source.lower()
+
+        # === 1. Detect "Was" price (original price before discount) ===
+        was_price_patterns = [
+            r'was[:\s]*[€£]?\s*(\d+[.,]\d{2})',           # "Was €5.99" or "Was: €5.99"
+            r'class="[^"]*was[^"]*"[^>]*>[^€£]*[€£]\s*(\d+[.,]\d{2})',  # class containing "was"
+            r'base-price__was[^>]*>[^€£]*[€£]\s*(\d+[.,]\d{2})',        # Aldi specific class
+            r'original[:\s]*price[:\s]*[€£]?\s*(\d+[.,]\d{2})',         # "Original price"
+            r'rrp[:\s]*[€£]?\s*(\d+[.,]\d{2})',           # RRP (Recommended Retail Price)
+            r'previously[:\s]*[€£]?\s*(\d+[.,]\d{2})',    # "Previously €X"
+        ]
+
+        original_price = None
+        for pattern in was_price_patterns:
+            match = re.search(pattern, page_lower)
+            if match:
+                try:
+                    original_price = float(match.group(1).replace(',', '.'))
+                    if original_price > 0 and (current_price is None or original_price > current_price):
+                        promotion_data['original_price'] = original_price
+                        promotion_data['promotion_type'] = 'temporary_discount'
+                        promotion_data['promotion_text'] = f'Was €{original_price:.2f}'
+                        if current_price and original_price > current_price:
+                            promotion_data['promotion_discount_value'] = original_price - current_price
+                        logger.info(f"🏷️ Aldi Was/Now promotion detected: Was €{original_price:.2f}")
+                        break
+                except ValueError:
+                    continue
+
+        # === 2. Detect "Super Saver" promotions ===
+        super_saver_patterns = [
+            r'super\s*saver',
+            r'supersaver',
+            r'class="[^"]*super-saver[^"]*"',
+            r'data-[^=]*="[^"]*super.?saver[^"]*"',
+        ]
+
+        for pattern in super_saver_patterns:
+            if re.search(pattern, page_lower):
+                promotion_data['promotion_type'] = 'clearance'  # Super Saver is like clearance pricing
+                promotion_data['promotion_text'] = 'Super Saver'
+                logger.info(f"🏷️ Aldi Super Saver promotion detected")
+                break
+
+        # === 3. Detect "Special Buy" / "Specialbuy" promotions ===
+        special_buy_patterns = [
+            r'special\s*buy',
+            r'specialbuy',
+            r'special\s*offer',
+            r'limited\s*time',
+            r'while\s*stocks\s*last',
+        ]
+
+        for pattern in special_buy_patterns:
+            if re.search(pattern, page_lower):
+                if not promotion_data['promotion_type']:  # Don't override if already set
+                    promotion_data['promotion_type'] = 'flash_sale'
+                    promotion_data['promotion_text'] = 'Special Buy'
+                    logger.info(f"🏷️ Aldi Special Buy promotion detected")
+                break
+
+        # === 4. Detect percentage/amount savings ===
+        savings_patterns = [
+            r'save\s*[€£]?\s*(\d+[.,]\d{2})',             # "Save €2.00"
+            r'saving\s*[€£]?\s*(\d+[.,]\d{2})',           # "Saving €2.00"
+            r'(\d+)\s*%\s*off',                           # "25% off"
+            r'save\s*(\d+)\s*%',                          # "Save 25%"
+        ]
+
+        for pattern in savings_patterns:
+            match = re.search(pattern, page_lower)
+            if match:
+                try:
+                    value = match.group(1).replace(',', '.')
+                    if '%' in pattern:
+                        # Percentage discount
+                        discount_pct = float(value)
+                        if 0 < discount_pct <= 90:  # Reasonable percentage range
+                            promotion_data['promotion_type'] = 'percentage_off'
+                            promotion_data['promotion_text'] = f'{int(discount_pct)}% Off'
+                            promotion_data['promotion_discount_value'] = discount_pct
+                            logger.info(f"🏷️ Aldi {int(discount_pct)}% discount detected")
+                    else:
+                        # Fixed amount discount
+                        discount_amount = float(value)
+                        if 0 < discount_amount < 100:  # Reasonable amount
+                            if not promotion_data['promotion_discount_value']:
+                                promotion_data['promotion_discount_value'] = discount_amount
+                            if not promotion_data['promotion_type']:
+                                promotion_data['promotion_type'] = 'fixed_amount_off'
+                                promotion_data['promotion_text'] = f'Save €{discount_amount:.2f}'
+                            logger.info(f"🏷️ Aldi €{discount_amount:.2f} discount detected")
+                    break
+                except ValueError:
+                    continue
+
+        # === 5. Detect multi-buy offers (less common at Aldi but possible) ===
+        multi_buy_patterns = [
+            r'(\d+)\s*for\s*[€£]?\s*(\d+[.,]\d{2})',      # "3 for €5.00"
+            r'buy\s*(\d+)\s*get\s*(\d+)',                  # "Buy 2 Get 1"
+            r'(\d+)\s*x\s*(\d+)',                          # "2x1" style
+        ]
+
+        for pattern in multi_buy_patterns:
+            match = re.search(pattern, page_lower)
+            if match:
+                promotion_data['promotion_type'] = 'multi_buy'
+                if 'for' in pattern:
+                    qty = match.group(1)
+                    price = match.group(2).replace(',', '.')
+                    promotion_data['promotion_text'] = f'{qty} for €{price}'
+                else:
+                    promotion_data['promotion_text'] = match.group(0).strip()
+                logger.info(f"🏷️ Aldi multi-buy promotion detected: {promotion_data['promotion_text']}")
+                break
+
+        return promotion_data
+
+    def detect_supervalu_promotion_data(self, html_content: str, current_price: float = None) -> dict:
+        """
+        Detect and extract promotion information from SuperValu Ireland product pages
+
+        SuperValu Ireland promotion types:
+        - Real Rewards: Member-only prices (similar to Tesco Clubcard)
+        - Multi-buy: "Any 3 for €X", "2 for €X" offers
+        - Was/Now: Original price vs current sale price
+        - Save €X: Fixed amount savings
+        - % Off: Percentage discounts
+        - Weekly Specials: Time-limited offers
+
+        Args:
+            html_content: HTML content of the product page
+            current_price: The current price already extracted (for calculating discount)
+
+        Returns:
+            dict: Promotion data with keys: original_price, promotion_type, promotion_text,
+                  promotion_discount_value
+        """
+        import re
+
+        promotion_data = {
+            'original_price': None,
+            'promotion_type': None,
+            'promotion_text': None,
+            'promotion_discount_value': None
+        }
+
+        html_lower = html_content.lower()
+
+        # === 1. Detect Real Rewards (membership pricing) ===
+        # Be specific - only match actual member pricing indicators in visible HTML, not JS code
+        # SuperValu shows member prices with specific HTML elements, not just any mention of "loyalty"
+        real_rewards_patterns = [
+            r'real\s*rewards?\s*price',                           # "Real Rewards Price" label
+            r'member\s*price[^}]*€\s*(\d+[.,]\d{2})',            # "Member price €X.XX"
+            r'data-testid="[^"]*loyalty[^"]*price',              # SuperValu loyalty price test IDs
+            r'class="[^"]*LoyaltyPrice[^"]*"[^>]*>[^<]*€',       # Loyalty price class with euro
+            r'ProductPriceLoyalty[^>]*>\s*€\s*(\d+[.,]\d{2})',   # SuperValu specific loyalty price
+        ]
+
+        real_rewards_found = False
+        for pattern in real_rewards_patterns:
+            match = re.search(pattern, html_content, re.IGNORECASE)
+            if match:
+                real_rewards_found = True
+                promotion_data['promotion_type'] = 'membership_price'
+                promotion_data['promotion_text'] = 'Real Rewards Price'
+                logger.info(f"🏷️ SuperValu Real Rewards price detected")
+                break
+
+        # Don't set membership_price just because "loyalty" appears in JavaScript code
+
+        # === 2. Detect "Was" price / Original price ===
+        was_price_patterns = [
+            r'was[:\s]*[€£]?\s*(\d+[.,]\d{2})',           # "Was €5.99"
+            r'original[:\s]*price[:\s]*[€£]?\s*(\d+[.,]\d{2})',
+            r'rrp[:\s]*[€£]?\s*(\d+[.,]\d{2})',
+            r'previously[:\s]*[€£]?\s*(\d+[.,]\d{2})',
+            r'regular[:\s]*price[:\s]*[€£]?\s*(\d+[.,]\d{2})',
+            r'class="[^"]*was[^"]*"[^>]*>[^€£]*[€£]\s*(\d+[.,]\d{2})',
+            r'class="[^"]*original[^"]*"[^>]*>[^€£]*[€£]\s*(\d+[.,]\d{2})',
+            r'<s[^>]*>\s*[€£]?\s*(\d+[.,]\d{2})',         # Strikethrough price
+            r'<del[^>]*>\s*[€£]?\s*(\d+[.,]\d{2})',       # Deleted/crossed out price
+        ]
+
+        for pattern in was_price_patterns:
+            match = re.search(pattern, html_lower)
+            if match:
+                try:
+                    original_price = float(match.group(1).replace(',', '.'))
+                    if original_price > 0 and (current_price is None or original_price > current_price):
+                        promotion_data['original_price'] = original_price
+                        if not promotion_data['promotion_type']:
+                            promotion_data['promotion_type'] = 'temporary_discount'
+                            promotion_data['promotion_text'] = f'Was €{original_price:.2f}'
+                        if current_price and original_price > current_price:
+                            promotion_data['promotion_discount_value'] = original_price - current_price
+                        logger.info(f"🏷️ SuperValu Was/Now promotion: Was €{original_price:.2f}")
+                        break
+                except ValueError:
+                    continue
+
+        # === 3. Detect multi-buy offers (very common at SuperValu) ===
+        # First, try to find the actual promotion badge text from SuperValu's HTML structure
+        # SuperValu uses "promotionBadgeComponent-testId" with text like "2 for €13"
+        promo_badge_match = re.search(r'promotionBadgeComponent[^>]*>([^<]+)<', html_content, re.IGNORECASE)
+        if promo_badge_match:
+            badge_text = promo_badge_match.group(1).strip()
+            # Check if it's a multi-buy format like "2 for €13"
+            multi_match = re.match(r'(\d+)\s*for\s*€?\s*(\d+(?:[.,]\d{2})?)', badge_text, re.IGNORECASE)
+            if multi_match:
+                qty = int(multi_match.group(1))
+                price = float(multi_match.group(2).replace(',', '.'))
+                promotion_data['promotion_type'] = 'multi_buy'
+                promotion_data['promotion_text'] = f'{qty} for €{price:.2f}'
+                # Calculate savings if we have current price
+                if current_price and qty > 0:
+                    regular_total = current_price * qty
+                    if regular_total > price:
+                        promotion_data['promotion_discount_value'] = round(regular_total - price, 2)
+                logger.info(f"🏷️ SuperValu multi-buy from badge: {promotion_data['promotion_text']}")
+
+        # Fallback to pattern matching if badge not found
+        if not promotion_data.get('promotion_type') == 'multi_buy':
+            multi_buy_patterns = [
+                (r'any\s*(\d+)\s*for\s*€\s*(\d+[.,]\d{2})', 'any'),     # "Any 3 for €5.00" - requires €
+                (r'(\d+)\s*for\s*€\s*(\d+[.,]\d{2})', 'for'),           # "3 for €5.00" - requires €
+                (r'buy\s*(\d+)\s*get\s*(\d+)\s*free', 'bogo'),          # "Buy 2 Get 1 Free"
+                (r'bogof', 'bogof'),                                     # Buy One Get One Free
+                (r'buy\s*one\s*get\s*one', 'b1g1'),                     # Buy One Get One
+                (r'half\s*price\s*when\s*you\s*buy\s*(\d+)', 'half'),   # "Half price when you buy 2"
+            ]
+            # NOTE: Removed r'(\d+)\s*x\s*(\d+)' pattern as it matches image dimensions like "144x144"
+
+            for pattern, ptype in multi_buy_patterns:
+                match = re.search(pattern, html_lower)
+                if match:
+                    promotion_data['promotion_type'] = 'multi_buy'
+                    groups = match.groups()
+                    if ptype == 'any' and len(groups) >= 2:
+                        promotion_data['promotion_text'] = f'Any {groups[0]} for €{groups[1].replace(",", ".")}'
+                    elif ptype == 'for' and len(groups) >= 2:
+                        promotion_data['promotion_text'] = f'{groups[0]} for €{groups[1].replace(",", ".")}'
+                    elif ptype == 'bogof':
+                        promotion_data['promotion_text'] = 'Buy One Get One Free'
+                    elif ptype == 'b1g1':
+                        promotion_data['promotion_text'] = 'Buy One Get One Free'
+                    elif ptype == 'bogo' and len(groups) >= 2:
+                        promotion_data['promotion_text'] = f'Buy {groups[0]} Get {groups[1]} Free'
+                    elif ptype == 'half' and len(groups) >= 1:
+                        promotion_data['promotion_text'] = f'Half Price when you buy {groups[0]}'
+                    else:
+                        promotion_data['promotion_text'] = match.group(0).strip().title()
+                    logger.info(f"🏷️ SuperValu multi-buy: {promotion_data['promotion_text']}")
+                    break
+
+        # === 4. Detect percentage discounts ===
+        percentage_patterns = [
+            r'(\d+)\s*%\s*off',                            # "25% off"
+            r'save\s*(\d+)\s*%',                           # "Save 25%"
+            r'(\d+)\s*%\s*discount',                       # "25% discount"
+            r'half\s*price',                               # "Half price"
+            r'better\s*than\s*half\s*price',               # "Better than half price"
+        ]
+
+        for pattern in percentage_patterns:
+            match = re.search(pattern, html_lower)
+            if match:
+                if 'half price' in pattern and 'better' not in pattern:
+                    promotion_data['promotion_type'] = 'percentage_off'
+                    promotion_data['promotion_text'] = 'Half Price'
+                    promotion_data['promotion_discount_value'] = 50.0
+                elif 'better than half' in pattern:
+                    promotion_data['promotion_type'] = 'percentage_off'
+                    promotion_data['promotion_text'] = 'Better Than Half Price'
+                    promotion_data['promotion_discount_value'] = 50.0
+                else:
+                    try:
+                        discount_pct = float(match.group(1))
+                        if 0 < discount_pct <= 90:
+                            promotion_data['promotion_type'] = 'percentage_off'
+                            promotion_data['promotion_text'] = f'{int(discount_pct)}% Off'
+                            promotion_data['promotion_discount_value'] = discount_pct
+                    except (ValueError, IndexError):
+                        continue
+                logger.info(f"🏷️ SuperValu percentage discount: {promotion_data['promotion_text']}")
+                break
+
+        # === 5. Detect fixed amount savings ===
+        savings_patterns = [
+            r'save\s*[€£]\s*(\d+[.,]\d{2})',               # "Save €2.00"
+            r'saving\s*[€£]\s*(\d+[.,]\d{2})',             # "Saving €2.00"
+            r'[€£]\s*(\d+[.,]\d{2})\s*off',                # "€2.00 off"
+        ]
+
+        for pattern in savings_patterns:
+            match = re.search(pattern, html_lower)
+            if match:
+                try:
+                    discount_amount = float(match.group(1).replace(',', '.'))
+                    if 0 < discount_amount < 100:
+                        if not promotion_data['promotion_discount_value']:
+                            promotion_data['promotion_discount_value'] = discount_amount
+                        if not promotion_data['promotion_type']:
+                            promotion_data['promotion_type'] = 'fixed_amount_off'
+                            promotion_data['promotion_text'] = f'Save €{discount_amount:.2f}'
+                        logger.info(f"🏷️ SuperValu fixed discount: €{discount_amount:.2f} off")
+                        break
+                except ValueError:
+                    continue
+
+        # === 6. Detect weekly specials / limited offers ===
+        # Be more specific - only match in promotional badge/label context, not navigation
+        # Look for these patterns in promotion badge elements specifically
+        promo_context_match = re.search(
+            r'(promotionBadge|SaleContent|PromoBadge)[^>]*>([^<]{0,100})',
+            html_content,
+            re.IGNORECASE
+        )
+        if promo_context_match:
+            promo_text = promo_context_match.group(2).lower()
+            special_keywords = ['weekly special', 'this week only', 'limited time', 'special offer', 'price drop']
+            for keyword in special_keywords:
+                if keyword in promo_text:
+                    if not promotion_data['promotion_type']:
+                        promotion_data['promotion_type'] = 'flash_sale'
+                        promotion_data['promotion_text'] = 'Weekly Special'
+                        logger.info(f"🏷️ SuperValu weekly special detected: {keyword}")
+                    break
 
         return promotion_data
 
@@ -655,15 +1050,28 @@ class SimpleLocalScraper:
                     continue
         return None
 
-    def scrape_aldi(self, url: str, product_name: str) -> Optional[float]:
-        """Scrape Aldi product - optimized for speed"""
+    def scrape_aldi(self, url: str, product_name: str) -> Tuple[Optional[float], Optional[dict]]:
+        """
+        Scrape Aldi product with promotion detection
+
+        Returns:
+            Tuple[Optional[float], Optional[dict]]: (price, promotion_data)
+            - price: The product price or None if not found
+            - promotion_data: Dict with promotion info or None if no promotion
+        """
         try:
             logger.info(f"🛒 Scraping Aldi: {product_name}")
             self.driver.get(url)
-            
+
             # Quick initial check - often price is available immediately
             time.sleep(1)  # Reduced from 3s to 1s
-            
+
+            price = None
+            promotion_data = None
+
+            # Get page source early for promotion detection
+            page_source = self.driver.page_source
+
             # Method 1: JSON-LD structured data (fastest)
             scripts = self.driver.find_elements(By.XPATH, "//script[@type='application/ld+json']")
             for script in scripts[:3]:  # Only check first 3 scripts
@@ -675,22 +1083,24 @@ class SimpleLocalScraper:
                             price = float(offers['price'])
                             if 0.01 <= price <= 1000:
                                 logger.info(f"✅ Aldi price via JSON-LD: €{price}")
-                                return price
+                                # Detect promotions with the extracted price
+                                promotion_data = self.detect_aldi_promotion_data(page_source, price)
+                                return (price, promotion_data if promotion_data.get('promotion_type') else None)
                 except (json.JSONDecodeError, ValueError, KeyError):
                     continue
-            
+
             # Method 2: Prioritized CSS selectors
             priority_selectors = [
                 '.base-price__regular',
                 'span[data-testid="price"]',
                 '.product-price'
             ]
-            
+
             fallback_selectors = [
                 '.price',
                 'span'
             ]
-            
+
             # Try priority selectors first
             for selector in priority_selectors:
                 elements = self.driver.find_elements(By.CSS_SELECTOR, selector)
@@ -700,8 +1110,10 @@ class SimpleLocalScraper:
                         price = self.extract_price_from_text(text)
                         if price:
                             logger.info(f"✅ Aldi price via priority selector '{selector}': €{price}")
-                            return price
-            
+                            # Detect promotions with the extracted price
+                            promotion_data = self.detect_aldi_promotion_data(page_source, price)
+                            return (price, promotion_data if promotion_data.get('promotion_type') else None)
+
             # Only try fallback if priority failed
             for selector in fallback_selectors:
                 elements = self.driver.find_elements(By.CSS_SELECTOR, selector)
@@ -711,14 +1123,16 @@ class SimpleLocalScraper:
                         price = self.extract_price_from_text(text)
                         if price:
                             logger.info(f"✅ Aldi price via fallback selector '{selector}': €{price}")
-                            return price
-            
+                            # Detect promotions with the extracted price
+                            promotion_data = self.detect_aldi_promotion_data(page_source, price)
+                            return (price, promotion_data if promotion_data.get('promotion_type') else None)
+
             logger.warning(f"⚠️ Could not find Aldi price for {product_name}")
-            return None
-            
+            return (None, None)
+
         except Exception as e:
             logger.error(f"❌ Aldi scraping error: {e}")
-            return None
+            return (None, None)
     
     def scrape_tesco(self, url: str, product_name: str) -> Optional[float]:
         """
@@ -1178,36 +1592,38 @@ class SimpleLocalScraper:
             except:
                 pass
     
-    def scrape_supervalu(self, url: str, product_name: str) -> Optional[float]:
+    def scrape_supervalu(self, url: str, product_name: str) -> Tuple[Optional[float], Optional[dict]]:
         """
-        Scrape SuperValu Product with Enhanced Hybrid Approach
-        
+        Scrape SuperValu Product with Enhanced Hybrid Approach and Promotion Detection
+
         SuperValu Implementation Strategy:
         1. Primary: Enhanced Selenium with bot detection
         2. Fallback: requests library if Selenium is blocked or slow
         3. Detection: Error page and timeout monitoring
         4. Extraction: JSON-LD @graph priority with optimized selectors
-        
+
         Performance Improvements:
         - Reduced timeout from 45s to 25s
         - Added requests fallback for reliability
         - Enhanced JSON-LD parsing with @graph support
         - Optimized selectors based on SuperValu structure
         - Bot detection similar to Tesco approach
-        
+
         Args:
             url (str): SuperValu product URL
             product_name (str): Product name for logging
-            
+
         Returns:
-            Optional[float]: Extracted price in EUR or None if extraction fails
+            Tuple[Optional[float], Optional[dict]]: (price, promotion_data)
+            - price: Extracted price in EUR or None if extraction fails
+            - promotion_data: Dict with promotion info or None if no promotion
         """
         start_time = time.time()
         max_time = 30  # Further reduced - if it takes longer, use requests fallback
-        
+
         try:
             logger.info(f"🛒 Scraping SuperValu: {product_name}")
-            
+
             # SuperValu Performance Optimization:
             # Since requests method is 160x faster (0.8s vs 129s) and 100% reliable,
             # skip Selenium entirely and use requests directly for optimal performance
@@ -1392,38 +1808,48 @@ class SimpleLocalScraper:
             except:
                 pass
     
-    def _scrape_supervalu_requests_fallback(self, url: str, product_name: str) -> Optional[float]:
-        """Fallback method using requests instead of Selenium for SuperValu"""
+    def _scrape_supervalu_requests_fallback(self, url: str, product_name: str) -> Tuple[Optional[float], Optional[dict]]:
+        """
+        Fallback method using requests instead of Selenium for SuperValu with promotion detection
+
+        Returns:
+            Tuple[Optional[float], Optional[dict]]: (price, promotion_data)
+            - price: The product price or None if not found
+            - promotion_data: Dict with promotion info or None if no promotion
+        """
         try:
             logger.info("🔄 Trying SuperValu requests fallback method...")
-            
+
             # Minimal mobile headers for SuperValu (complex headers cause simplified page)
             headers = {
                 'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1'
             }
-            
+
             # Make request with reasonable timeout
             response = requests.get(url, headers=headers, timeout=25, allow_redirects=True)
-            
+
             if response.status_code == 200:
                 html_content = response.text
                 logger.info(f"✅ Successfully fetched SuperValu page with requests ({len(html_content)} chars)")
-                
+
+                price = None
+                promotion_data = None
+
                 # === 1. JSON-LD EXTRACTION ===
                 import re
                 json_pattern = r'<script type="application/ld\+json"[^>]*>(.*?)</script>'
                 json_matches = re.findall(json_pattern, html_content, re.DOTALL | re.IGNORECASE)
                 logger.info(f"🔍 Found {len(json_matches)} JSON-LD patterns via requests")
-                
+
                 for i, json_content in enumerate(json_matches[:3]):
                     try:
                         # Limit JSON content size to prevent hanging
                         if len(json_content) > 500000:  # 500KB limit
                             logger.warning(f"    ⚠️ JSON content {i+1} too large ({len(json_content)} chars), skipping...")
                             continue
-                            
+
                         data = json.loads(json_content.strip())
-                        
+
                         # Handle @graph structure (like Tesco)
                         if isinstance(data, dict) and '@graph' in data:
                             items = data['@graph']
@@ -1433,32 +1859,34 @@ class SimpleLocalScraper:
                         else:
                             items = data if isinstance(data, list) else [data]
                             items = items[:20] if isinstance(items, list) and len(items) > 20 else items
-                        
+
                         for idx, item in enumerate(items):
                             if isinstance(item, dict) and item.get('@type') == 'Product':
                                 logger.info(f"    🎯 Found Product in JSON-LD via requests (item {idx+1})!")
                                 offers = item.get('offers', {})
-                                
+
                                 # Handle both single offer and array of offers
                                 if isinstance(offers, list) and len(offers) > 0:
                                     offers = offers[0]
-                                
+
                                 if isinstance(offers, dict) and 'price' in offers:
                                     try:
                                         price = float(offers['price'])
                                         if 0.01 <= price <= 1000:
                                             logger.info(f"✅ SuperValu price found via requests JSON-LD: €{price}")
-                                            return price
+                                            # Detect promotions with the extracted price
+                                            promotion_data = self.detect_supervalu_promotion_data(html_content, price)
+                                            return (price, promotion_data if promotion_data.get('promotion_type') else None)
                                     except (ValueError, TypeError):
                                         continue
                     except (json.JSONDecodeError, ValueError) as e:
                         logger.debug(f"JSON pattern {i+1} parsing error: {e}")
                         continue
-                
+
                 # === 2. ENHANCED REGEX PRICE EXTRACTION ===
                 # SuperValu specific price patterns in HTML
                 # Based on analysis: found prices like 1.18, 2.43, 1.81 in static HTML
-                
+
                 # First try to find realistic price ranges (€0.50 - €50.00 for typical groceries)
                 # Pattern 2 from debug is the one that works: €\s*(\d+[.,]\d{2})
                 realistic_patterns = [
@@ -1472,29 +1900,29 @@ class SimpleLocalScraper:
                     r'pricing[^}]*?(\d+[.,]\d{2})',
                     r'cost[^}]*?(\d+[.,]\d{2})'
                 ]
-                
+
                 found_prices = []
                 for i, pattern in enumerate(realistic_patterns):
                     matches = re.findall(pattern, html_content, re.IGNORECASE)
                     logger.info(f"Pattern {i+1}: {pattern} -> {len(matches)} matches")
                     if matches:
                         logger.info(f"  First 3 matches: {matches[:3]}")
-                    
+
                     for match in matches:
                         try:
-                            price = float(match.replace(',', '.'))
+                            price_val = float(match.replace(',', '.'))
                             # Focus on realistic grocery prices and avoid decimals like version numbers
-                            if 0.50 <= price <= 50.00:
-                                found_prices.append(price)
-                                logger.info(f"  Added price: €{price}")
+                            if 0.50 <= price_val <= 50.00:
+                                found_prices.append(price_val)
+                                logger.info(f"  Added price: €{price_val}")
                         except ValueError:
                             continue
-                
+
                 if found_prices:
                     # Remove duplicates and sort
                     unique_prices = sorted(list(set(found_prices)))
                     logger.info(f"Found potential prices: {unique_prices[:10]}")
-                    
+
                     # SuperValu-specific heuristic: tea products are typically €2-€10
                     # Filter for realistic tea prices first
                     tea_prices = [p for p in unique_prices if 2.00 <= p <= 10.00]
@@ -1505,86 +1933,87 @@ class SimpleLocalScraper:
                         if optimal_prices:
                             price = optimal_prices[0]  # Take the first in optimal range
                             logger.info(f"✅ SuperValu price found via requests (tea-optimized): €{price}")
-                            return price
                         else:
                             price = tea_prices[0]  # Take first reasonable tea price
                             logger.info(f"✅ SuperValu price found via requests (tea range): €{price}")
-                            return price
-                    
-                    # Fallback: general grocery prices
-                    grocery_prices = [p for p in unique_prices if 1.00 <= p <= 15.00]
-                    if grocery_prices:
-                        price = grocery_prices[0]  
-                        logger.info(f"✅ SuperValu price found via requests (grocery range): €{price}")
-                        return price
-                    elif unique_prices:
-                        price = unique_prices[0]  
-                        logger.info(f"✅ SuperValu price found via requests (any price): €{price}")
-                        return price
-                
+                    else:
+                        # Fallback: general grocery prices
+                        grocery_prices = [p for p in unique_prices if 1.00 <= p <= 15.00]
+                        if grocery_prices:
+                            price = grocery_prices[0]
+                            logger.info(f"✅ SuperValu price found via requests (grocery range): €{price}")
+                        elif unique_prices:
+                            price = unique_prices[0]
+                            logger.info(f"✅ SuperValu price found via requests (any price): €{price}")
+
+                    if price:
+                        # Detect promotions with the extracted price
+                        promotion_data = self.detect_supervalu_promotion_data(html_content, price)
+                        return (price, promotion_data if promotion_data.get('promotion_type') else None)
+
                 logger.warning("⚠️ No valid prices found in SuperValu requests fallback")
-                return None
-            
+                return (None, None)
+
             else:
                 logger.warning(f"⚠️ SuperValu requests fallback failed: HTTP {response.status_code}")
-                return None
-                
+                return (None, None)
+
         except requests.exceptions.Timeout:
             logger.warning("⚠️ SuperValu requests timeout")
-            return None
+            return (None, None)
         except requests.exceptions.ConnectionError:
             logger.warning("⚠️ SuperValu requests connection error")
-            return None
+            return (None, None)
         except Exception as e:
             logger.error(f"❌ SuperValu requests fallback error: {e}")
-            return None
+            return (None, None)
     
     def scrape_dunnes(self, url: str, product_name: str) -> Optional[float]:
-        """Scrape Dunnes product - GitHub Actions optimized"""
+        """Scrape Dunnes product - Uses Selenium for both local and GitHub Actions"""
         try:
             logger.info(f"🛒 Scraping Dunnes: {product_name}")
-            
+
             # Detect if running in GitHub Actions
             is_github_actions = os.getenv('GITHUB_ACTIONS') == 'true'
             if is_github_actions:
-                logger.info("🔧 Detected GitHub Actions environment - using enhanced Cloudflare bypass")
-                # GitHub Actions often gets blocked more aggressively, skip Selenium and go directly to requests
-                return self._scrape_dunnes_requests_fallback(url, product_name)
-            
-            # Local execution - use original Selenium approach
+                logger.info("🔧 GitHub Actions: Using Selenium with extended Cloudflare wait times")
+
+            # Use Selenium approach (works better than requests for Cloudflare)
             self.driver.get(url)
             time.sleep(5)  # Initial wait for page load
-            
+
             # Check if we got blocked
             page_title = self.driver.title
             logger.info(f"Page title: {page_title}")
-            
+
             # Handle Cloudflare challenge more aggressively
+            is_github_actions = os.getenv('GITHUB_ACTIONS') == 'true'
             if "Just a moment" in page_title or "Checking your browser" in self.driver.page_source:
                 logger.warning("⚠️ Cloudflare challenge detected, attempting to bypass...")
-                
-                # Wait for mobile challenge to resolve (shorter timeout)
-                max_wait = 30  # Maximum 30 seconds for mobile
+
+                # Extended wait for GitHub Actions (datacenter IPs need more time)
+                max_wait = 60 if is_github_actions else 30
                 wait_time = 0
-                
+
                 while wait_time < max_wait:
                     time.sleep(5)
                     wait_time += 5
-                    
+
                     # Check if challenge resolved
                     current_title = self.driver.title
-                    if "Just a moment" not in current_title and "Dunnes Stores" in current_title:
+                    if "Just a moment" not in current_title and ("Dunnes" in current_title or "dunnes" in current_title.lower()):
                         logger.info(f"✅ Cloudflare challenge resolved after {wait_time}s")
                         page_title = current_title
                         break
-                    
+
                     logger.info(f"Still waiting for Cloudflare... ({wait_time}s/{max_wait}s)")
-                
-                # If still blocked after max wait, try alternative approach
+
+                # If still blocked after max wait, log failure (requests fallback doesn't work for Dunnes)
                 if "Just a moment" in self.driver.title:
-                    logger.warning("⚠️ Cloudflare challenge persisting, trying requests fallback...")
-                    return self._scrape_dunnes_requests_fallback(url, product_name)
-            
+                    logger.warning("⚠️ Cloudflare challenge persisting after extended wait")
+                    logger.warning("❌ Dunnes blocked by Cloudflare - this product will be retried later")
+                    return None
+
             # Quick check if we're on the product page
             if "Dunnes Stores" in page_title:
                 logger.info("✅ Product page loaded successfully")
@@ -2266,28 +2695,41 @@ class SimpleLocalScraper:
             
             # Scrape based on store
             price = None
+            scraper_promotion_data = None  # Promotion data returned directly from scraper
+
             if store_name.lower() == 'aldi':
-                price = self.scrape_aldi(alias['scraper_url'], alias['alias_name'])
+                # Aldi scraper now returns (price, promotion_data) tuple
+                price, scraper_promotion_data = self.scrape_aldi(alias['scraper_url'], alias['alias_name'])
             elif store_name.lower() == 'tesco':
                 price = self.scrape_tesco(alias['scraper_url'], alias['alias_name'])
             elif store_name.lower() == 'supervalu':
-                price = self.scrape_supervalu(alias['scraper_url'], alias['alias_name'])
+                # SuperValu scraper now returns (price, promotion_data) tuple
+                price, scraper_promotion_data = self.scrape_supervalu(alias['scraper_url'], alias['alias_name'])
             elif store_name.lower() == 'dunnes':
                 price = self.scrape_dunnes(alias['scraper_url'], alias['alias_name'])
             elif store_name.lower() == 'lidl':
                 price = self.scrape_lidl(alias['scraper_url'], alias['alias_name'])
-            
+
             elapsed = time.time() - start_time
-            
+
             if price:
-                # Detect if this is a promotion price by checking if we found clubcard/promotion info
+                # Initialize promotion variables
                 promotion_type = None
                 promotion_text = None
                 promotion_discount_value = None
                 original_price = None
 
+                # For Aldi and SuperValu, use promotion data returned from scraper
+                if scraper_promotion_data:
+                    promotion_type = scraper_promotion_data.get('promotion_type')
+                    promotion_text = scraper_promotion_data.get('promotion_text')
+                    promotion_discount_value = scraper_promotion_data.get('promotion_discount_value')
+                    original_price = scraper_promotion_data.get('original_price')
+                    if promotion_type:
+                        logger.info(f"🏷️ {store_name} promotion detected: {promotion_type} - {promotion_text}")
+
                 # For Tesco, check if we detected a clubcard price or multi-buy promotion
-                if store_name == 'Tesco':
+                elif store_name == 'Tesco':
                     # Get comprehensive price analysis to check for promotions
                     try:
                         if hasattr(self, '_last_html_content'):
