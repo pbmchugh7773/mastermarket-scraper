@@ -813,73 +813,130 @@ class SimpleLocalScraper:
         html_lower = html_content.lower()
 
         # === 1. Detect Real Rewards (membership pricing) ===
-        # Be specific - only match actual member pricing indicators in visible HTML, not JS code
-        # SuperValu shows member prices with specific HTML elements, not just any mention of "loyalty"
-        real_rewards_patterns = [
-            r'real\s*rewards?\s*price',                           # "Real Rewards Price" label
-            r'member\s*price[^}]*€\s*(\d+[.,]\d{2})',            # "Member price €X.XX"
-            r'data-testid="[^"]*loyalty[^"]*price',              # SuperValu loyalty price test IDs
-            r'class="[^"]*LoyaltyPrice[^"]*"[^>]*>[^<]*€',       # Loyalty price class with euro
-            r'ProductPriceLoyalty[^>]*>\s*€\s*(\d+[.,]\d{2})',   # SuperValu specific loyalty price
+        # SuperValu Real Rewards shows promotional prices for members
+        # We need to extract BOTH the Real Rewards price AND the normal price
+        # Example: "Only €2.00 Real Rewards Price" with "non-Real Rewards members will pay €3"
+
+        # Patterns to extract Real Rewards promotional price
+        real_rewards_price_patterns = [
+            r'Only\s*€\s*(\d+[.,]\d{2})\s*Real\s*Rewards\s*Price',  # "Only €2.00 Real Rewards Price"
+            r'real\s*rewards[^€]{0,30}€\s*(\d+[.,]\d{2})',          # "Real Rewards ... €2.00"
+            r'Real\s*Rewards\s*members\s*will\s*pay\s*€\s*(\d+[.,]\d{2})',  # "Real Rewards members will pay €2.00"
+            r'promotionBadgeComponent[^>]*>Only\s*€\s*(\d+[.,]\d{2})',  # Badge with price
         ]
 
-        real_rewards_found = False
-        for pattern in real_rewards_patterns:
+        # Patterns to extract the normal (non-member) price
+        normal_price_patterns = [
+            r'non-Real\s*Rewards\s*members\s*will\s*pay\s*€\s*(\d+[.,]?\d*)',  # "non-Real Rewards members will pay €3"
+            r'tprInfo[^}]*markdown["\s:]*€\s*(\d+[.,]\d{2})',      # tprInfo markdown price
+            r'"priceLabel"\s*:\s*"Only\s*€\s*(\d+[.,]?\d*)"',      # priceLabel "Only €3"
+        ]
+
+        real_rewards_price = None
+        normal_price = None
+
+        # Extract Real Rewards promotional price
+        for pattern in real_rewards_price_patterns:
             match = re.search(pattern, html_content, re.IGNORECASE)
             if match:
-                real_rewards_found = True
-                promotion_data['promotion_type'] = 'membership_price'
-                promotion_data['promotion_text'] = 'Real Rewards Price'
-                logger.info(f"🏷️ SuperValu Real Rewards price detected")
-                break
+                try:
+                    real_rewards_price = float(match.group(1).replace(',', '.'))
+                    logger.info(f"🏷️ SuperValu Real Rewards price found: €{real_rewards_price:.2f}")
+                    break
+                except (ValueError, IndexError):
+                    continue
 
-        # Don't set membership_price just because "loyalty" appears in JavaScript code
-
-        # === 2. Detect "Was" price / Original price ===
-        # IMPORTANT: These patterns should NOT match per-unit prices like €X.XX/kg
-        was_price_patterns = [
-            r'was[:\s]*[€£]?\s*(\d+[.,]\d{2})(?!\s*/(?:kg|100g|g|ml|l|litre))',           # "Was €5.99" not per-unit
-            r'original[:\s]*price[:\s]*[€£]?\s*(\d+[.,]\d{2})(?!\s*/(?:kg|100g|g|ml|l|litre))',
-            r'rrp[:\s]*[€£]?\s*(\d+[.,]\d{2})(?!\s*/(?:kg|100g|g|ml|l|litre))',
-            r'previously[:\s]*[€£]?\s*(\d+[.,]\d{2})(?!\s*/(?:kg|100g|g|ml|l|litre))',
-            r'regular[:\s]*price[:\s]*[€£]?\s*(\d+[.,]\d{2})(?!\s*/(?:kg|100g|g|ml|l|litre))',
-            r'class="[^"]*was[^"]*"[^>]*>[^€£]*[€£]\s*(\d+[.,]\d{2})(?!\s*/(?:kg|100g|g|ml|l|litre))',
-            r'class="[^"]*original[^"]*"[^>]*>[^€£]*[€£]\s*(\d+[.,]\d{2})(?!\s*/(?:kg|100g|g|ml|l|litre))',
-            r'<s[^>]*>\s*[€£]?\s*(\d+[.,]\d{2})(?!\s*/(?:kg|100g|g|ml|l|litre))',         # Strikethrough price
-            r'<del[^>]*>\s*[€£]?\s*(\d+[.,]\d{2})(?!\s*/(?:kg|100g|g|ml|l|litre))',       # Deleted/crossed out price
-        ]
-
-        # Per-unit price indicators to exclude from "was price" detection
-        per_unit_indicators = ['/kg', '/100g', '/ml', '/l', '/litre', 'per kg', 'per 100g', 'per litre', 'price per']
-
-        for pattern in was_price_patterns:
-            match = re.search(pattern, html_lower)
+        # Extract normal (non-member) price
+        for pattern in normal_price_patterns:
+            match = re.search(pattern, html_content, re.IGNORECASE)
             if match:
                 try:
-                    original_price = float(match.group(1).replace(',', '.'))
-                    if original_price > 0 and (current_price is None or original_price > current_price):
-                        # Additional check: verify this isn't a per-unit price
-                        # Get context around the match (30 chars before and after)
-                        match_start = match.start()
-                        match_end = match.end()
-                        context = html_lower[max(0, match_start - 30):min(len(html_lower), match_end + 30)]
-
-                        # Skip if context contains per-unit indicators
-                        is_per_unit = any(indicator in context for indicator in per_unit_indicators)
-                        if is_per_unit:
-                            logger.info(f"⏭️ Skipping potential per-unit 'was price': €{original_price:.2f}")
-                            continue
-
-                        promotion_data['original_price'] = original_price
-                        if not promotion_data['promotion_type']:
-                            promotion_data['promotion_type'] = 'temporary_discount'
-                            promotion_data['promotion_text'] = f'Was €{original_price:.2f}'
-                        if current_price and original_price > current_price:
-                            promotion_data['promotion_discount_value'] = original_price - current_price
-                        logger.info(f"🏷️ SuperValu Was/Now promotion: Was €{original_price:.2f}")
-                        break
-                except ValueError:
+                    price_str = match.group(1).replace(',', '.')
+                    # Handle prices like "€3" without decimal
+                    if '.' not in price_str:
+                        price_str += '.00'
+                    normal_price = float(price_str)
+                    logger.info(f"🏷️ SuperValu normal price found: €{normal_price:.2f}")
+                    break
+                except (ValueError, IndexError):
                     continue
+
+        # If we found Real Rewards pricing, set up the promotion data
+        if real_rewards_price is not None:
+            promotion_data['promotion_type'] = 'membership_price'
+            promotion_data['promotion_text'] = f'Only €{real_rewards_price:.2f} Real Rewards Price'
+            promotion_data['real_rewards_price'] = real_rewards_price  # Store the promotional price
+
+            if normal_price is not None and normal_price > real_rewards_price:
+                promotion_data['original_price'] = normal_price
+                promotion_data['promotion_discount_value'] = round(normal_price - real_rewards_price, 2)
+                logger.info(f"🏷️ SuperValu Real Rewards promotion: €{real_rewards_price:.2f} (was €{normal_price:.2f}, save €{promotion_data['promotion_discount_value']:.2f})")
+            else:
+                logger.info(f"🏷️ SuperValu Real Rewards price detected: €{real_rewards_price:.2f}")
+
+        # Fallback: Check for basic Real Rewards indicators without extracting price
+        elif not real_rewards_price:
+            basic_patterns = [
+                r'real\s*rewards?\s*price',
+                r'data-testid="[^"]*loyalty[^"]*price',
+            ]
+            for pattern in basic_patterns:
+                if re.search(pattern, html_content, re.IGNORECASE):
+                    promotion_data['promotion_type'] = 'membership_price'
+                    promotion_data['promotion_text'] = 'Real Rewards Price'
+                    logger.info(f"🏷️ SuperValu Real Rewards detected (no price extracted)")
+                    break
+
+        # === 2. Detect "Was" price / Original price ===
+        # IMPORTANT: Skip this section if Real Rewards already set the original_price
+        # The normal price from Real Rewards detection is more accurate than "Was" price
+        if promotion_data.get('real_rewards_price') and promotion_data.get('original_price'):
+            logger.info(f"⏭️ Skipping 'Was price' detection - Real Rewards already set original_price: €{promotion_data['original_price']:.2f}")
+        else:
+            # IMPORTANT: These patterns should NOT match per-unit prices like €X.XX/kg
+            was_price_patterns = [
+                r'was[:\s]*[€£]?\s*(\d+[.,]\d{2})(?!\s*/(?:kg|100g|g|ml|l|litre))',           # "Was €5.99" not per-unit
+                r'original[:\s]*price[:\s]*[€£]?\s*(\d+[.,]\d{2})(?!\s*/(?:kg|100g|g|ml|l|litre))',
+                r'rrp[:\s]*[€£]?\s*(\d+[.,]\d{2})(?!\s*/(?:kg|100g|g|ml|l|litre))',
+                r'previously[:\s]*[€£]?\s*(\d+[.,]\d{2})(?!\s*/(?:kg|100g|g|ml|l|litre))',
+                r'regular[:\s]*price[:\s]*[€£]?\s*(\d+[.,]\d{2})(?!\s*/(?:kg|100g|g|ml|l|litre))',
+                r'class="[^"]*was[^"]*"[^>]*>[^€£]*[€£]\s*(\d+[.,]\d{2})(?!\s*/(?:kg|100g|g|ml|l|litre))',
+                r'class="[^"]*original[^"]*"[^>]*>[^€£]*[€£]\s*(\d+[.,]\d{2})(?!\s*/(?:kg|100g|g|ml|l|litre))',
+                r'<s[^>]*>\s*[€£]?\s*(\d+[.,]\d{2})(?!\s*/(?:kg|100g|g|ml|l|litre))',         # Strikethrough price
+                r'<del[^>]*>\s*[€£]?\s*(\d+[.,]\d{2})(?!\s*/(?:kg|100g|g|ml|l|litre))',       # Deleted/crossed out price
+            ]
+
+            # Per-unit price indicators to exclude from "was price" detection
+            per_unit_indicators = ['/kg', '/100g', '/ml', '/l', '/litre', 'per kg', 'per 100g', 'per litre', 'price per']
+
+            for pattern in was_price_patterns:
+                match = re.search(pattern, html_lower)
+                if match:
+                    try:
+                        original_price = float(match.group(1).replace(',', '.'))
+                        if original_price > 0 and (current_price is None or original_price > current_price):
+                            # Additional check: verify this isn't a per-unit price
+                            # Get context around the match (30 chars before and after)
+                            match_start = match.start()
+                            match_end = match.end()
+                            context = html_lower[max(0, match_start - 30):min(len(html_lower), match_end + 30)]
+
+                            # Skip if context contains per-unit indicators
+                            is_per_unit = any(indicator in context for indicator in per_unit_indicators)
+                            if is_per_unit:
+                                logger.info(f"⏭️ Skipping potential per-unit 'was price': €{original_price:.2f}")
+                                continue
+
+                            promotion_data['original_price'] = original_price
+                            if not promotion_data['promotion_type']:
+                                promotion_data['promotion_type'] = 'temporary_discount'
+                                promotion_data['promotion_text'] = f'Was €{original_price:.2f}'
+                            if current_price and original_price > current_price:
+                                promotion_data['promotion_discount_value'] = original_price - current_price
+                            logger.info(f"🏷️ SuperValu Was/Now promotion: Was €{original_price:.2f}")
+                            break
+                    except ValueError:
+                        continue
 
         # === 3. Detect multi-buy offers (very common at SuperValu) ===
         # First, try to find the actual promotion badge text from SuperValu's HTML structure
@@ -1995,7 +2052,25 @@ class SimpleLocalScraper:
                     if price:
                         # Detect promotions with the extracted price
                         promotion_data = self.detect_supervalu_promotion_data(html_content, price)
-                        return (price, promotion_data if promotion_data.get('promotion_type') else None)
+
+                        # IMPORTANT: If Real Rewards price was detected, use it as the main price
+                        # This ensures consistency with Tesco (Clubcard price as main price)
+                        if promotion_data and promotion_data.get('real_rewards_price'):
+                            real_rewards_price = promotion_data['real_rewards_price']
+                            normal_price = promotion_data.get('original_price') or price
+
+                            # Use Real Rewards price as the main price (what customer pays)
+                            # Set original_price to normal price (price without membership)
+                            if real_rewards_price < normal_price:
+                                logger.info(f"🎯 Using Real Rewards price as main price: €{real_rewards_price:.2f} (normal: €{normal_price:.2f})")
+                                promotion_data['original_price'] = normal_price
+                                return (real_rewards_price, promotion_data)
+                            else:
+                                # Real Rewards price is not lower, use the extracted price
+                                logger.info(f"⚠️ Real Rewards price (€{real_rewards_price:.2f}) not lower than normal (€{normal_price:.2f}), using normal price")
+                                return (price, promotion_data if promotion_data.get('promotion_type') else None)
+                        else:
+                            return (price, promotion_data if promotion_data.get('promotion_type') else None)
 
                 logger.warning("⚠️ No valid prices found in SuperValu requests fallback")
                 return (None, None)
