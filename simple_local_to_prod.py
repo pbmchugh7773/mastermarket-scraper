@@ -748,22 +748,34 @@ class SimpleLocalScraper:
                     continue
 
         # === 5. Detect multi-buy offers (less common at Aldi but possible) ===
+        # NOTE: Be careful with "NxM" patterns - they can match image dimensions like "32x32", "144x144"
         multi_buy_patterns = [
-            r'(\d+)\s*for\s*[€£]?\s*(\d+[.,]\d{2})',      # "3 for €5.00"
-            r'buy\s*(\d+)\s*get\s*(\d+)',                  # "Buy 2 Get 1"
-            r'(\d+)\s*x\s*(\d+)',                          # "2x1" style
+            (r'(\d+)\s*for\s*[€£]?\s*(\d+[.,]\d{2})', 'for'),      # "3 for €5.00"
+            (r'buy\s*(\d+)\s*get\s*(\d+)', 'buy_get'),              # "Buy 2 Get 1"
+            (r'(\d)\s*x\s*(\d)(?!\d)', 'nxm'),                      # "2x1" style - single digits only to avoid image dimensions
         ]
 
-        for pattern in multi_buy_patterns:
+        for pattern, ptype in multi_buy_patterns:
             match = re.search(pattern, page_lower)
             if match:
+                # For NxM pattern, validate it's a realistic multi-buy (not image dimensions)
+                if ptype == 'nxm':
+                    num1, num2 = int(match.group(1)), int(match.group(2))
+                    # Skip if both numbers are the same (likely image dimensions like 3x3 placeholder)
+                    # or if numbers don't make sense for a promotion (e.g., 0x0, 1x1)
+                    if num1 == num2 or num1 < 2 or num2 < 1 or num1 > 5 or num2 > 5:
+                        logger.info(f"⏭️ Skipping likely non-promotion pattern: {match.group(0)} (image dimensions or invalid)")
+                        continue
+
                 promotion_data['promotion_type'] = 'multi_buy'
-                if 'for' in pattern:
+                if ptype == 'for':
                     qty = match.group(1)
                     price = match.group(2).replace(',', '.')
                     promotion_data['promotion_text'] = f'{qty} for €{price}'
+                elif ptype == 'buy_get':
+                    promotion_data['promotion_text'] = f'Buy {match.group(1)} Get {match.group(2)}'
                 else:
-                    promotion_data['promotion_text'] = match.group(0).strip()
+                    promotion_data['promotion_text'] = match.group(0).strip().upper()
                 logger.info(f"🏷️ Aldi multi-buy promotion detected: {promotion_data['promotion_text']}")
                 break
 
@@ -824,17 +836,21 @@ class SimpleLocalScraper:
         # Don't set membership_price just because "loyalty" appears in JavaScript code
 
         # === 2. Detect "Was" price / Original price ===
+        # IMPORTANT: These patterns should NOT match per-unit prices like €X.XX/kg
         was_price_patterns = [
-            r'was[:\s]*[€£]?\s*(\d+[.,]\d{2})',           # "Was €5.99"
-            r'original[:\s]*price[:\s]*[€£]?\s*(\d+[.,]\d{2})',
-            r'rrp[:\s]*[€£]?\s*(\d+[.,]\d{2})',
-            r'previously[:\s]*[€£]?\s*(\d+[.,]\d{2})',
-            r'regular[:\s]*price[:\s]*[€£]?\s*(\d+[.,]\d{2})',
-            r'class="[^"]*was[^"]*"[^>]*>[^€£]*[€£]\s*(\d+[.,]\d{2})',
-            r'class="[^"]*original[^"]*"[^>]*>[^€£]*[€£]\s*(\d+[.,]\d{2})',
-            r'<s[^>]*>\s*[€£]?\s*(\d+[.,]\d{2})',         # Strikethrough price
-            r'<del[^>]*>\s*[€£]?\s*(\d+[.,]\d{2})',       # Deleted/crossed out price
+            r'was[:\s]*[€£]?\s*(\d+[.,]\d{2})(?!\s*/(?:kg|100g|g|ml|l|litre))',           # "Was €5.99" not per-unit
+            r'original[:\s]*price[:\s]*[€£]?\s*(\d+[.,]\d{2})(?!\s*/(?:kg|100g|g|ml|l|litre))',
+            r'rrp[:\s]*[€£]?\s*(\d+[.,]\d{2})(?!\s*/(?:kg|100g|g|ml|l|litre))',
+            r'previously[:\s]*[€£]?\s*(\d+[.,]\d{2})(?!\s*/(?:kg|100g|g|ml|l|litre))',
+            r'regular[:\s]*price[:\s]*[€£]?\s*(\d+[.,]\d{2})(?!\s*/(?:kg|100g|g|ml|l|litre))',
+            r'class="[^"]*was[^"]*"[^>]*>[^€£]*[€£]\s*(\d+[.,]\d{2})(?!\s*/(?:kg|100g|g|ml|l|litre))',
+            r'class="[^"]*original[^"]*"[^>]*>[^€£]*[€£]\s*(\d+[.,]\d{2})(?!\s*/(?:kg|100g|g|ml|l|litre))',
+            r'<s[^>]*>\s*[€£]?\s*(\d+[.,]\d{2})(?!\s*/(?:kg|100g|g|ml|l|litre))',         # Strikethrough price
+            r'<del[^>]*>\s*[€£]?\s*(\d+[.,]\d{2})(?!\s*/(?:kg|100g|g|ml|l|litre))',       # Deleted/crossed out price
         ]
+
+        # Per-unit price indicators to exclude from "was price" detection
+        per_unit_indicators = ['/kg', '/100g', '/ml', '/l', '/litre', 'per kg', 'per 100g', 'per litre', 'price per']
 
         for pattern in was_price_patterns:
             match = re.search(pattern, html_lower)
@@ -842,6 +858,18 @@ class SimpleLocalScraper:
                 try:
                     original_price = float(match.group(1).replace(',', '.'))
                     if original_price > 0 and (current_price is None or original_price > current_price):
+                        # Additional check: verify this isn't a per-unit price
+                        # Get context around the match (30 chars before and after)
+                        match_start = match.start()
+                        match_end = match.end()
+                        context = html_lower[max(0, match_start - 30):min(len(html_lower), match_end + 30)]
+
+                        # Skip if context contains per-unit indicators
+                        is_per_unit = any(indicator in context for indicator in per_unit_indicators)
+                        if is_per_unit:
+                            logger.info(f"⏭️ Skipping potential per-unit 'was price': €{original_price:.2f}")
+                            continue
+
                         promotion_data['original_price'] = original_price
                         if not promotion_data['promotion_type']:
                             promotion_data['promotion_type'] = 'temporary_discount'
@@ -1889,22 +1917,27 @@ class SimpleLocalScraper:
 
                 # First try to find realistic price ranges (€0.50 - €50.00 for typical groceries)
                 # Pattern 2 from debug is the one that works: €\s*(\d+[.,]\d{2})
+                # IMPORTANT: Exclude per-unit prices like €X.XX/kg, €X.XX/100g, per litre
                 realistic_patterns = [
-                    r'€\s*(\d+[.,]\d{2})',  # This pattern works! Found €4.09
-                    r'"price"[:\s]*"?(\d+[.,]\d{2})"?',
-                    r'price["\s:]*(\d+[.,]\d{2})',
-                    r'(\d+[.,]\d{2})\s*€',
-                    r'"amount"[:\s]*"?(\d+[.,]\d{2})"?',
-                    r'value["\s:]*(\d+[.,]\d{2})',
+                    r'€\s*(\d+[.,]\d{2})(?!\s*/(?:kg|100g|g|ml|l|litre|ltr))(?![^<]{0,15}(?:/kg|/100g|per\s*kg|per\s*100g|per\s*litre))',  # Exclude per-unit
+                    r'"price"[:\s]*"?(\d+[.,]\d{2})"?(?![^"]*(?:/kg|/100g|per))',
+                    r'price["\s:]*(\d+[.,]\d{2})(?![^"]*(?:/kg|/100g|per))',
+                    r'(\d+[.,]\d{2})\s*€(?!\s*/(?:kg|100g|g|ml|l|litre|ltr))',
+                    r'"amount"[:\s]*"?(\d+[.,]\d{2})"?(?![^"]*(?:/kg|/100g|per))',
+                    r'value["\s:]*(\d+[.,]\d{2})(?![^"]*(?:/kg|/100g|per))',
                     # Additional SuperValu patterns
-                    r'pricing[^}]*?(\d+[.,]\d{2})',
-                    r'cost[^}]*?(\d+[.,]\d{2})'
+                    r'pricing[^}]*?(\d+[.,]\d{2})(?![^}]*(?:/kg|/100g|per))',
+                    r'cost[^}]*?(\d+[.,]\d{2})(?![^}]*(?:/kg|/100g|per))'
                 ]
+
+                # Per-unit price indicators to filter out
+                per_unit_indicators = ['/kg', '/100g', '/ml', '/l', '/litre', 'per kg', 'per 100g',
+                                       'per litre', 'per unit', 'unit price', 'price per', '€/kg']
 
                 found_prices = []
                 for i, pattern in enumerate(realistic_patterns):
                     matches = re.findall(pattern, html_content, re.IGNORECASE)
-                    logger.info(f"Pattern {i+1}: {pattern} -> {len(matches)} matches")
+                    logger.info(f"Pattern {i+1}: {pattern[:50]}... -> {len(matches)} matches")
                     if matches:
                         logger.info(f"  First 3 matches: {matches[:3]}")
 
@@ -1913,8 +1946,21 @@ class SimpleLocalScraper:
                             price_val = float(match.replace(',', '.'))
                             # Focus on realistic grocery prices and avoid decimals like version numbers
                             if 0.50 <= price_val <= 50.00:
-                                found_prices.append(price_val)
-                                logger.info(f"  Added price: €{price_val}")
+                                # Double-check: make sure this price isn't a per-unit price
+                                # by checking if it appears near per-unit indicators in the HTML
+                                price_str = f"{price_val:.2f}".replace('.', '[.,]')
+                                is_per_unit = False
+                                for indicator in per_unit_indicators:
+                                    # Check if price appears within 30 chars of a per-unit indicator
+                                    per_unit_pattern = rf'€?\s*{price_str}\s*{re.escape(indicator)}|{re.escape(indicator)}\s*€?\s*{price_str}'
+                                    if re.search(per_unit_pattern, html_content, re.IGNORECASE):
+                                        logger.info(f"  Skipping per-unit price: €{price_val} (found near '{indicator}')")
+                                        is_per_unit = True
+                                        break
+
+                                if not is_per_unit:
+                                    found_prices.append(price_val)
+                                    logger.info(f"  Added price: €{price_val}")
                         except ValueError:
                             continue
 
