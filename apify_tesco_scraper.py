@@ -271,50 +271,58 @@ class ApifyTescoScraper:
         """
         Extract price and promotion data from Apify result.
 
+        IMPORTANT: Following MasterMarket price architecture:
+        - price = promotional price (what customer pays, e.g., Clubcard price)
+        - original_price = regular price (without promotion)
+
+        This is consistent with simple_local_to_prod.py scraper logic.
+
         Args:
             item: Single product result from Apify
 
         Returns:
             Dict with price data or None if invalid
         """
-        # Try different field names for price
-        price = (
+        # Try different field names for regular price
+        regular_price = (
             item.get('price') or
             item.get('currentPrice') or
             item.get('regularPrice')
         )
 
-        if not price:
+        if not regular_price:
             return None
 
         # Ensure price is a float
         try:
-            price = float(price)
+            regular_price = float(regular_price)
         except (TypeError, ValueError):
             return None
 
         # Validate price range (€0.01 - €1000)
-        if price < 0.01 or price > 1000:
+        if regular_price < 0.01 or regular_price > 1000:
             return None
 
         result = {
-            'price': price,
+            'price': regular_price,  # Default to regular price
             'url': item.get('url', ''),
             'title': item.get('title', ''),
             'ean': item.get('ean') or item.get('gtin') or item.get('upc'),
         }
 
         # Check for Clubcard/promotional price
+        # If Clubcard price exists and is lower, use it as the main price
         clubcard_price = item.get('clubcardPrice') or item.get('promoPrice')
         if clubcard_price:
             try:
                 clubcard_price = float(clubcard_price)
-                if 0.01 <= clubcard_price < price:
-                    # Use valid enum value 'membership_price' for Clubcard promotions
+                if 0.01 <= clubcard_price < regular_price:
+                    # ARCHITECTURE: price = promotional (Clubcard), original_price = regular
+                    result['price'] = clubcard_price  # What customer pays
+                    result['original_price'] = regular_price  # Price without membership
                     result['promotion_type'] = 'membership_price'
-                    result['promotion_text'] = 'Clubcard Price'  # Required for has_clubcard_price detection
-                    result['clubcard_price'] = clubcard_price
-                    result['original_price'] = price
+                    result['promotion_text'] = 'Clubcard Price'
+                    result['promotion_discount_value'] = regular_price - clubcard_price
             except (TypeError, ValueError):
                 pass
 
@@ -345,14 +353,15 @@ class ApifyTescoScraper:
         }
 
         # Add promotion data if available
+        # Architecture: price = promotional, original_price = regular
         if 'promotion_type' in price_data:
             payload['promotion_type'] = price_data['promotion_type']
         if 'promotion_text' in price_data:
             payload['promotion_text'] = price_data['promotion_text']
-        if 'clubcard_price' in price_data:
-            payload['clubcard_price'] = price_data['clubcard_price']
         if 'original_price' in price_data:
             payload['original_price'] = price_data['original_price']
+        if 'promotion_discount_value' in price_data:
+            payload['promotion_discount_value'] = price_data['promotion_discount_value']
 
         # Retry logic
         for attempt in range(3):
