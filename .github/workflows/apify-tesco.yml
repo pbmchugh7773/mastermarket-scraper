@@ -2,9 +2,12 @@ name: Apify Tesco Scraper
 
 on:
   schedule:
-    # Martes y Viernes a las 6:00 AM UTC
+    # Martes y Viernes a las 6:00 AM UTC (normal mode)
     - cron: '0 6 * * 2'   # Tuesday
     - cron: '0 6 * * 5'   # Friday
+    # Retry run 2 hours later (8:00 AM UTC) for failed/pending products
+    - cron: '0 8 * * 2'   # Tuesday retry
+    - cron: '0 8 * * 5'   # Friday retry
   workflow_dispatch:
     inputs:
       limit:
@@ -13,6 +16,11 @@ on:
         default: ''
       dry_run:
         description: 'Run without uploading prices'
+        required: false
+        type: boolean
+        default: false
+      retry_mode:
+        description: 'Only scrape pending/failed products (retry mode)'
         required: false
         type: boolean
         default: false
@@ -83,6 +91,15 @@ jobs:
           SCRAPER_PASSWORD: ${{ secrets.SCRAPER_PASSWORD }}
         run: |
           ARGS=""
+
+          # Detect if this is a retry run (8:00 AM UTC)
+          CURRENT_HOUR=$(date +%H)
+          if [ "$CURRENT_HOUR" == "08" ] || [ "${{ github.event.inputs.retry_mode }}" == "true" ]; then
+            ARGS="$ARGS --retry-mode"
+            echo "Running in RETRY MODE (pending/failed products only)"
+          else
+            echo "Running in NORMAL MODE (all products)"
+          fi
 
           # Add limit if specified
           if [ -n "${{ github.event.inputs.limit }}" ]; then
