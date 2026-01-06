@@ -311,8 +311,39 @@ class ApifyTescoScraper:
         }
 
         # Check for Clubcard/promotional price
-        # If Clubcard price exists and is lower, use it as the main price
+        # Apify returns promotions in different structures:
+        # 1. Direct fields: clubcardPrice, promoPrice
+        # 2. Nested promotion object with description like "€3.00 Clubcard Price"
+        clubcard_price = None
+
+        # Method 1: Direct fields (legacy)
         clubcard_price = item.get('clubcardPrice') or item.get('promoPrice')
+
+        # Method 2: Parse from promotion object (current Apify structure)
+        if not clubcard_price:
+            promotion = item.get('promotion')
+            if promotion and isinstance(promotion, dict):
+                terms = promotion.get('terms', '')
+                description = promotion.get('description', '')
+
+                # Check if it's a Clubcard promotion
+                if 'CLUBCARD' in terms.upper() or 'clubcard' in description.lower():
+                    # Extract price from description like "€3.00 Clubcard Price" or "90p Clubcard Price"
+                    # Patterns: €X.XX, £X.XX, Xp (pence)
+                    price_match = re.search(r'[€£]?\s*(\d+(?:[.,]\d{2})?)\s*(?:p\s+)?[Cc]lubcard', description)
+                    if price_match:
+                        price_str = price_match.group(1).replace(',', '.')
+                        try:
+                            extracted_price = float(price_str)
+                            # Handle pence (e.g., "90p" = 0.90)
+                            if 'p ' in description.lower() or description.lower().endswith('p'):
+                                if extracted_price > 10:  # Likely pence not pounds
+                                    extracted_price = extracted_price / 100
+                            clubcard_price = extracted_price
+                        except ValueError:
+                            pass
+
+        # Apply Clubcard price if valid
         if clubcard_price:
             try:
                 clubcard_price = float(clubcard_price)
