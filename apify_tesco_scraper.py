@@ -420,6 +420,40 @@ class ApifyTescoScraper:
 
         return False
 
+    def update_scraping_status(self, alias_id: int, success: bool, price: float = None,
+                              error_message: str = None, promotion_type: str = None,
+                              promotion_text: str = None) -> bool:
+        """Update scraping status for an alias (same as simple_local_to_prod.py)"""
+        if self.dry_run:
+            print(f"  [DRY RUN] Would update status: alias_id={alias_id}, success={success}")
+            return True
+
+        try:
+            data = {
+                'alias_id': alias_id,
+                'success': success,
+                'price': price,
+                'error_message': error_message,
+                'promotion_type': promotion_type,
+                'promotion_text': promotion_text
+            }
+
+            response = self.session.post(
+                f'{API_URL}/api/scraping/update-status',
+                json=data,
+                timeout=30
+            )
+
+            if response.status_code == 200:
+                return True
+            else:
+                print(f"  WARNING: Failed to update status for alias {alias_id}: {response.status_code}")
+                return False
+
+        except Exception as e:
+            print(f"  ERROR: Failed to update status for alias {alias_id}: {e}")
+            return False
+
     def run(self) -> Dict[str, Any]:
         """
         Main execution flow.
@@ -448,14 +482,19 @@ class ApifyTescoScraper:
         # Build mappings for matching:
         # 1. url_to_product: Direct URL match
         # 2. tesco_id_to_product: Match by Tesco product ID (handles .ie vs .com)
+        # 3. url_to_alias_id: For updating scraping status
         url_to_product = {}
         tesco_id_to_product = {}
+        url_to_alias_id = {}
 
         for alias in aliases:
             scraper_url = alias.get('scraper_url')
             product_id = alias.get('product_id')
+            alias_id = alias.get('id')  # ProductAlias.id
             if scraper_url and product_id:
                 url_to_product[scraper_url] = product_id
+                if alias_id:
+                    url_to_alias_id[scraper_url] = alias_id
 
                 # Also map by Tesco product ID for cross-domain matching
                 tesco_id = self.extract_tesco_product_id(scraper_url)
@@ -513,17 +552,45 @@ class ApifyTescoScraper:
                 self.stats['prices_skipped'] += 1
                 continue
 
+            # Get alias_id for this URL (needed to update scraping status)
+            alias_id = url_to_alias_id.get(url)
+
             # Extract price data
             price_data = self.extract_price_data(item)
             if not price_data:
                 self.stats['prices_skipped'] += 1
+                # Update status as failed (no price found)
+                if alias_id:
+                    self.update_scraping_status(
+                        alias_id=alias_id,
+                        success=False,
+                        error_message="No valid price found in Apify data"
+                    )
                 continue
 
             # Upload price
-            if self.upload_price(product_id, price_data):
+            success = self.upload_price(product_id, price_data)
+
+            if success:
                 self.stats['prices_uploaded'] += 1
+                # Update scraping status as successful
+                if alias_id:
+                    self.update_scraping_status(
+                        alias_id=alias_id,
+                        success=True,
+                        price=price_data['price'],
+                        promotion_type=price_data.get('promotion_type'),
+                        promotion_text=price_data.get('promotion_text')
+                    )
             else:
                 self.stats['prices_failed'] += 1
+                # Update status as failed (upload failed)
+                if alias_id:
+                    self.update_scraping_status(
+                        alias_id=alias_id,
+                        success=False,
+                        error_message="Upload to API failed"
+                    )
 
             # Progress update
             if (i + 1) % 50 == 0:
