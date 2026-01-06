@@ -56,13 +56,14 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 class ApifyTescoScraper:
     """Scraper that uses Apify's Tesco actor to fetch prices."""
 
-    def __init__(self, dry_run: bool = False, limit: int = None):
+    def __init__(self, dry_run: bool = False, limit: int = None, retry_mode: bool = False):
         """
         Initialize the scraper.
 
         Args:
             dry_run: If True, don't upload prices to MasterMarket
             limit: Maximum number of products to scrape (None = all)
+            retry_mode: If True, only scrape pending/failed aliases
         """
         if not APIFY_TOKEN:
             raise ValueError("APIFY_API_TOKEN environment variable not set")
@@ -72,6 +73,7 @@ class ApifyTescoScraper:
         self.token: Optional[str] = None
         self.dry_run = dry_run
         self.limit = limit
+        self.retry_mode = retry_mode
 
         # Statistics
         self.stats = {
@@ -156,6 +158,39 @@ class ApifyTescoScraper:
 
         except requests.RequestException as e:
             print(f"Failed to fetch aliases: {e}")
+            return []
+
+    def get_pending_aliases(self) -> List[Dict]:
+        """Get pending aliases that need scraping (retry mode, same as simple_local_to_prod.py)."""
+        try:
+            params = {
+                'store_name': STORE_NAME,
+                'limit': self.limit or 500,
+                'retry_mode': True
+            }
+
+            response = self.session.get(
+                f'{API_URL}/api/scraping/pending-aliases',
+                params=params,
+                timeout=30
+            )
+            response.raise_for_status()
+            data = response.json()
+
+            # Handle different response formats
+            if isinstance(data, list):
+                aliases = data
+            elif isinstance(data, dict):
+                aliases = data.get('aliases', [])
+            else:
+                aliases = []
+
+            self.stats['total_aliases'] = len(aliases)
+            print(f"  Found {len(aliases)} pending aliases to retry")
+            return aliases
+
+        except requests.RequestException as e:
+            print(f"Failed to fetch pending aliases: {e}")
             return []
 
     def run_apify_scraper(self, urls: List[str]) -> List[Dict]:
@@ -465,6 +500,8 @@ class ApifyTescoScraper:
         print(f"\n{'='*60}")
         print(f"Apify Tesco Scraper - {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
         print(f"Mode: {'DRY RUN' if self.dry_run else 'PRODUCTION'}")
+        if self.retry_mode:
+            print(f"Retry Mode: ENABLED (only pending/failed aliases)")
         print(f"API: {API_URL}")
         print(f"{'='*60}\n")
 
@@ -475,9 +512,16 @@ class ApifyTescoScraper:
             return self.stats
         print("  Authenticated successfully")
 
-        # Step 2: Get Tesco aliases
-        print("\n[2/4] Fetching Tesco product aliases...")
-        aliases = self.get_tesco_aliases()
+        # Step 2: Get Tesco aliases (all or pending based on retry_mode)
+        if self.retry_mode:
+            print("\n[2/4] Fetching pending Tesco aliases (retry mode)...")
+            aliases = self.get_pending_aliases()
+            if not aliases:
+                print("  No pending aliases found - all products up to date!")
+                return self.stats
+        else:
+            print("\n[2/4] Fetching Tesco product aliases...")
+            aliases = self.get_tesco_aliases()
 
         # Build mappings for matching:
         # 1. url_to_product: Direct URL match
@@ -637,6 +681,12 @@ def main():
         help='Maximum number of products to scrape'
     )
 
+    parser.add_argument(
+        '--retry-mode',
+        action='store_true',
+        help='Only scrape pending/failed aliases (for retry runs)'
+    )
+
     args = parser.parse_args()
 
     # Validate API token
@@ -650,7 +700,8 @@ def main():
     try:
         scraper = ApifyTescoScraper(
             dry_run=args.dry_run,
-            limit=args.limit
+            limit=args.limit,
+            retry_mode=args.retry_mode
         )
         stats = scraper.run()
 
