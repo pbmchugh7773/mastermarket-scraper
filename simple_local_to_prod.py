@@ -1589,13 +1589,22 @@ class SimpleLocalScraper:
                             for i, price_info in enumerate(all_prices['analysis'][:10]):  # Limit to 10 for readability
                                 logger.info(f"  {i+1}. Type: {price_info['type']}, Value: €{price_info['value']}, Text: '{price_info['text']}'")
 
-                    # Return the regular price if found
+                    # Return the best price - prefer Clubcard if lower
                     if all_prices['regular']:
+                        final_price = all_prices['regular']
+                        price_type = "regular"
+
+                        # Check if Clubcard price is available and lower
+                        if all_prices.get('clubcard') and all_prices['clubcard'] < all_prices['regular']:
+                            final_price = all_prices['clubcard']
+                            price_type = "Clubcard"
+                            logger.info(f"🎟️ Better Clubcard price found: €{final_price} (was €{all_prices['regular']})")
+
                         if self.debug_prices:
-                            logger.info(f"✅ Tesco regular price selected for upload: €{all_prices['regular']}")
+                            logger.info(f"✅ Tesco {price_type} price selected for upload: €{final_price}")
                         else:
-                            logger.info(f"✅ Tesco regular price found via requests: €{all_prices['regular']}")
-                        return all_prices['regular']
+                            logger.info(f"✅ Tesco {price_type} price found via requests: €{final_price}")
+                        return final_price
                     else:
                         logger.warning("⚠️ No regular price found, checking fallback methods...")
 
