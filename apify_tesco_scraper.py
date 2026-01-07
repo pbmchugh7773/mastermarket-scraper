@@ -423,7 +423,7 @@ class ApifyTescoScraper:
             True if upload succeeded
         """
         if self.dry_run:
-            print(f"  [DRY RUN] Would upload: product_id={product_id}, price={price_data['price']}")
+            print(f"  [DRY RUN] Would upload: product_id={product_id}, price={price_data['price']}, original_price={price_data.get('original_price')}, promotion_type={price_data.get('promotion_type')}")
             return True
 
         payload = {
@@ -474,7 +474,7 @@ class ApifyTescoScraper:
 
     def update_scraping_status(self, alias_id: int, success: bool, price: float = None,
                               error_message: str = None, promotion_type: str = None,
-                              promotion_text: str = None) -> bool:
+                              promotion_text: str = None, original_price: float = None) -> bool:
         """Update scraping status for an alias (same as simple_local_to_prod.py)"""
         if self.dry_run:
             print(f"  [DRY RUN] Would update status: alias_id={alias_id}, success={success}")
@@ -487,7 +487,8 @@ class ApifyTescoScraper:
                 'price': price,
                 'error_message': error_message,
                 'promotion_type': promotion_type,
-                'promotion_text': promotion_text
+                'promotion_text': promotion_text,
+                'original_price': original_price
             }
 
             response = self.session.post(
@@ -641,7 +642,8 @@ class ApifyTescoScraper:
                         success=True,
                         price=price_data['price'],
                         promotion_type=price_data.get('promotion_type'),
-                        promotion_text=price_data.get('promotion_text')
+                        promotion_text=price_data.get('promotion_text'),
+                        original_price=price_data.get('original_price')
                     )
             else:
                 self.stats['prices_failed'] += 1
