@@ -307,10 +307,8 @@ class ApifyTescoScraper:
         Extract price and promotion data from Apify result.
 
         IMPORTANT: Following MasterMarket price architecture:
-        - price = promotional price (what customer pays, e.g., Clubcard price)
-        - original_price = regular price (without promotion)
-
-        This is consistent with simple_local_to_prod.py scraper logic.
+        - membership_price: price = Clubcard price, original_price = regular price
+        - multi_buy: price = regular unit price, promotion_text = deal description
 
         Args:
             item: Single product result from Apify
@@ -340,52 +338,71 @@ class ApifyTescoScraper:
 
         result = {
             'price': regular_price,  # Default to regular price
+            'original_price': regular_price,  # Same by default
             'url': item.get('url', ''),
             'title': item.get('title', ''),
             'ean': item.get('ean') or item.get('gtin') or item.get('upc'),
         }
 
-        # Check for Clubcard/promotional price
-        # Apify returns promotions in different structures:
-        # 1. Direct fields: clubcardPrice, promoPrice
-        # 2. Nested promotion object with description like "€3.00 Clubcard Price"
-        clubcard_price = None
+        # Check for promotions in the promotion object
+        promotion = item.get('promotion')
+        if promotion and isinstance(promotion, dict):
+            terms = promotion.get('terms', '')
+            description = promotion.get('description', '')
 
-        # Method 1: Direct fields (legacy)
+            # First, check if it's a MULTI_BUY promotion
+            # Patterns: "Any 3 for €5", "2 for €6", "3 for 2", etc.
+            multi_buy_match = re.search(
+                r'(?:any\s+)?(\d+)\s+for\s+[€£]?\s*(\d+(?:[.,]\d{2})?)',
+                description,
+                re.IGNORECASE
+            )
+
+            if multi_buy_match:
+                # This is a MULTI_BUY promotion
+                # Keep price as regular unit price, store the deal in promotion_text
+                result['promotion_type'] = 'multi_buy'
+                result['promotion_text'] = description  # Full description like "Any 3 for €5 Clubcard Price"
+                # Don't change price - multi_buy uses regular unit price
+                # The basket calculation will apply the deal based on quantity
+                return result
+
+            # If not multi_buy, check for simple Clubcard price
+            if 'CLUBCARD' in terms.upper() or 'clubcard' in description.lower():
+                # Extract price from description like "€9.00 Clubcard Price"
+                # Patterns: €X.XX, £X.XX, Xp (pence)
+                price_match = re.search(
+                    r'[€£]?\s*(\d+(?:[.,]\d{2})?)\s*(?:p\s+)?[Cc]lubcard',
+                    description
+                )
+                if price_match:
+                    price_str = price_match.group(1).replace(',', '.')
+                    try:
+                        clubcard_price = float(price_str)
+                        # Handle pence (e.g., "90p" = 0.90)
+                        if 'p ' in description.lower() or description.lower().endswith('p'):
+                            if clubcard_price > 10:  # Likely pence not pounds
+                                clubcard_price = clubcard_price / 100
+
+                        # Validate Clubcard price
+                        if 0.01 <= clubcard_price < regular_price:
+                            # ARCHITECTURE: price = promotional (Clubcard), original_price = regular
+                            result['price'] = clubcard_price  # What customer pays
+                            result['original_price'] = regular_price  # Price without membership
+                            result['promotion_type'] = 'membership_price'
+                            result['promotion_text'] = 'Clubcard Price'
+                            result['promotion_discount_value'] = regular_price - clubcard_price
+                    except ValueError:
+                        pass
+
+        # Legacy: Check direct fields for Clubcard price
         clubcard_price = item.get('clubcardPrice') or item.get('promoPrice')
-
-        # Method 2: Parse from promotion object (current Apify structure)
-        if not clubcard_price:
-            promotion = item.get('promotion')
-            if promotion and isinstance(promotion, dict):
-                terms = promotion.get('terms', '')
-                description = promotion.get('description', '')
-
-                # Check if it's a Clubcard promotion
-                if 'CLUBCARD' in terms.upper() or 'clubcard' in description.lower():
-                    # Extract price from description like "€3.00 Clubcard Price" or "90p Clubcard Price"
-                    # Patterns: €X.XX, £X.XX, Xp (pence)
-                    price_match = re.search(r'[€£]?\s*(\d+(?:[.,]\d{2})?)\s*(?:p\s+)?[Cc]lubcard', description)
-                    if price_match:
-                        price_str = price_match.group(1).replace(',', '.')
-                        try:
-                            extracted_price = float(price_str)
-                            # Handle pence (e.g., "90p" = 0.90)
-                            if 'p ' in description.lower() or description.lower().endswith('p'):
-                                if extracted_price > 10:  # Likely pence not pounds
-                                    extracted_price = extracted_price / 100
-                            clubcard_price = extracted_price
-                        except ValueError:
-                            pass
-
-        # Apply Clubcard price if valid
-        if clubcard_price:
+        if clubcard_price and 'promotion_type' not in result:
             try:
                 clubcard_price = float(clubcard_price)
                 if 0.01 <= clubcard_price < regular_price:
-                    # ARCHITECTURE: price = promotional (Clubcard), original_price = regular
-                    result['price'] = clubcard_price  # What customer pays
-                    result['original_price'] = regular_price  # Price without membership
+                    result['price'] = clubcard_price
+                    result['original_price'] = regular_price
                     result['promotion_type'] = 'membership_price'
                     result['promotion_text'] = 'Clubcard Price'
                     result['promotion_discount_value'] = regular_price - clubcard_price
