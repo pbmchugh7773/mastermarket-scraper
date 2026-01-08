@@ -87,6 +87,11 @@ class ApifyTescoScraper:
             'matched_by_product_id': 0
         }
 
+    # Apify's URL validation pattern for Tesco scraper
+    TESCO_URL_PATTERN = re.compile(
+        r'^https://www\.tesco\.(?:com|ie)/groceries/en-(?:GB|IE)/(?:shop|products|search)'
+    )
+
     @staticmethod
     def extract_tesco_product_id(url: str) -> Optional[str]:
         """
@@ -107,6 +112,21 @@ class ApifyTescoScraper:
         if match:
             return match.group(1)
         return None
+
+    @classmethod
+    def is_valid_tesco_url(cls, url: str) -> bool:
+        """
+        Validate if URL matches Apify's expected Tesco URL pattern.
+
+        Args:
+            url: URL to validate
+
+        Returns:
+            True if URL is valid for Apify Tesco scraper
+        """
+        if not url:
+            return False
+        return bool(cls.TESCO_URL_PATTERN.match(url))
 
     def authenticate_mastermarket(self) -> bool:
         """Authenticate with MasterMarket API."""
@@ -207,6 +227,28 @@ class ApifyTescoScraper:
             print("No URLs to scrape")
             return []
 
+        # Filter out invalid URLs before sending to Apify
+        valid_urls = []
+        invalid_urls = []
+        for url in urls:
+            if self.is_valid_tesco_url(url):
+                valid_urls.append(url)
+            else:
+                invalid_urls.append(url)
+
+        if invalid_urls:
+            print(f"  ⚠️ Filtered out {len(invalid_urls)} invalid URL(s):")
+            for url in invalid_urls[:5]:  # Show first 5
+                print(f"     - {url[:80]}...")
+            if len(invalid_urls) > 5:
+                print(f"     ... and {len(invalid_urls) - 5} more")
+            self.stats['urls_filtered'] = len(invalid_urls)
+
+        if not valid_urls:
+            print("ERROR: No valid URLs to scrape after filtering")
+            return []
+
+        urls = valid_urls
         self.stats['urls_sent_to_apify'] = len(urls)
 
         # Prepare actor input - using correct schema for radeance/tesco-scraper
@@ -672,6 +714,8 @@ class ApifyTescoScraper:
         print(f"  Prices uploaded:      {self.stats['prices_uploaded']}")
         print(f"  Prices failed:        {self.stats['prices_failed']}")
         print(f"  Prices skipped:       {self.stats['prices_skipped']}")
+        if self.stats.get('urls_filtered'):
+            print(f"  URLs filtered (invalid): {self.stats['urls_filtered']}")
         print(f"  Elapsed time:         {elapsed:.1f} seconds")
         if self.stats.get('json_saved'):
             print(f"  JSON saved to:        {self.stats['json_saved']}")
