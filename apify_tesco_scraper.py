@@ -411,12 +411,21 @@ class ApifyTescoScraper:
 
             # If not multi_buy, check for simple Clubcard price
             if 'CLUBCARD' in terms.upper() or 'clubcard' in description.lower():
-                # Extract price from description like "€9.00 Clubcard Price"
-                # Patterns: €X.XX, £X.XX, Xp (pence)
+                # Extract price from description like "€8.00 Save 1/3 Clubcard Price"
+                # IMPORTANT: Require currency symbol to avoid matching "1/3" from "Save 1/3"
+                # Patterns supported:
+                #   - "€8.00 ..." or "£8.00 ..." (currency + price)
+                #   - "90p Clubcard" (pence format)
                 price_match = re.search(
-                    r'[€£]?\s*(\d+(?:[.,]\d{2})?)\s*(?:p\s+)?[Cc]lubcard',
+                    r'[€£]\s*(\d+(?:[.,]\d{2})?)',  # Currency symbol required
                     description
                 )
+                # Fallback: Check for pence format "XXp" (no currency symbol)
+                if not price_match:
+                    pence_match = re.search(r'^(\d+)p\s', description)
+                    if pence_match:
+                        # Convert pence to euros/pounds
+                        price_match = pence_match
                 if price_match:
                     price_str = price_match.group(1).replace(',', '.')
                     try:
