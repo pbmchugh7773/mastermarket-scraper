@@ -2895,35 +2895,34 @@ class SimpleLocalScraper:
                     except Exception as e:
                         logger.warning(f"Failed to detect promotion info: {e}")
 
-                # Update scraping status and upload price
+                # Build promotion data structure for upload
+                upload_promotion_data = None
+                if promotion_type:
+                    upload_promotion_data = {
+                        'promotion_type': promotion_type,
+                        'promotion_text': promotion_text,
+                        'promotion_discount_value': promotion_discount_value,
+                        'original_price': original_price
+                    }
+                    # For clubcard prices, add the clubcard price field
+                    if promotion_type == 'membership_price' and original_price and promotion_discount_value:
+                        upload_promotion_data['clubcard_price'] = original_price - promotion_discount_value
+
+                # Upload price to community_prices (always required for price to be stored)
+                success = self.upload_price(alias, price, store_name, promotion_data=upload_promotion_data)
+
+                # In retry_mode or promotions_mode, also update alias tracking status
                 if retry_mode or (promotions_mode and promotion_type):
-                    # Use new endpoint that tracks status with promotion info
-                    # This ensures promotion data is properly saved in database
-                    success = self.update_scraping_status(
+                    # Update tracking fields on the alias (last_scraped_at, last_scrape_success)
+                    self.update_scraping_status(
                         alias_id=alias['id'],
-                        success=True,
+                        success=success,
                         price=price,
                         promotion_type=promotion_type,
                         promotion_text=promotion_text,
                         promotion_discount_value=promotion_discount_value,
                         original_price=original_price
                     )
-                else:
-                    # Normal mode: use existing upload method with promotion detection
-                    # Create promotion data structure for upload
-                    upload_promotion_data = None
-                    if promotion_type:
-                        upload_promotion_data = {
-                            'promotion_type': promotion_type,
-                            'promotion_text': promotion_text,
-                            'promotion_discount_value': promotion_discount_value,
-                            'original_price': original_price
-                        }
-                        # For clubcard prices, add the clubcard price field
-                        if promotion_type == 'membership_price' and original_price and promotion_discount_value:
-                            upload_promotion_data['clubcard_price'] = original_price - promotion_discount_value
-
-                    success = self.upload_price(alias, price, store_name, promotion_data=upload_promotion_data)
 
                 results.append({
                     'alias_id': alias['id'],
