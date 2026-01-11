@@ -1068,6 +1068,235 @@ class SimpleLocalScraper:
 
         return promotion_data
 
+    def detect_dunnes_promotion_data(self, html_content: str, current_price: float = None) -> dict:
+        """
+        Detect and extract promotion information from Dunnes Stores Ireland product pages
+
+        Dunnes Ireland promotion types:
+        - Multi-buy: "Buy 3 for €10", "Mix & Match any 3 for €10", "3 for 2"
+        - Percentage off: "25% off", "Save 25%"
+        - Fixed amount off: "Save €2", "€2 off"
+        - Was/Now: Original price crossed out with new lower price
+        - Offer validity: Date ranges like "Offer Valid: 7th Jan - 27th Jan 2026"
+
+        Args:
+            html_content: HTML content of the product page
+            current_price: The current price already extracted (for calculating discount)
+
+        Returns:
+            dict: Promotion data with keys: original_price, promotion_type, promotion_text,
+                  promotion_discount_value, offer_valid_from, offer_valid_to
+        """
+        import re
+
+        promotion_data = {
+            'original_price': None,
+            'promotion_type': None,
+            'promotion_text': None,
+            'promotion_discount_value': None,
+            'offer_valid_from': None,
+            'offer_valid_to': None
+        }
+
+        html_lower = html_content.lower()
+
+        # === 1. DETECT MULTI-BUY OFFERS (Primary for Dunnes) ===
+        # Patterns: "Buy 3 for €10", "Mix & Match any 3 for €10", "Any 3 for €10", etc.
+
+        multibuy_patterns = [
+            # Standard "Buy X for €Y" format
+            (r'buy\s*(\d+)\s*for\s*€\s*(\d+(?:[.,]\d{2})?)', 'buy_x_for'),
+            # "Any X for €Y" format (Mix & Match style)
+            (r'(?:mix\s*&?\s*match\s+)?any\s*(\d+)\s*for\s*€\s*(\d+(?:[.,]\d{2})?)', 'any_x_for'),
+            # Standard "X for €Y" without "buy"
+            (r'(\d+)\s*for\s*€\s*(\d+(?:[.,]\d{2})?)', 'x_for'),
+            # "Buy X get Y free" / "3 for 2" style (buy 3 pay for 2)
+            (r'buy\s*(\d+)\s*get\s*(\d+)\s*free', 'bogo'),
+            (r'(\d+)\s*for\s*(\d+)\s*\*', 'x_for_y'),  # "3 for 2*"
+        ]
+
+        for pattern, ptype in multibuy_patterns:
+            match = re.search(pattern, html_lower)
+            if match:
+                groups = match.groups()
+
+                if ptype == 'buy_x_for' and len(groups) >= 2:
+                    qty = groups[0]
+                    price = groups[1].replace(',', '.')
+                    # Add .00 if no decimal
+                    if '.' not in price:
+                        price += '.00'
+                    promotion_data['promotion_type'] = 'multi_buy'
+                    promotion_data['promotion_text'] = f'Buy {qty} for €{price}'
+                    logger.info(f"🏷️ Dunnes multi-buy detected: {promotion_data['promotion_text']}")
+                    break
+
+                elif ptype == 'any_x_for' and len(groups) >= 2:
+                    qty = groups[0]
+                    price = groups[1].replace(',', '.')
+                    if '.' not in price:
+                        price += '.00'
+                    promotion_data['promotion_type'] = 'multi_buy'
+                    promotion_data['promotion_text'] = f'Any {qty} for €{price}'
+                    logger.info(f"🏷️ Dunnes Mix & Match detected: {promotion_data['promotion_text']}")
+                    break
+
+                elif ptype == 'x_for' and len(groups) >= 2:
+                    qty = groups[0]
+                    price = groups[1].replace(',', '.')
+                    if '.' not in price:
+                        price += '.00'
+                    promotion_data['promotion_type'] = 'multi_buy'
+                    promotion_data['promotion_text'] = f'{qty} for €{price}'
+                    logger.info(f"🏷️ Dunnes multi-buy detected: {promotion_data['promotion_text']}")
+                    break
+
+                elif ptype == 'bogo' and len(groups) >= 2:
+                    buy_qty = groups[0]
+                    free_qty = groups[1]
+                    promotion_data['promotion_type'] = 'multi_buy'
+                    promotion_data['promotion_text'] = f'Buy {buy_qty} Get {free_qty} Free'
+                    logger.info(f"🏷️ Dunnes BOGO detected: {promotion_data['promotion_text']}")
+                    break
+
+                elif ptype == 'x_for_y' and len(groups) >= 2:
+                    qty_buy = groups[0]
+                    qty_pay = groups[1]
+                    promotion_data['promotion_type'] = 'multi_buy'
+                    promotion_data['promotion_text'] = f'Buy {qty_buy} for {qty_pay}'
+                    logger.info(f"🏷️ Dunnes Buy X for Y detected: {promotion_data['promotion_text']}")
+                    break
+
+        # === 2. DETECT OFFER VALIDITY PERIOD ===
+        # Pattern: "Offer Valid: 7th Jan - 27th Jan" or "Offer Valid: 7th Jan 2026 - 27th Jan 2026"
+
+        validity_patterns = [
+            r'offer\s+valid[:\s]*([^-\n<]+?)\s*[-–]\s*([^\n<]+)',  # "Offer Valid: 7th Jan - 27th Jan"
+            r'valid\s+(?:from\s+)?([^-\n<]+?)\s*[-–]\s*([^\n<]+)',  # "Valid from 7th Jan - 27th Jan"
+            r'promotion\s+ends?\s*[:\s]*([^\n<]+)',  # "Promotion ends 27th Jan"
+        ]
+
+        for pattern in validity_patterns:
+            match = re.search(pattern, html_lower)
+            if match:
+                try:
+                    if len(match.groups()) >= 2:
+                        from_date = match.group(1).strip()
+                        to_date = match.group(2).strip()
+                        # Clean up the dates (remove extra spaces, limit length)
+                        from_date = ' '.join(from_date.split())[:30]
+                        to_date = ' '.join(to_date.split())[:30]
+                        # Skip template placeholders (JavaScript renders real dates)
+                        if '{{' in from_date or '{{' in to_date:
+                            logger.debug(f"⏭️ Skipping template placeholder dates")
+                            continue
+                        promotion_data['offer_valid_from'] = from_date
+                        promotion_data['offer_valid_to'] = to_date
+                        logger.info(f"📅 Dunnes offer valid: {from_date} - {to_date}")
+                    elif len(match.groups()) == 1:
+                        to_date = match.group(1).strip()[:30]
+                        # Skip template placeholders
+                        if '{{' in to_date:
+                            continue
+                        promotion_data['offer_valid_to'] = to_date
+                        logger.info(f"📅 Dunnes promotion ends: {to_date}")
+                    break
+                except Exception as e:
+                    logger.warning(f"Error parsing validity dates: {e}")
+                    continue
+
+        # === 3. DETECT PERCENTAGE DISCOUNTS ===
+
+        percentage_patterns = [
+            r'(\d+)\s*%\s*off',
+            r'save\s*(\d+)\s*%',
+            r'(\d+)\s*%\s*discount',
+            r'half\s*price',
+        ]
+
+        if not promotion_data['promotion_type']:  # Don't override multi-buy
+            for pattern in percentage_patterns:
+                match = re.search(pattern, html_lower)
+                if match:
+                    if 'half price' in pattern:
+                        promotion_data['promotion_type'] = 'percentage_off'
+                        promotion_data['promotion_text'] = 'Half Price'
+                        promotion_data['promotion_discount_value'] = 50.0
+                        logger.info(f"🏷️ Dunnes half price detected")
+                        break
+                    else:
+                        try:
+                            discount_pct = float(match.group(1))
+                            if 0 < discount_pct <= 90:
+                                promotion_data['promotion_type'] = 'percentage_off'
+                                promotion_data['promotion_text'] = f'{int(discount_pct)}% Off'
+                                promotion_data['promotion_discount_value'] = discount_pct
+                                logger.info(f"🏷️ Dunnes percentage discount: {int(discount_pct)}%")
+                                break
+                        except ValueError:
+                            continue
+
+        # === 4. DETECT FIXED AMOUNT SAVINGS ===
+
+        savings_patterns = [
+            r'save\s*€\s*(\d+[.,]\d{2})',
+            r'€\s*(\d+[.,]\d{2})\s*off',
+            r'saving\s*€\s*(\d+[.,]\d{2})',
+            r'reduction[:\s]*€\s*(\d+[.,]\d{2})',
+        ]
+
+        if not promotion_data['promotion_type']:  # Don't override existing types
+            for pattern in savings_patterns:
+                match = re.search(pattern, html_lower)
+                if match:
+                    try:
+                        discount_amount = float(match.group(1).replace(',', '.'))
+                        if 0 < discount_amount < 100:
+                            promotion_data['promotion_type'] = 'fixed_amount_off'
+                            promotion_data['promotion_text'] = f'Save €{discount_amount:.2f}'
+                            promotion_data['promotion_discount_value'] = discount_amount
+                            logger.info(f"🏷️ Dunnes fixed discount: €{discount_amount:.2f}")
+                            break
+                    except ValueError:
+                        continue
+
+        # === 5. DETECT "WAS/NOW" PRICING ===
+        # Pattern: Original price before discount
+
+        if not promotion_data['promotion_type']:  # Don't override existing types
+            was_patterns = [
+                r'was\s*€\s*(\d+[.,]\d{2})',
+                r'original\s*price[:\s]*€\s*(\d+[.,]\d{2})',
+                r'<s[^>]*>\s*€?\s*(\d+[.,]\d{2})',  # Strikethrough
+                r'<del[^>]*>\s*€?\s*(\d+[.,]\d{2})',  # Deleted price
+                r'class="[^"]*was[^"]*"[^>]*>[^€]*€\s*(\d+[.,]\d{2})',
+                r'class="[^"]*original[^"]*"[^>]*>[^€]*€\s*(\d+[.,]\d{2})',
+            ]
+
+            for pattern in was_patterns:
+                match = re.search(pattern, html_lower)
+                if match:
+                    try:
+                        original_price = float(match.group(1).replace(',', '.'))
+                        if current_price and original_price > current_price:
+                            promotion_data['original_price'] = original_price
+                            promotion_data['promotion_type'] = 'temporary_discount'
+                            promotion_data['promotion_text'] = f'Was €{original_price:.2f}'
+                            promotion_data['promotion_discount_value'] = round(original_price - current_price, 2)
+                            logger.info(f"🏷️ Dunnes Was/Now: Was €{original_price:.2f}, Now €{current_price:.2f}")
+                            break
+                        elif original_price > 0 and not current_price:
+                            # We have original price but no current price to compare
+                            promotion_data['original_price'] = original_price
+                            promotion_data['promotion_type'] = 'temporary_discount'
+                            promotion_data['promotion_text'] = f'Was €{original_price:.2f}'
+                            logger.info(f"🏷️ Dunnes Was price detected: €{original_price:.2f}")
+                            break
+                    except ValueError:
+                        continue
+
+        return promotion_data
+
     def extract_price_value_from_text(self, text: str) -> Optional[float]:
         """Extract price value from text containing currency symbols"""
         import re
@@ -2012,21 +2241,33 @@ class SimpleLocalScraper:
                             price_val = float(match.replace(',', '.'))
                             # Focus on realistic grocery prices and avoid decimals like version numbers
                             if 0.50 <= price_val <= 50.00:
-                                # Double-check: make sure this price isn't a per-unit price
-                                # by checking if it appears near per-unit indicators in the HTML
+                                # Double-check: Count how many times the price appears WITH vs WITHOUT
+                                # per-unit indicators. For 1kg/1L products, price = price/unit so we
+                                # need to allow prices that appear standalone too.
                                 price_str = f"{price_val:.2f}".replace('.', '[.,]')
-                                is_per_unit = False
-                                for indicator in per_unit_indicators:
-                                    # Check if price appears within 30 chars of a per-unit indicator
-                                    per_unit_pattern = rf'€?\s*{price_str}\s*{re.escape(indicator)}|{re.escape(indicator)}\s*€?\s*{price_str}'
-                                    if re.search(per_unit_pattern, html_content, re.IGNORECASE):
-                                        logger.info(f"  Skipping per-unit price: €{price_val} (found near '{indicator}')")
-                                        is_per_unit = True
-                                        break
 
-                                if not is_per_unit:
+                                # Count total occurrences of this price with € symbol
+                                total_price_pattern = rf'€\s*{price_str}'
+                                total_matches = len(re.findall(total_price_pattern, html_content, re.IGNORECASE))
+
+                                # Count occurrences with per-unit indicators
+                                per_unit_count = 0
+                                for indicator in per_unit_indicators:
+                                    per_unit_pattern = rf'€\s*{price_str}\s*{re.escape(indicator)}'
+                                    per_unit_count += len(re.findall(per_unit_pattern, html_content, re.IGNORECASE))
+
+                                # Also count indicator before price patterns
+                                for indicator in per_unit_indicators:
+                                    per_unit_pattern = rf'{re.escape(indicator)}\s*€?\s*{price_str}'
+                                    per_unit_count += len(re.findall(per_unit_pattern, html_content, re.IGNORECASE))
+
+                                # If price appears standalone (without per-unit indicator) at least once, accept it
+                                standalone_count = total_matches - per_unit_count
+                                if standalone_count > 0 or per_unit_count == 0:
                                     found_prices.append(price_val)
-                                    logger.info(f"  Added price: €{price_val}")
+                                    logger.info(f"  Added price: €{price_val} (standalone: {standalone_count}, per-unit: {per_unit_count})")
+                                else:
+                                    logger.info(f"  Skipping per-unit only price: €{price_val} (all {per_unit_count} occurrences are per-unit)")
                         except ValueError:
                             continue
 
@@ -2081,7 +2322,13 @@ class SimpleLocalScraper:
                         else:
                             return (price, promotion_data if promotion_data.get('promotion_type') else None)
 
-                logger.warning("⚠️ No valid prices found in SuperValu requests fallback")
+                # Check if product is out of stock
+                out_of_stock_patterns = ['Out of Stock', 'out-of-stock', 'outofstock', 'unavailable', 'Temporarily Unavailable']
+                is_out_of_stock = any(pattern.lower() in html_content.lower() for pattern in out_of_stock_patterns)
+                if is_out_of_stock:
+                    logger.warning("⚠️ Product appears to be OUT OF STOCK on SuperValu")
+                else:
+                    logger.warning("⚠️ No valid prices found in SuperValu requests fallback")
                 return (None, None)
 
             else:
@@ -2098,8 +2345,14 @@ class SimpleLocalScraper:
             logger.error(f"❌ SuperValu requests fallback error: {e}")
             return (None, None)
     
-    def scrape_dunnes(self, url: str, product_name: str) -> Optional[float]:
-        """Scrape Dunnes product - Uses Selenium for both local and GitHub Actions"""
+    def scrape_dunnes(self, url: str, product_name: str) -> Tuple[Optional[float], Optional[dict]]:
+        """Scrape Dunnes product with promotion detection - Uses Selenium for both local and GitHub Actions
+
+        Returns:
+            Tuple[Optional[float], Optional[dict]]: (price, promotion_data)
+            - price: The product price or None if not found
+            - promotion_data: Dict with promotion info or None if no promotion
+        """
         try:
             logger.info(f"🛒 Scraping Dunnes: {product_name}")
 
@@ -2142,14 +2395,16 @@ class SimpleLocalScraper:
                 if "Just a moment" in self.driver.title:
                     logger.warning("⚠️ Cloudflare challenge persisting after extended wait")
                     logger.warning("❌ Dunnes blocked by Cloudflare - this product will be retried later")
-                    return None
+                    return (None, None)
 
             # Quick check if we're on the product page
             if "Dunnes Stores" in page_title:
                 logger.info("✅ Product page loaded successfully")
-            
-            # First, try to get price from page source (fastest method)
+
+            # Get page source for price and promotion detection
             page_source = self.driver.page_source
+
+            # First, try to get price from page source (fastest method)
             price_patterns = [
                 r'"price"[:\s]*"?(\d+[.,]\d{2})"?',
                 r'€\s*(\d+[.,]\d{2})',
@@ -2157,7 +2412,7 @@ class SimpleLocalScraper:
                 r'"amount"[:\s]*"?(\d+[.,]\d{2})"?',
                 r'"Price"[:\s]*"?€?(\d+[.,]\d{2})"?'
             ]
-            
+
             for pattern in price_patterns:
                 matches = re.findall(pattern, page_source)
                 for match in matches:
@@ -2165,10 +2420,12 @@ class SimpleLocalScraper:
                         price = float(match.replace(',', '.'))
                         if 0.01 <= price <= 1000:
                             logger.info(f"✅ Dunnes price found quickly via regex: €{price}")
-                            return price
+                            # Detect promotions with the extracted price
+                            promotion_data = self.detect_dunnes_promotion_data(page_source, price)
+                            return (price, promotion_data if promotion_data.get('promotion_type') else None)
                     except ValueError:
                         continue
-            
+
             # If regex didn't work, try a few key selectors (but don't waste time)
             key_selectors = [
                 '[data-testid*="price"]',
@@ -2176,7 +2433,7 @@ class SimpleLocalScraper:
                 'span.price',
                 '[class*="ProductPrice"]'
             ]
-            
+
             for selector in key_selectors:
                 try:
                     elements = self.driver.find_elements(By.CSS_SELECTOR, selector)
@@ -2187,10 +2444,12 @@ class SimpleLocalScraper:
                                 price = self.extract_price_from_text(text)
                                 if price:
                                     logger.info(f"✅ Dunnes price via selector '{selector}': €{price}")
-                                    return price
+                                    # Detect promotions with the extracted price
+                                    promotion_data = self.detect_dunnes_promotion_data(page_source, price)
+                                    return (price, promotion_data if promotion_data.get('promotion_type') else None)
                 except:
                     continue
-            
+
             # Last resort: Check for JSON-LD structured data
             try:
                 scripts = self.driver.find_elements(By.XPATH, "//script[@type='application/ld+json']")
@@ -2203,18 +2462,20 @@ class SimpleLocalScraper:
                                 price = float(offers['price'])
                                 if 0.01 <= price <= 1000:
                                     logger.info(f"✅ Dunnes price via JSON-LD: €{price}")
-                                    return price
+                                    # Detect promotions with the extracted price
+                                    promotion_data = self.detect_dunnes_promotion_data(page_source, price)
+                                    return (price, promotion_data if promotion_data.get('promotion_type') else None)
                     except:
                         continue
             except:
                 pass
-            
+
             logger.warning(f"⚠️ Could not find Dunnes price for {product_name}")
-            return None
-            
+            return (None, None)
+
         except Exception as e:
             logger.error(f"❌ Dunnes scraping error: {e}")
-            return None
+            return (None, None)
     
     def scrape_lidl(self, url: str, product_name: str) -> Optional[float]:
         """
@@ -2713,6 +2974,12 @@ class SimpleLocalScraper:
                         'confidence_level': 'high'
                     }
 
+                    # Add offer validity dates if available (Dunnes promotions)
+                    if promotion_data.get('offer_valid_from'):
+                        data['promotion_details']['offer_valid_from'] = promotion_data['offer_valid_from']
+                    if promotion_data.get('offer_valid_to'):
+                        data['promotion_details']['offer_valid_to'] = promotion_data['offer_valid_to']
+
                     logger.info(f"🎉 Promotion detected: {promotion_data['promotion_type']} - {promotion_data.get('promotion_text', 'N/A')}")
                 
                 # Use the community prices endpoint
@@ -2804,7 +3071,7 @@ class SimpleLocalScraper:
         results = []
         
         # For Dunnes, use fresh browser session per product to avoid Cloudflare fingerprinting
-        use_fresh_session = store_name.lower() == 'dunnes'
+        use_fresh_session = store_name.lower() == 'dunnes stores'
         
         for i, alias in enumerate(aliases, 1):
             logger.info(f"\n[{i}/{len(aliases)}] Processing: {alias.get('alias_name', 'Unknown')}")
@@ -2835,8 +3102,9 @@ class SimpleLocalScraper:
             elif store_name.lower() == 'supervalu':
                 # SuperValu scraper now returns (price, promotion_data) tuple
                 price, scraper_promotion_data = self.scrape_supervalu(alias['scraper_url'], alias['alias_name'])
-            elif store_name.lower() == 'dunnes':
-                price = self.scrape_dunnes(alias['scraper_url'], alias['alias_name'])
+            elif store_name.lower() == 'dunnes stores':
+                # Dunnes scraper now returns (price, promotion_data) tuple
+                price, scraper_promotion_data = self.scrape_dunnes(alias['scraper_url'], alias['alias_name'])
             elif store_name.lower() == 'lidl':
                 price = self.scrape_lidl(alias['scraper_url'], alias['alias_name'])
 
@@ -2849,7 +3117,7 @@ class SimpleLocalScraper:
                 promotion_discount_value = None
                 original_price = None
 
-                # For Aldi and SuperValu, use promotion data returned from scraper
+                # For Aldi, SuperValu, and Dunnes, use promotion data returned from scraper
                 if scraper_promotion_data:
                     promotion_type = scraper_promotion_data.get('promotion_type')
                     promotion_text = scraper_promotion_data.get('promotion_text')
@@ -2954,7 +3222,7 @@ class SimpleLocalScraper:
                 logger.warning(f"❌ Failed to extract price in {elapsed:.2f}s")
             
             # Adaptive delays based on store requirements
-            if store_name.lower() == 'dunnes':
+            if store_name.lower() == 'dunnes stores':
                 delay = random.randint(15, 25)  # 15-25 seconds for Dunnes
                 logger.info(f"⏱️ Waiting {delay}s before next Dunnes product (Cloudflare avoidance)")
                 time.sleep(delay)
@@ -2987,7 +3255,7 @@ class SimpleLocalScraper:
         if stores is None:
             # Note: Dunnes disabled in GitHub Actions due to Cloudflare blocking
             # Works locally but fails in CI/CD environment
-            stores = ['Aldi', 'Tesco', 'SuperValu', 'Dunnes', 'Lidl']
+            stores = ['Aldi', 'Tesco', 'SuperValu', 'Dunnes Stores', 'Lidl']
 
         logger.info("🚀 Starting Simple Local to Production Scraper")
         logger.info(f"Target stores: {', '.join(stores)}")
@@ -3027,7 +3295,7 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser(description='Simple Local to Production Scraper')
-    parser.add_argument('--store', type=str, help='Store name (Aldi, Tesco, SuperValu, Dunnes, Lidl)')
+    parser.add_argument('--store', type=str, help='Store name (Aldi, Tesco, SuperValu, "Dunnes Stores", Lidl)')
     parser.add_argument('--all', action='store_true', help='Scrape all stores')
     parser.add_argument('--products', type=int, default=100, help='Max products per store')
     parser.add_argument('--product-id', type=int, help='Scrape specific product ID only')
@@ -3044,7 +3312,7 @@ def main():
         if args.store:
             stores = [args.store]
         else:
-            stores = ['Aldi', 'Tesco', 'SuperValu', 'Dunnes', 'Lidl']
+            stores = ['Aldi', 'Tesco', 'SuperValu', 'Dunnes Stores', 'Lidl']
 
         # Run scraper for specific product
         scraper = SimpleLocalScraper(debug_prices=args.debug_prices)
@@ -3052,12 +3320,12 @@ def main():
     else:
         # Normal operation - determine stores
         if args.all:
-            stores = ['Aldi', 'Tesco', 'SuperValu', 'Dunnes', 'Lidl']
+            stores = ['Aldi', 'Tesco', 'SuperValu', 'Dunnes Stores', 'Lidl']
         elif args.store:
             stores = [args.store]
         else:
             # Default: test all stores with fewer products
-            stores = ['Aldi', 'Tesco', 'SuperValu', 'Dunnes', 'Lidl']
+            stores = ['Aldi', 'Tesco', 'SuperValu', 'Dunnes Stores', 'Lidl']
             args.products = 2
 
         # Run scraper normally
