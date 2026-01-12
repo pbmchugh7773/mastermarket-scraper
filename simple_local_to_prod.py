@@ -1218,7 +1218,8 @@ class SimpleLocalScraper:
             for pattern in percentage_patterns:
                 match = re.search(pattern, html_lower)
                 if match:
-                    if 'half price' in pattern:
+                    # Check for half price pattern (no capture group)
+                    if 'half' in pattern:
                         promotion_data['promotion_type'] = 'percentage_off'
                         promotion_data['promotion_text'] = 'Half Price'
                         promotion_data['promotion_discount_value'] = 50.0
@@ -1233,7 +1234,7 @@ class SimpleLocalScraper:
                                 promotion_data['promotion_discount_value'] = discount_pct
                                 logger.info(f"🏷️ Dunnes percentage discount: {int(discount_pct)}%")
                                 break
-                        except ValueError:
+                        except (ValueError, IndexError):
                             continue
 
         # === 4. DETECT FIXED AMOUNT SAVINGS ===
