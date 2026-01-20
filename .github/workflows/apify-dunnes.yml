@@ -11,7 +11,7 @@ on:
   workflow_dispatch:
     inputs:
       limit:
-        description: 'Maximum number of products to scrape (empty = all)'
+        description: 'Max products to scrape (empty = no limit)'
         required: false
         default: ''
       dry_run:
