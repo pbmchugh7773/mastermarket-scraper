@@ -1,205 +1,145 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+## Overview
 
-## Repository Overview
+**MasterMarket Price Scraper** - Automated scraping service for Irish supermarkets (Aldi, Tesco, SuperValu, Dunnes). Feeds prices to MasterMarket via REST API. Runs serverless on GitHub Actions daily at 5:00 AM UTC.
 
-This is the **MasterMarket Price Scraper** - a standalone, automated scraping service that collects prices from Irish supermarkets and feeds them to the main MasterMarket platform via REST API. It operates independently using GitHub Actions for serverless execution.
+**API**: `https://api.mastermarketapp.com`
 
-**Key Architecture Points:**
-- **Microservice Design**: Completely separate from main MasterMarket repository
-- **GitHub Actions Based**: Runs on GitHub's infrastructure (no server required)
-- **API Client**: Communicates with MasterMarket backend at `https://api.mastermarketapp.com`
-- **Daily Schedule**: Executes at 5:00 AM UTC (6:00 AM Irish time) - Updated Nov 2024
+## Quick Start
 
-## Development Commands
-
-### Local Testing
 ```bash
-# Install dependencies
 pip install -r requirements.txt
 
-# Test single store with limited products
-python simple_local_to_prod.py --store Aldi --products 3
+# Scrape single store
+./scrape.sh aldi 10                    # or: python simple_local_to_prod.py --store Aldi --products 10
 
-# Test all stores
-python simple_local_to_prod.py --store Aldi --products 67
-python simple_local_to_prod.py --store Tesco --products 67
-python simple_local_to_prod.py --store SuperValu --products 67
+# Scrape all stores
+./scrape.sh all 30                     # or: python simple_local_to_prod.py --all --products 30
 ```
 
-### GitHub Actions Testing
-```bash
-# Manual workflow trigger (from GitHub UI)
-Actions → Daily Price Scraping → Run workflow → Set max_products → Run
+## Scripts Reference
 
-# Monitor execution
-Actions tab → Click running workflow → View job progress
+| Script | Purpose | Example |
+|--------|---------|---------|
+| `simple_local_to_prod.py` | Main Selenium scraper | `python simple_local_to_prod.py --store Tesco --products 50` |
+| `scrape.sh` | Convenience wrapper | `./scrape.sh tesco 50` or `./scrape.sh t 50` |
+| `apify_tesco_scraper.py` | Cloud-based Tesco scraper | `python apify_tesco_scraper.py --limit 50` |
+| `apify_dunnes_scraper.py` | Cloud-based Dunnes scraper | `python apify_dunnes_scraper.py --limit 50` |
+| `run_until_done.sh` | Run until complete | `./run_until_done.sh SuperValu 10` |
+| `import_tesco_products.py` | Import from JSON | `python import_tesco_products.py data.json` |
+| `import_household_products.py` | Import from Excel | `python import_household_products.py --excel file.xlsx` |
+| `install_chrome.sh` | Install Chrome (WSL) | `./install_chrome.sh` |
+| `install_chromedriver.py` | Install ChromeDriver | `python install_chromedriver.py` |
+
+### Main Scraper Options
+
+```bash
+python simple_local_to_prod.py --store <store> --products <n>  # Basic
+python simple_local_to_prod.py --store Tesco --retry-mode      # Only failed/pending
+python simple_local_to_prod.py --store Aldi --debug-prices     # Verbose logging
+python simple_local_to_prod.py --product-id 4573 --store Tesco # Single product
+python simple_local_to_prod.py --all --products 67             # All stores
 ```
 
-### Debugging Commands
+### scrape.sh Shortcuts
+
+| Shortcut | Store |
+|----------|-------|
+| `aldi`, `a` | Aldi |
+| `tesco`, `t` | Tesco |
+| `supervalu`, `sv` | SuperValu |
+| `dunnes`, `d` | Dunnes Stores |
+| `all` | All stores |
+
+Options: `-r` (retry), `-d` (debug), `-p N` (products)
+
+## Store Performance
+
+| Store | Speed | Method |
+|-------|-------|--------|
+| Aldi | ~2s/product | JSON-LD + CSS selectors |
+| Tesco | ~10s/product | Hybrid Selenium/requests |
+| SuperValu | ~129s/product | JSON-LD @graph + JS handling |
+| Dunnes | ~8s/product | Regex + Cloudflare bypass |
+
+## Environment Variables
+
+| Variable | Purpose | Default |
+|----------|---------|---------|
+| `API_URL` | API endpoint | `https://api.mastermarketapp.com` |
+| `SCRAPER_USERNAME` | Auth username | `pricerIE@mastermarket.com` |
+| `SCRAPER_PASSWORD` | Auth password | - |
+| `APIFY_API_TOKEN` | Apify API (for apify scripts) | - |
+| `APIFY_DUNNES_ACTOR_ID` | Custom Dunnes actor ID | `YOUR_USERNAME/dunnes-scraper` |
+| `MASTERMARKET_API_URL` | Import scripts API | `http://localhost:8000` |
+| `MASTERMARKET_EMAIL` | Import scripts auth | - |
+| `MASTERMARKET_PASSWORD` | Import scripts auth | - |
+
+## API Endpoints
+
 ```bash
-# Check Chrome/ChromeDriver installation (local)
-google-chrome --version
-chromedriver --version
+# Auth
+POST /auth/login  (username, password) → {access_token}
 
-# View scraping logs
-cat *.log
+# Get products to scrape
+GET /api/admin/product-aliases?store={store}&limit={n}
 
-# Test API authentication
+# Submit price
+POST /api/community-prices/submit
+{product_id, price, store, location, date_recorded}
+```
+
+## Architecture
+
+```
+GitHub Actions (5 AM UTC) → Matrix (4 parallel jobs) → Selenium Chrome
+    → Scrape stores → MasterMarket API → PostgreSQL
+```
+
+**Core class**: `SimpleLocalScraper` in `simple_local_to_prod.py`
+- `authenticate()` - JWT login
+- `setup_chrome()` - Headless Chrome with anti-detection
+- `get_product_aliases()` - Fetch products from API
+- `scrape_[store]()` - Store-specific logic
+- `upload_price()` - Submit with retry
+
+## GitHub Actions
+
+**Workflows**:
+- `.github/workflows/daily-scraping.yml` - Main Selenium scraper (Aldi, SuperValu)
+- `.github/workflows/apify-tesco.yml` - Apify-based Tesco scraper
+- `.github/workflows/apify-dunnes.yml` - Apify-based Dunnes scraper
+
+**Secrets required**: `API_URL`, `SCRAPER_USERNAME`, `SCRAPER_PASSWORD`, `APIFY_API_TOKEN`, `APIFY_DUNNES_ACTOR_ID`
+
+```bash
+# Manual trigger: Actions → [Workflow Name] → Run workflow
+# Apify scrapers run on Tuesdays and Fridays at 6:00 AM UTC (retry at 8:00 AM)
+```
+
+## Adding New Store
+
+1. Add `scrape_newstore()` method to `SimpleLocalScraper`
+2. Add store to GitHub Actions matrix in `daily-scraping.yml`
+3. Create product aliases in MasterMarket database
+4. Test: `python simple_local_to_prod.py --store NewStore --products 3`
+
+## Troubleshooting
+
+| Issue | Solution |
+|-------|----------|
+| Auth failure | Check `SCRAPER_USERNAME`/`SCRAPER_PASSWORD` |
+| Chrome not found | Run `./install_chrome.sh` (local) or check Actions setup |
+| Store blocking | Normal - retry logic handles it |
+| No products | Verify aliases exist in API for store |
+
+## Debugging
+
+```bash
+google-chrome --version && chromedriver --version  # Check installation
+cat *.log                                          # View logs
 curl -X POST https://api.mastermarketapp.com/auth/login \
   -H "Content-Type: application/x-www-form-urlencoded" \
-  -d "username=YOUR_USERNAME&password=YOUR_PASSWORD"
+  -d "username=$SCRAPER_USERNAME&password=$SCRAPER_PASSWORD"
 ```
-
-## High-Level Architecture
-
-### Data Flow
-```
-GitHub Actions Scheduler (2 AM UTC)
-    ↓ Triggers workflow
-Matrix Strategy (3 parallel jobs)
-    ↓ One job per store
-Selenium Chrome (Headless)
-    ↓ Scrapes websites
-Store Websites (Aldi/Tesco/SuperValu)
-    ↓ Extracts prices
-MasterMarket API
-    ↓ JWT authentication
-Product Aliases Endpoint
-    ↓ Gets products to scrape
-Price Submission Endpoint
-    ↓ Uploads scraped prices
-PostgreSQL Database
-    ↓ Stores price history
-MasterMarket Platform
-```
-
-### Core Components
-
-**`simple_local_to_prod.py`** - Main scraper class:
-- `authenticate()`: JWT token-based API login
-- `setup_chrome()`: Configures headless Chrome with anti-detection
-- `get_product_aliases()`: Fetches products to scrape from API
-- `scrape_[store]()`: Store-specific scraping logic (Aldi, Tesco, SuperValu, Dunnes)
-- `upload_price()`: Submits prices to API with retry logic
-
-**GitHub Actions Workflow** (`daily-scraping.yml`):
-- **Matrix Strategy**: Parallel execution for 4 stores
-- **Environment Setup**: Chrome, ChromeDriver, Python dependencies
-- **Secret Management**: API credentials via GitHub Secrets
-- **Artifact Storage**: Logs retained for 7 days
-
-### Store-Specific Considerations
-
-| Store | Scraping Method | Performance | Special Requirements |
-|-------|----------------|-------------|---------------------|
-| **Aldi** | JSON-LD priority + CSS selectors | ~2 sec/product | None |
-| **Tesco** | Hybrid Selenium/requests fallback | ~10.6 sec/product | Anti-bot detection bypass |
-| **SuperValu** | JSON-LD @graph + priority CSS | ~129 sec/product | Complex JavaScript handling |
-| **Dunnes** | Regex optimization + fresh sessions | ~8 sec/product | Cloudflare bypass measures |
-
-## Critical Configuration
-
-### Required GitHub Secrets
-- `API_URL`: Production API endpoint (`https://api.mastermarketapp.com`)
-- `SCRAPER_USERNAME`: MasterMarket admin username
-- `SCRAPER_PASSWORD`: MasterMarket admin password
-
-### Chrome Configuration
-- **Headless Mode**: Required for GitHub Actions
-- **User Agent Rotation**: Anti-detection via fake-useragent
-- **Stealth Settings**: Disable automation flags
-- **Virtual Display**: Xvfb for GUI-requiring operations
-
-### Performance Metrics (Updated Nov 2024)
-- **Default**: 67 products per store (268 total daily)  
-- **Success Rate**: 100% across all stores
-- **Execution Time**: ~45 minutes total (parallel) - **83% improvement**
-- **GitHub Actions Usage**: ~65% of 2,000 minutes/month limit
-
-### Store Performance:
-- **Aldi**: ~2s per product, 100% success
-- **Tesco**: ~10.6s per product, 100% success (FIXED from 0%)
-- **SuperValu**: ~129s per product, 100% success  
-- **Dunnes**: ~8s per product, 100% success (RE-ENABLED)
-
-## API Integration Points
-
-### Authentication
-```python
-POST /auth/login
-Body: username={username}&password={password}
-Returns: { "access_token": "jwt_token" }
-```
-
-### Product Aliases
-```python
-GET /api/admin/product-aliases?store={store}&limit={limit}
-Headers: Authorization: Bearer {token}
-Returns: List of products with URLs to scrape
-```
-
-### Price Submission
-```python
-POST /api/community-prices/submit
-Headers: Authorization: Bearer {token}
-Body: {
-    "product_id": int,
-    "price": float,
-    "store": str,
-    "location": str,
-    "date_recorded": str
-}
-```
-
-## Error Handling Patterns
-
-### Retry Logic
-- **API Calls**: 3 retries with exponential backoff
-- **Page Loading**: Store-specific timeouts (Aldi: 10s, Others: 30s)
-- **Element Finding**: Multiple selector strategies
-- **Price Extraction**: Fallback patterns for different formats
-
-### Common Issues
-- **Authentication Failures**: Check GitHub Secrets configuration
-- **Chrome Not Found**: GitHub Actions auto-installs, verify locally
-- **Store Blocking**: Normal anti-bot behavior, includes retry logic
-- **No Products Found**: Verify API has product aliases for store
-
-## Monitoring & Maintenance
-
-### Success Metrics
-- **Daily Success Rate**: Target 95%+
-- **Products Scraped**: ~268 per day
-- **Execution Time**: <3 hours
-- **API Upload Rate**: ~99% successful uploads
-
-### Health Checks
-- GitHub Actions dashboard for execution history
-- Artifact logs for detailed debugging
-- MasterMarket admin panel for price updates
-- API endpoint monitoring at `/health/`
-
-## Development Workflow
-
-### Adding New Store
-1. Add scraping method to `SimpleLocalScraper` class
-2. Follow naming pattern: `scrape_[storename]()`
-3. Add store to GitHub Actions matrix
-4. Create product aliases in MasterMarket database
-5. Test locally with small product count
-6. Deploy and monitor first production run
-
-### Modifying Schedule
-Edit `.github/workflows/daily-scraping.yml`:
-```yaml
-schedule:
-  - cron: '0 2 * * *'  # Modify this line
-```
-
-### Performance Optimization
-- Reduce products per store in workflow inputs
-- Optimize selectors for faster element finding
-- Implement caching for static elements
-- Consider browser session reuse for same-store products

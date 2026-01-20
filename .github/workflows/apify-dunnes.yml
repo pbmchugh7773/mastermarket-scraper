@@ -1,0 +1,90 @@
+name: Apify Dunnes Scraper
+
+on:
+  schedule:
+    # Tuesday and Friday at 6:00 AM UTC (normal mode)
+    - cron: '0 6 * * 2'   # Tuesday
+    - cron: '0 6 * * 5'   # Friday
+    # Retry run 2 hours later (8:00 AM UTC) for failed/pending products
+    - cron: '0 8 * * 2'   # Tuesday retry
+    - cron: '0 8 * * 5'   # Friday retry
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: 'Maximum number of products to scrape (empty = all)'
+        required: false
+        default: ''
+      dry_run:
+        description: 'Run without uploading prices'
+        required: false
+        type: boolean
+        default: false
+      retry_mode:
+        description: 'Only scrape pending/failed products (retry mode)'
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  scrape-dunnes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60  # Dunnes may take longer due to Cloudflare
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install apify-client requests
+
+      - name: Run Apify Dunnes Scraper
+        env:
+          APIFY_API_TOKEN: ${{ secrets.APIFY_API_TOKEN }}
+          APIFY_DUNNES_ACTOR_ID: ${{ secrets.APIFY_DUNNES_ACTOR_ID }}
+          API_URL: ${{ secrets.API_URL }}
+          SCRAPER_USERNAME: ${{ secrets.SCRAPER_USERNAME }}
+          SCRAPER_PASSWORD: ${{ secrets.SCRAPER_PASSWORD }}
+        run: |
+          ARGS=""
+
+          # Detect if this is a retry run (8:00 AM UTC)
+          CURRENT_HOUR=$(date +%H)
+          if [ "$CURRENT_HOUR" == "08" ] || [ "${{ github.event.inputs.retry_mode }}" == "true" ]; then
+            ARGS="$ARGS --retry-mode"
+            echo "Running in RETRY MODE (pending/failed products only)"
+          else
+            echo "Running in NORMAL MODE (all products)"
+          fi
+
+          # Add limit if specified
+          if [ -n "${{ github.event.inputs.limit }}" ]; then
+            ARGS="$ARGS --limit ${{ github.event.inputs.limit }}"
+          fi
+
+          # Add dry-run if specified
+          if [ "${{ github.event.inputs.dry_run }}" == "true" ]; then
+            ARGS="$ARGS --dry-run"
+          fi
+
+          python apify_dunnes_scraper.py $ARGS 2>&1 | tee apify_dunnes_scraper.log
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: apify-dunnes-scraper-logs-${{ github.run_number }}
+          path: '*.log'
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: Notify on failure
+        if: failure()
+        run: |
+          echo "::error::Apify Dunnes Scraper failed. Check logs for details."

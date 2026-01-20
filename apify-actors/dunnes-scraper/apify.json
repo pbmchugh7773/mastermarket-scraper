@@ -1,0 +1,11 @@
+{
+    "name": "dunnes-scraper",
+    "version": "1.0.0",
+    "buildTag": "latest",
+    "env": null,
+    "defaultRunOptions": {
+        "build": "latest",
+        "timeoutSecs": 3600,
+        "memoryMbytes": 4096
+    }
+}

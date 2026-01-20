@@ -1,0 +1,53 @@
+{
+    "title": "Dunnes Stores Scraper Input",
+    "description": "Input configuration for Dunnes Stores Ireland price scraper",
+    "type": "object",
+    "schemaVersion": 1,
+    "properties": {
+        "urls": {
+            "title": "Product URLs",
+            "description": "List of Dunnes Stores product URLs to scrape",
+            "type": "array",
+            "editor": "stringList",
+            "prefill": ["https://www.dunnesstores.com/c/example-product/123456"]
+        },
+        "maxConcurrency": {
+            "title": "Max Concurrency",
+            "description": "Maximum number of pages to scrape in parallel",
+            "type": "integer",
+            "default": 5,
+            "minimum": 1,
+            "maximum": 20
+        },
+        "maxRequestRetries": {
+            "title": "Max Request Retries",
+            "description": "Maximum number of retries for failed requests",
+            "type": "integer",
+            "default": 3,
+            "minimum": 0,
+            "maximum": 10
+        },
+        "requestHandlerTimeoutSecs": {
+            "title": "Request Handler Timeout (seconds)",
+            "description": "Timeout for each page request handler",
+            "type": "integer",
+            "default": 120,
+            "minimum": 30,
+            "maximum": 300
+        },
+        "useResidentialProxies": {
+            "title": "Use Residential Proxies",
+            "description": "Use residential proxies to bypass Cloudflare (recommended)",
+            "type": "boolean",
+            "default": true
+        },
+        "proxyCountryCode": {
+            "title": "Proxy Country Code",
+            "description": "Country code for proxy selection (IE = Ireland)",
+            "type": "string",
+            "default": "IE",
+            "enum": ["IE", "GB", "US", "DE", "FR"]
+        }
+    },
+    "required": ["urls"]
+}
