@@ -19,8 +19,8 @@ on:
         required: false
         type: boolean
         default: false
-      retry_mode:
-        description: 'Only scrape pending/failed products (retry mode)'
+      all_products:
+        description: 'Scrape ALL products (not just pending)'
         required: false
         type: boolean
         default: false
@@ -54,13 +54,14 @@ jobs:
         run: |
           ARGS=""
 
-          # Detect if this is a retry run (8:00 AM UTC)
+          # Default: only pending products
+          # Use --all to scrape all products (scheduled 6 AM runs or manual with all_products=true)
           CURRENT_HOUR=$(date +%H)
-          if [ "$CURRENT_HOUR" == "08" ] || [ "${{ github.event.inputs.retry_mode }}" == "true" ]; then
-            ARGS="$ARGS --retry-mode"
-            echo "Running in RETRY MODE (pending/failed products only)"
+          if [ "$CURRENT_HOUR" == "06" ] || [ "${{ github.event.inputs.all_products }}" == "true" ]; then
+            ARGS="$ARGS --all"
+            echo "Running in ALL MODE (all products)"
           else
-            echo "Running in NORMAL MODE (all products)"
+            echo "Running in PENDING MODE (only pending/failed products)"
           fi
 
           # Add limit if specified
