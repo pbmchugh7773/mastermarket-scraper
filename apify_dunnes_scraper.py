@@ -373,11 +373,12 @@ class ApifyDunnesScraper:
         }
 
         # If the actor already extracted promotion data, use it directly
-        if item.get('promotion_type'):
-            promotion_data['promotion_type'] = item.get('promotion_type')
-            promotion_data['promotion_text'] = item.get('promotion_text')
-            promotion_data['original_price'] = item.get('original_price')
-            promotion_data['promotion_discount_value'] = item.get('promotion_discount_value')
+        # Actor returns camelCase: promotionType, promotionText, etc.
+        if item.get('promotionType') or item.get('promotion_type'):
+            promotion_data['promotion_type'] = item.get('promotionType') or item.get('promotion_type')
+            promotion_data['promotion_text'] = item.get('promotionText') or item.get('promotion_text')
+            promotion_data['original_price'] = item.get('originalPrice') or item.get('original_price')
+            promotion_data['promotion_discount_value'] = item.get('promotionDiscountValue') or item.get('promotion_discount_value')
             return promotion_data
 
         # Otherwise, try to parse from raw text fields
@@ -633,7 +634,11 @@ class ApifyDunnesScraper:
 
         # Add promotion data if available
         if 'promotion_type' in price_data:
-            payload['promotion_type'] = price_data['promotion_type']
+            # Map temporary_discount to 'other' (not in backend enum)
+            promo_type = price_data['promotion_type']
+            if promo_type == 'temporary_discount':
+                promo_type = 'other'
+            payload['promotion_type'] = promo_type
         if 'promotion_text' in price_data:
             payload['promotion_text'] = price_data['promotion_text']
         if 'original_price' in price_data:
@@ -641,7 +646,8 @@ class ApifyDunnesScraper:
         if 'promotion_discount_value' in price_data:
             payload['promotion_discount_value'] = price_data['promotion_discount_value']
 
-        print(f"    Uploading: product_id={product_id}, price={payload['price']}, store={STORE_NAME}")
+        promo_info = f", promo_type={payload.get('promotion_type')}" if payload.get('promotion_type') else ""
+        print(f"    Uploading: product_id={product_id}, price={payload['price']}{promo_info}")
 
         # Retry logic
         for attempt in range(3):
