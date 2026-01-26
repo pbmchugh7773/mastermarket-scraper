@@ -70,7 +70,7 @@ class ApifyDunnesScraper:
         r'^https://www\.dunnesstores(grocery)?\.com/.*'
     )
 
-    def __init__(self, dry_run: bool = False, limit: int = None, retry_mode: bool = True):
+    def __init__(self, dry_run: bool = False, limit: int = None, retry_mode: bool = True, use_residential_proxy: bool = False):
         """
         Initialize the scraper.
 
@@ -78,6 +78,7 @@ class ApifyDunnesScraper:
             dry_run: If True, don't upload prices to MasterMarket
             limit: Maximum number of products to scrape (None = all)
             retry_mode: If True, only scrape pending/failed aliases
+            use_residential_proxy: If True, use residential proxy (expensive but bypasses Cloudflare)
         """
         if not APIFY_TOKEN:
             raise ValueError("APIFY_API_TOKEN environment variable not set")
@@ -88,6 +89,7 @@ class ApifyDunnesScraper:
         self.dry_run = dry_run
         self.limit = limit
         self.retry_mode = retry_mode
+        self.use_residential_proxy = use_residential_proxy
 
         # Statistics
         self.stats = {
@@ -266,7 +268,7 @@ class ApifyDunnesScraper:
             "maxConcurrency": 5,  # Conservative to avoid blocking
             "maxRequestRetries": 3,
             "requestHandlerTimeoutSecs": 120,  # Allow time for Cloudflare
-            "useResidentialProxies": True,  # Key for bypassing Cloudflare
+            "useResidentialProxies": self.use_residential_proxy,  # Datacenter by default, residential if --use-residential-proxy
         }
 
         print(f"  URLs sample: {urls[:2]}..." if len(urls) > 2 else f"  URLs: {urls}")
@@ -724,6 +726,7 @@ class ApifyDunnesScraper:
         print(f"Mode: {'DRY RUN' if self.dry_run else 'PRODUCTION'}")
         if self.retry_mode:
             print(f"Retry Mode: ENABLED (only pending/failed aliases)")
+        print(f"Proxy: {'RESIDENTIAL (expensive)' if self.use_residential_proxy else 'DATACENTER (cheap)'}")
         print(f"API: {API_URL}")
         print(f"Actor: {ACTOR_ID}")
         print(f"{'='*60}\n")
@@ -916,6 +919,12 @@ def main():
         help='Scrape all aliases, not just pending ones'
     )
 
+    parser.add_argument(
+        '--use-residential-proxy',
+        action='store_true',
+        help='Use residential proxy (more expensive but bypasses Cloudflare better)'
+    )
+
     args = parser.parse_args()
 
     # Validate API token
@@ -932,7 +941,8 @@ def main():
         scraper = ApifyDunnesScraper(
             dry_run=args.dry_run,
             limit=args.limit,
-            retry_mode=retry_mode
+            retry_mode=retry_mode,
+            use_residential_proxy=args.use_residential_proxy
         )
         stats = scraper.run()
 

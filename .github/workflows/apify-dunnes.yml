@@ -24,6 +24,11 @@ on:
         required: false
         type: boolean
         default: false
+      use_residential_proxy:
+        description: 'Use residential proxy (expensive but bypasses Cloudflare better)'
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   scrape-dunnes:
@@ -72,6 +77,11 @@ jobs:
           # Add dry-run if specified
           if [ "${{ github.event.inputs.dry_run }}" == "true" ]; then
             ARGS="$ARGS --dry-run"
+          fi
+
+          # Use residential proxy if specified (more expensive but bypasses Cloudflare)
+          if [ "${{ github.event.inputs.use_residential_proxy }}" == "true" ]; then
+            ARGS="$ARGS --use-residential-proxy"
           fi
 
           python apify_dunnes_scraper.py $ARGS 2>&1 | tee apify_dunnes_scraper.log

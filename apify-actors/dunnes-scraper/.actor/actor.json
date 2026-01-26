@@ -1,0 +1,10 @@
+{
+    "actorSpecification": 1,
+    "name": "dunnes-scraper",
+    "version": "1.0.0",
+    "buildTag": "latest",
+    "environmentVariables": {},
+    "dockerfile": "../Dockerfile",
+    "input": "../INPUT_SCHEMA.json",
+    "storages": {}
+}

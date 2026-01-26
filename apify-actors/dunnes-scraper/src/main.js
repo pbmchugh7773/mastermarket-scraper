@@ -210,14 +210,21 @@ console.log(`Starting Dunnes Stores scraper with ${urls.length} URLs`);
 console.log(`Max concurrency: ${maxConcurrency}`);
 console.log(`Use residential proxies: ${useResidentialProxies}`);
 
-// Configure proxy
+// Configure proxy based on input setting
 let proxyConfiguration = null;
 if (useResidentialProxies) {
+    // Residential proxy - more expensive but bypasses Cloudflare better
     proxyConfiguration = await Actor.createProxyConfiguration({
         groups: ['RESIDENTIAL'],
         countryCode: proxyCountryCode,
     });
-    console.log(`Proxy configured for country: ${proxyCountryCode}`);
+    console.log(`Proxy configured: RESIDENTIAL for country: ${proxyCountryCode}`);
+} else {
+    // Datacenter proxy - cheaper, may get blocked by Cloudflare
+    proxyConfiguration = await Actor.createProxyConfiguration({
+        countryCode: proxyCountryCode,
+    });
+    console.log(`Proxy configured: DATACENTER (default) for country: ${proxyCountryCode}`);
 }
 
 // Create the crawler
@@ -263,15 +270,62 @@ const crawler = new PuppeteerCrawler({
                 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
             );
 
-            // Block unnecessary resources for speed
+            // Block unnecessary resources to reduce bandwidth (saves proxy costs)
             await page.setRequestInterception(true);
+
+            // Domains to block (tracking, analytics, ads)
+            const blockedDomains = [
+                'google-analytics.com',
+                'googletagmanager.com',
+                'facebook.net',
+                'facebook.com',
+                'doubleclick.net',
+                'googlesyndication.com',
+                'hotjar.com',
+                'newrelic.com',
+                'nr-data.net',
+                'segment.io',
+                'segment.com',
+                'optimizely.com',
+                'crazyegg.com',
+                'fullstory.com',
+                'mouseflow.com',
+                'clarity.ms',
+                'bing.com',
+                'twitter.com',
+                'linkedin.com',
+                'pinterest.com',
+                'tiktok.com',
+                'snapchat.com',
+            ];
+
             page.on('request', (request) => {
                 const resourceType = request.resourceType();
-                if (['image', 'stylesheet', 'font', 'media'].includes(resourceType)) {
+                const url = request.url();
+
+                // Block by resource type
+                if (['image', 'stylesheet', 'font', 'media', 'texttrack', 'eventsource', 'websocket'].includes(resourceType)) {
                     request.abort();
-                } else {
-                    request.continue();
+                    return;
                 }
+
+                // Block tracking/analytics domains
+                if (blockedDomains.some(domain => url.includes(domain))) {
+                    request.abort();
+                    return;
+                }
+
+                // Block common tracking patterns in URLs
+                if (url.includes('/analytics') ||
+                    url.includes('/tracking') ||
+                    url.includes('/pixel') ||
+                    url.includes('gtm.js') ||
+                    url.includes('gtag/js')) {
+                    request.abort();
+                    return;
+                }
+
+                request.continue();
             });
         },
     ],
@@ -281,8 +335,8 @@ const crawler = new PuppeteerCrawler({
         const url = request.url;
         log.info(`Processing: ${url}`);
 
-        // Wait for page to load
-        await page.waitForTimeout(3000);
+        // Brief wait for initial page load (reduced from 3s to save bandwidth)
+        await page.waitForTimeout(1500);
 
         // Check for Cloudflare challenge
         const title = await page.title();
