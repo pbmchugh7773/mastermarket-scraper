@@ -25,10 +25,10 @@ on:
         type: boolean
         default: false
       use_residential_proxy:
-        description: 'Use residential proxy (expensive but bypasses Cloudflare better)'
+        description: 'Use residential proxy (required for Cloudflare bypass)'
         required: false
         type: boolean
-        default: false
+        default: true
 
 jobs:
   scrape-dunnes:
@@ -79,9 +79,13 @@ jobs:
             ARGS="$ARGS --dry-run"
           fi
 
-          # Use residential proxy if specified (more expensive but bypasses Cloudflare)
-          if [ "${{ github.event.inputs.use_residential_proxy }}" == "true" ]; then
+          # Use residential proxy by default (required for Cloudflare)
+          # Only skip if explicitly set to false in manual run
+          if [ "${{ github.event.inputs.use_residential_proxy }}" != "false" ]; then
             ARGS="$ARGS --use-residential-proxy"
+            echo "Using RESIDENTIAL proxy (required for Cloudflare)"
+          else
+            echo "Using DATACENTER proxy (may be blocked by Cloudflare)"
           fi
 
           python apify_dunnes_scraper.py $ARGS 2>&1 | tee apify_dunnes_scraper.log
