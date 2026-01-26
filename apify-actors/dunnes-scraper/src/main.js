@@ -221,10 +221,11 @@ if (useResidentialProxies) {
     console.log(`Proxy configured: RESIDENTIAL for country: ${proxyCountryCode}`);
 } else {
     // Datacenter proxy - cheaper, may get blocked by Cloudflare
+    // Note: Free tier datacenter doesn't have IE proxies, so we don't specify country
     proxyConfiguration = await Actor.createProxyConfiguration({
-        countryCode: proxyCountryCode,
+        // No countryCode - use any available datacenter proxy
     });
-    console.log(`Proxy configured: DATACENTER (default) for country: ${proxyCountryCode}`);
+    console.log(`Proxy configured: DATACENTER (default, any country)`);
 }
 
 // Create the crawler
