@@ -2,12 +2,16 @@ name: Apify Tesco Scraper
 
 on:
   schedule:
-    # Martes y Viernes a las 6:00 AM UTC (normal mode)
-    - cron: '0 6 * * 2'   # Tuesday
+    # Lunes, Miércoles, Viernes y Sábado a las 6:00 AM UTC (normal mode)
+    - cron: '0 6 * * 1'   # Monday
+    - cron: '0 6 * * 3'   # Wednesday
     - cron: '0 6 * * 5'   # Friday
+    - cron: '0 6 * * 6'   # Saturday
     # Retry run 2 hours later (8:00 AM UTC) for failed/pending products
-    - cron: '0 8 * * 2'   # Tuesday retry
+    - cron: '0 8 * * 1'   # Monday retry
+    - cron: '0 8 * * 3'   # Wednesday retry
     - cron: '0 8 * * 5'   # Friday retry
+    - cron: '0 8 * * 6'   # Saturday retry
   workflow_dispatch:
     inputs:
       limit:
@@ -24,15 +28,6 @@ on:
         required: false
         type: boolean
         default: false
-      token_override:
-        description: 'Which Apify token to use (auto = based on day)'
-        required: false
-        type: choice
-        options:
-          - auto
-          - tuesday
-          - friday
-        default: 'auto'
 
 jobs:
   scrape-tesco:
@@ -53,52 +48,23 @@ jobs:
           pip install --upgrade pip
           pip install apify-client requests
 
-      - name: Select Apify Token based on day
-        id: select-token
-        run: |
-          # Get day of week (1=Monday, 2=Tuesday, ..., 5=Friday)
-          DAY_OF_WEEK=$(date +%u)
-          TOKEN_OVERRIDE="${{ github.event.inputs.token_override }}"
-
-          echo "Day of week: $DAY_OF_WEEK"
-          echo "Token override: $TOKEN_OVERRIDE"
-
-          # Determine which token to use
-          if [ "$TOKEN_OVERRIDE" == "tuesday" ]; then
-            echo "token_key=APIFY_API_TOKEN_TUESDAY" >> $GITHUB_OUTPUT
-            echo "Using Tuesday token (manual override)"
-          elif [ "$TOKEN_OVERRIDE" == "friday" ]; then
-            echo "token_key=APIFY_API_TOKEN_FRIDAY" >> $GITHUB_OUTPUT
-            echo "Using Friday token (manual override)"
-          elif [ "$DAY_OF_WEEK" == "2" ]; then
-            echo "token_key=APIFY_API_TOKEN_TUESDAY" >> $GITHUB_OUTPUT
-            echo "Using Tuesday token (scheduled)"
-          elif [ "$DAY_OF_WEEK" == "5" ]; then
-            echo "token_key=APIFY_API_TOKEN_FRIDAY" >> $GITHUB_OUTPUT
-            echo "Using Friday token (scheduled)"
-          else
-            # Default to Tuesday token for manual runs on other days
-            echo "token_key=APIFY_API_TOKEN_TUESDAY" >> $GITHUB_OUTPUT
-            echo "Using Tuesday token (default)"
-          fi
-
       - name: Run Apify Tesco Scraper
         env:
-          # Select token based on day (with fallback to single token)
-          APIFY_API_TOKEN: ${{ steps.select-token.outputs.token_key == 'APIFY_API_TOKEN_FRIDAY' && secrets.APIFY_API_TOKEN_FRIDAY || secrets.APIFY_API_TOKEN_TUESDAY || secrets.APIFY_API_TOKEN }}
+          APIFY_API_TOKEN: ${{ secrets.APIFY_API_TOKEN }}
           API_URL: ${{ secrets.API_URL }}
           SCRAPER_USERNAME: ${{ secrets.SCRAPER_USERNAME }}
           SCRAPER_PASSWORD: ${{ secrets.SCRAPER_PASSWORD }}
+          APIFY_TESCO_FALLBACK_ACTOR_ID: ${{ secrets.APIFY_TESCO_FALLBACK_ACTOR_ID }}
         run: |
           ARGS=""
 
-          # Detect if this is a retry run (8:00 AM UTC)
-          CURRENT_HOUR=$(date +%H)
-          if [ "$CURRENT_HOUR" == "08" ] || [ "${{ github.event.inputs.retry_mode }}" == "true" ]; then
-            ARGS="$ARGS --retry-mode"
-            echo "Running in RETRY MODE (pending/failed products only)"
+          # Detect if this is a retry run (scheduled at 8 AM or manual retry)
+          SCHEDULE="${{ github.event.schedule }}"
+          if [[ "$SCHEDULE" == "0 8 "* ]] || [ "${{ github.event.inputs.retry_mode }}" == "true" ]; then
+            ARGS="$ARGS --retry-mode --fallback-only"
+            echo "Running in RETRY MODE with FALLBACK actor (pending/failed products only)"
           else
-            echo "Running in NORMAL MODE (all products)"
+            echo "Running in NORMAL MODE (primary + inline fallback)"
           fi
 
           # Add limit if specified
@@ -111,7 +77,6 @@ jobs:
             ARGS="$ARGS --dry-run"
           fi
 
-          echo "Selected token: ${{ steps.select-token.outputs.token_key }}"
           python apify_tesco_scraper.py $ARGS 2>&1 | tee apify_scraper.log
 
       - name: Upload logs
