@@ -50,7 +50,7 @@ jobs:
 
       - name: Run Apify Tesco Scraper
         env:
-          APIFY_API_TOKEN: ${{ secrets.APIFY_API_TOKEN }}
+          APIFY_API_TOKEN: ${{ secrets.APIFY_TESCO_API_TOKEN }}
           API_URL: ${{ secrets.API_URL }}
           SCRAPER_USERNAME: ${{ secrets.SCRAPER_USERNAME }}
           SCRAPER_PASSWORD: ${{ secrets.SCRAPER_PASSWORD }}
