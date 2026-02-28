@@ -127,6 +127,10 @@ jobs:
           STORE_NAME: ${{ matrix.store }}
           MAX_PRODUCTS: ${{ github.event.inputs.max_products || '300' }}
           MANUAL_PROMOTIONS_MODE: ${{ github.event.inputs.promotions_mode || 'false' }}
+
+          # Country Configuration (for multi-country scraping)
+          SCRAPER_COUNTRY: 'IE'
+          SCRAPER_CURRENCY: 'EUR'
         
         run: |
           echo "🏪 Starting ${{ matrix.store }} scraping..."

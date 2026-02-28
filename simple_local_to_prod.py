@@ -65,6 +65,10 @@ API_URL = os.getenv('API_URL', 'https://api.mastermarketapp.com')
 USERNAME = os.getenv('SCRAPER_USERNAME', 'pricerIE@mastermarket.com')
 PASSWORD = os.getenv('SCRAPER_PASSWORD', 'pricerIE')
 
+# Country and currency configuration (for multi-country scraping)
+COUNTRY = os.getenv('SCRAPER_COUNTRY', 'IE')
+CURRENCY = os.getenv('SCRAPER_CURRENCY', 'EUR')
+
 class SimpleLocalScraper:
     """
     MasterMarket Price Scraper - Main scraping engine
@@ -2883,7 +2887,8 @@ class SimpleLocalScraper:
             params = {
                 'store_name': store_name,
                 'limit': limit,
-                'retry_mode': True
+                'retry_mode': True,
+                'country': COUNTRY
             }
 
             response = self.session.get(f'{API_URL}/api/scraping/pending-aliases', params=params)
@@ -2948,10 +2953,10 @@ class SimpleLocalScraper:
                 data = {
                     'product_id': alias['product_id'],
                     'store_name': store_name,
-                    'store_location': 'IE',  # Ireland location for Irish stores
+                    'store_location': COUNTRY,
                     'price': price,
-                    'currency': 'EUR',
-                    'country': 'IE'
+                    'currency': CURRENCY,
+                    'country': COUNTRY
                 }
 
                 # Add promotion data if available

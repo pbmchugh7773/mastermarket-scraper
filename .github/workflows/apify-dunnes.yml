@@ -56,6 +56,8 @@ jobs:
           API_URL: ${{ secrets.API_URL }}
           SCRAPER_USERNAME: ${{ secrets.SCRAPER_USERNAME }}
           SCRAPER_PASSWORD: ${{ secrets.SCRAPER_PASSWORD }}
+          SCRAPER_COUNTRY: 'IE'
+          SCRAPER_CURRENCY: 'EUR'
         run: |
           ARGS=""
 

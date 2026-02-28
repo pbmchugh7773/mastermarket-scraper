@@ -43,10 +43,11 @@ SCRAPER_PASSWORD = os.getenv('SCRAPER_PASSWORD', 'pricerIE')
 
 # Apify Actor configuration
 ACTOR_ID = 'radeance/tesco-scraper'
+FALLBACK_ACTOR_ID = os.getenv('APIFY_TESCO_FALLBACK_ACTOR_ID', 'pbmchugh7773/tesco-scraper')
 REGION = 'IE'  # Ireland (for Apify actor "region" parameter)
 STORE_NAME = 'Tesco'
-STORE_LOCATION = 'IE'
-CURRENCY = 'EUR'
+STORE_LOCATION = os.getenv('SCRAPER_COUNTRY', 'IE')
+CURRENCY = os.getenv('SCRAPER_CURRENCY', 'EUR')
 
 # Output directory for saving Apify JSON responses
 OUTPUT_DIR = Path(__file__).parent / 'output' / 'apify'
@@ -56,7 +57,8 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 class ApifyTescoScraper:
     """Scraper that uses Apify's Tesco actor to fetch prices."""
 
-    def __init__(self, dry_run: bool = False, limit: int = None, retry_mode: bool = False):
+    def __init__(self, dry_run: bool = False, limit: int = None, retry_mode: bool = False,
+                 fallback_only: bool = False):
         """
         Initialize the scraper.
 
@@ -64,6 +66,7 @@ class ApifyTescoScraper:
             dry_run: If True, don't upload prices to MasterMarket
             limit: Maximum number of products to scrape (None = all)
             retry_mode: If True, only scrape pending/failed aliases
+            fallback_only: If True, use only the custom fallback actor
         """
         if not APIFY_TOKEN:
             raise ValueError("APIFY_API_TOKEN environment variable not set")
@@ -74,6 +77,7 @@ class ApifyTescoScraper:
         self.dry_run = dry_run
         self.limit = limit
         self.retry_mode = retry_mode
+        self.fallback_only = fallback_only
 
         # Statistics
         self.stats = {
@@ -84,7 +88,10 @@ class ApifyTescoScraper:
             'prices_failed': 0,
             'prices_skipped': 0,
             'matched_by_url': 0,
-            'matched_by_product_id': 0
+            'matched_by_product_id': 0,
+            'fallback_urls': 0,
+            'fallback_results': 0,
+            'fallback_uploaded': 0
         }
 
     # Apify's URL validation pattern for Tesco scraper
@@ -186,7 +193,8 @@ class ApifyTescoScraper:
             params = {
                 'store_name': STORE_NAME,
                 'limit': self.limit or 500,
-                'retry_mode': True
+                'retry_mode': True,
+                'country': STORE_LOCATION
             }
 
             response = self.session.get(
@@ -343,6 +351,115 @@ class ApifyTescoScraper:
         except Exception as e:
             print(f"  WARNING: Failed to save JSON: {e}")
             return None
+
+    def run_fallback_scraper(self, urls: List[str]) -> List[Dict]:
+        """
+        Run the custom fallback Tesco scraper actor for URLs that failed with the primary actor.
+
+        Args:
+            urls: List of Tesco product URLs to scrape
+
+        Returns:
+            List of scraped product data from the custom actor
+        """
+        if not urls:
+            print("  No URLs for fallback scraper")
+            return []
+
+        self.stats['fallback_urls'] = len(urls)
+        print(f"\n  Running fallback actor '{FALLBACK_ACTOR_ID}' with {len(urls)} URLs...")
+
+        actor_input = {
+            "urls": urls,
+            "maxConcurrency": 3,
+            "useResidentialProxies": True,
+            "proxyCountryCode": "IE"
+        }
+
+        try:
+            run = self.apify_client.actor(FALLBACK_ACTOR_ID).call(
+                run_input=actor_input,
+                timeout_secs=1800
+            )
+
+            if not run:
+                print("  ERROR: Fallback actor run failed (no response)")
+                return []
+
+            status = run.get('status')
+            if status not in ('SUCCEEDED', 'FINISHED'):
+                print(f"  WARNING: Fallback actor run status: {status}")
+
+            dataset_id = run.get('defaultDatasetId')
+            if not dataset_id:
+                print("  ERROR: No dataset ID from fallback actor")
+                return []
+
+            dataset_items = self.apify_client.dataset(dataset_id).list_items().items
+            self.stats['fallback_results'] = len(dataset_items)
+
+            print(f"  Got {len(dataset_items)} results from fallback actor")
+
+            # Save fallback response
+            self.save_apify_response(dataset_items, run)
+
+            return dataset_items
+
+        except Exception as e:
+            print(f"  ERROR running fallback actor: {e}")
+            return []
+
+    def extract_price_data_custom(self, item: Dict) -> Optional[Dict]:
+        """
+        Extract price data from the custom fallback actor's output format.
+
+        The custom actor outputs: price, originalPrice, clubcardPrice,
+        promotionType, promotionText, promotionDiscountValue.
+
+        Args:
+            item: Single product result from custom actor
+
+        Returns:
+            Dict with price data or None if invalid
+        """
+        price = item.get('price')
+        if not price:
+            return None
+
+        try:
+            price = float(price)
+        except (TypeError, ValueError):
+            return None
+
+        if price < 0.01 or price > 1000:
+            return None
+
+        result = {
+            'price': price,
+            'original_price': price,
+            'url': item.get('url', ''),
+            'title': item.get('title', ''),
+        }
+
+        original_price = item.get('originalPrice')
+        if original_price:
+            try:
+                result['original_price'] = float(original_price)
+            except (TypeError, ValueError):
+                pass
+
+        promotion_type = item.get('promotionType')
+        if promotion_type:
+            result['promotion_type'] = promotion_type
+            result['promotion_text'] = item.get('promotionText')
+            discount = item.get('promotionDiscountValue')
+            if discount:
+                try:
+                    result['promotion_discount_value'] = float(discount)
+                except (TypeError, ValueError):
+                    pass
+
+        return result
 
     def extract_price_data(self, item: Dict) -> Optional[Dict]:
         """
@@ -569,6 +686,8 @@ class ApifyTescoScraper:
         print(f"\n{'='*60}")
         print(f"Apify Tesco Scraper - {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
         print(f"Mode: {'DRY RUN' if self.dry_run else 'PRODUCTION'}")
+        if self.fallback_only:
+            print(f"Fallback Only: ENABLED (using custom actor: {FALLBACK_ACTOR_ID})")
         if self.retry_mode:
             print(f"Retry Mode: ENABLED (only pending/failed aliases)")
         print(f"API: {API_URL}")
@@ -628,8 +747,21 @@ class ApifyTescoScraper:
             print(f"  Limited to {self.limit} URLs")
 
         # Step 3: Run Apify scraper
-        print(f"\n[3/4] Running Apify scraper...")
-        results = self.run_apify_scraper(urls)
+        if self.fallback_only:
+            print(f"\n[3/4] Running FALLBACK actor only ({FALLBACK_ACTOR_ID})...")
+            results = self.run_fallback_scraper(urls)
+            is_custom_actor = True
+        else:
+            print(f"\n[3/4] Running primary Apify scraper ({ACTOR_ID})...")
+            results = self.run_apify_scraper(urls)
+            is_custom_actor = False
+
+        if not results and not self.fallback_only:
+            print("WARNING: No results from primary actor")
+            # If primary returned nothing, try fallback for all URLs
+            print("  Attempting fallback actor for all URLs...")
+            results = self.run_fallback_scraper(urls)
+            is_custom_actor = True
 
         if not results:
             print("ERROR: No results from Apify")
@@ -637,6 +769,9 @@ class ApifyTescoScraper:
 
         # Step 4: Upload prices to MasterMarket
         print(f"\n[4/4] Uploading prices to MasterMarket...")
+
+        # Track which URLs got a successful price (for inline fallback)
+        successful_urls = set()
 
         for i, item in enumerate(results):
             url = item.get('url', '')
@@ -668,8 +803,12 @@ class ApifyTescoScraper:
             # Get alias_id for this URL (needed to update scraping status)
             alias_id = url_to_alias_id.get(url)
 
-            # Extract price data
-            price_data = self.extract_price_data(item)
+            # Extract price data (use custom extractor for fallback actor output)
+            if is_custom_actor:
+                price_data = self.extract_price_data_custom(item)
+            else:
+                price_data = self.extract_price_data(item)
+
             if not price_data:
                 self.stats['prices_skipped'] += 1
                 # Update status as failed (no price found)
@@ -686,6 +825,7 @@ class ApifyTescoScraper:
 
             if success:
                 self.stats['prices_uploaded'] += 1
+                successful_urls.add(url)
                 # Update scraping status as successful
                 if alias_id:
                     self.update_scraping_status(
@@ -710,6 +850,52 @@ class ApifyTescoScraper:
             if (i + 1) % 50 == 0:
                 print(f"  Progress: {i + 1}/{len(results)} processed...")
 
+        # === Inline fallback: run custom actor for URLs that failed/had no price ===
+        if not self.fallback_only and not is_custom_actor:
+            failed_urls = [u for u in urls if u not in successful_urls]
+            if failed_urls:
+                print(f"\n  [FALLBACK] {len(failed_urls)} URLs had no price from primary actor")
+                fallback_results = self.run_fallback_scraper(failed_urls)
+
+                if fallback_results:
+                    print(f"  [FALLBACK] Processing {len(fallback_results)} fallback results...")
+                    for item in fallback_results:
+                        url = item.get('url', '')
+
+                        product_id = url_to_product.get(url)
+                        if not product_id:
+                            tesco_id = self.extract_tesco_product_id(url)
+                            if tesco_id and tesco_id in tesco_id_to_product:
+                                product_id = tesco_id_to_product[tesco_id]
+                        if not product_id:
+                            for stored_url, pid in url_to_product.items():
+                                if url in stored_url or stored_url in url:
+                                    product_id = pid
+                                    break
+
+                        if not product_id:
+                            continue
+
+                        alias_id = url_to_alias_id.get(url)
+                        price_data = self.extract_price_data_custom(item)
+                        if not price_data:
+                            continue
+
+                        success = self.upload_price(product_id, price_data)
+                        if success:
+                            self.stats['fallback_uploaded'] += 1
+                            if alias_id:
+                                self.update_scraping_status(
+                                    alias_id=alias_id,
+                                    success=True,
+                                    price=price_data['price'],
+                                    promotion_type=price_data.get('promotion_type'),
+                                    promotion_text=price_data.get('promotion_text'),
+                                    original_price=price_data.get('original_price')
+                                )
+            else:
+                print(f"\n  [FALLBACK] All URLs got prices from primary actor - no fallback needed")
+
         # Print summary
         elapsed = (datetime.now() - start_time).total_seconds()
         print(f"\n{'='*60}")
@@ -725,6 +911,10 @@ class ApifyTescoScraper:
         print(f"  Prices skipped:       {self.stats['prices_skipped']}")
         if self.stats.get('urls_filtered'):
             print(f"  URLs filtered (invalid): {self.stats['urls_filtered']}")
+        if self.stats['fallback_urls']:
+            print(f"  Fallback URLs:        {self.stats['fallback_urls']}")
+            print(f"  Fallback results:     {self.stats['fallback_results']}")
+            print(f"  Fallback uploaded:    {self.stats['fallback_uploaded']}")
         print(f"  Elapsed time:         {elapsed:.1f} seconds")
         if self.stats.get('json_saved'):
             print(f"  JSON saved to:        {self.stats['json_saved']}")
@@ -759,6 +949,12 @@ def main():
         help='Only scrape pending/failed aliases (for retry runs)'
     )
 
+    parser.add_argument(
+        '--fallback-only',
+        action='store_true',
+        help='Use only the custom fallback actor (skip primary radeance/tesco-scraper)'
+    )
+
     args = parser.parse_args()
 
     # Validate API token
@@ -773,7 +969,8 @@ def main():
         scraper = ApifyTescoScraper(
             dry_run=args.dry_run,
             limit=args.limit,
-            retry_mode=args.retry_mode
+            retry_mode=args.retry_mode,
+            fallback_only=args.fallback_only
         )
         stats = scraper.run()
 

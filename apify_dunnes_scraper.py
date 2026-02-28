@@ -54,8 +54,8 @@ SCRAPER_PASSWORD = os.getenv('SCRAPER_PASSWORD', 'pricerIE')
 # TODO: Update this with your custom actor ID after creating it on Apify
 ACTOR_ID = os.getenv('APIFY_DUNNES_ACTOR_ID', 'pbmchugh7773/dunnes-scraper')
 STORE_NAME = 'Dunnes Stores'
-STORE_LOCATION = 'IE'
-CURRENCY = 'EUR'
+STORE_LOCATION = os.getenv('SCRAPER_COUNTRY', 'IE')
+CURRENCY = os.getenv('SCRAPER_CURRENCY', 'EUR')
 
 # Output directory for saving Apify JSON responses
 OUTPUT_DIR = Path(__file__).parent / 'output' / 'apify'
@@ -196,7 +196,8 @@ class ApifyDunnesScraper:
             params = {
                 'store_name': STORE_NAME,
                 'limit': self.limit or 500,
-                'retry_mode': True
+                'retry_mode': True,
+                'country': STORE_LOCATION
             }
 
             response = self.session.get(

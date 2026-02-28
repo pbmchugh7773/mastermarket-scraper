@@ -55,6 +55,8 @@ jobs:
           SCRAPER_USERNAME: ${{ secrets.SCRAPER_USERNAME }}
           SCRAPER_PASSWORD: ${{ secrets.SCRAPER_PASSWORD }}
           APIFY_TESCO_FALLBACK_ACTOR_ID: ${{ secrets.APIFY_TESCO_FALLBACK_ACTOR_ID }}
+          SCRAPER_COUNTRY: 'IE'
+          SCRAPER_CURRENCY: 'EUR'
         run: |
           ARGS=""
 
