@@ -604,7 +604,7 @@ class SimpleLocalScraper:
 
         # Detect "Was/Now" promotions
         elif ('was' in combined_text and 'now' in combined_text) or 'reduced' in combined_text:
-            promotion_data['promotion_type'] = 'temporary_discount'
+            promotion_data['promotion_type'] = 'fixed_amount_off'
             promotion_data['promotion_text'] = self.normalize_text_encoding(parent_element_text.strip())
 
             # Extract was price
@@ -675,7 +675,7 @@ class SimpleLocalScraper:
                     original_price = float(match.group(1).replace(',', '.'))
                     if original_price > 0 and (current_price is None or original_price > current_price):
                         promotion_data['original_price'] = original_price
-                        promotion_data['promotion_type'] = 'temporary_discount'
+                        promotion_data['promotion_type'] = 'fixed_amount_off'
                         promotion_data['promotion_text'] = f'Was €{original_price:.2f}'
                         if current_price and original_price > current_price:
                             promotion_data['promotion_discount_value'] = original_price - current_price
@@ -933,7 +933,7 @@ class SimpleLocalScraper:
 
                             promotion_data['original_price'] = original_price
                             if not promotion_data['promotion_type']:
-                                promotion_data['promotion_type'] = 'temporary_discount'
+                                promotion_data['promotion_type'] = 'fixed_amount_off'
                                 promotion_data['promotion_text'] = f'Was €{original_price:.2f}'
                             if current_price and original_price > current_price:
                                 promotion_data['promotion_discount_value'] = original_price - current_price
@@ -1285,7 +1285,7 @@ class SimpleLocalScraper:
                         original_price = float(match.group(1).replace(',', '.'))
                         if current_price and original_price > current_price:
                             promotion_data['original_price'] = original_price
-                            promotion_data['promotion_type'] = 'temporary_discount'
+                            promotion_data['promotion_type'] = 'fixed_amount_off'
                             promotion_data['promotion_text'] = f'Was €{original_price:.2f}'
                             promotion_data['promotion_discount_value'] = round(original_price - current_price, 2)
                             logger.info(f"🏷️ Dunnes Was/Now: Was €{original_price:.2f}, Now €{current_price:.2f}")
@@ -1293,7 +1293,7 @@ class SimpleLocalScraper:
                         elif original_price > 0 and not current_price:
                             # We have original price but no current price to compare
                             promotion_data['original_price'] = original_price
-                            promotion_data['promotion_type'] = 'temporary_discount'
+                            promotion_data['promotion_type'] = 'fixed_amount_off'
                             promotion_data['promotion_text'] = f'Was €{original_price:.2f}'
                             logger.info(f"🏷️ Dunnes Was price detected: €{original_price:.2f}")
                             break
