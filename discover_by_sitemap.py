@@ -57,6 +57,18 @@ HEADERS = {
     'Accept-Language': 'en-IE,en;q=0.9',
 }
 
+# Own-brand names by store — reject matches where product has store X own-brand
+# but alias is for store Y (these are different products, not the same item)
+OWN_BRAND_NAMES = {
+    'Tesco': ['tesco'],
+    'SuperValu': ['supervalu', 'daily basics'],
+    'Dunnes Stores': ['dunnes stores', 'dunnes', 'simply better'],
+    'Aldi': ['aldi', 'specially selected', 'nature\'s pick', 'cowbelle', 'brooklea',
+             'bramwells', 'lacura', 'harvest morn', 'snackrite', 'moser roth',
+             'cucina', 'lyttos', 'emporium', 'village bakery', 'the fishmonger'],
+    'Lidl': ['lidl', 'cien', 'milbona', 'deluxe', 'silvercrest', 'parkside'],
+}
+
 # Store configurations
 STORE_CONFIG = {
     'supervalu': {
@@ -101,6 +113,46 @@ def normalize(text: str) -> str:
     text = re.sub(r'[^a-z0-9\s]', ' ', text)
     text = re.sub(r'\s+', ' ', text).strip()
     return text
+
+
+def extract_size_ml_or_g(text: str) -> Optional[float]:
+    """Extract product size normalized to ml or g. Returns None if no size found.
+
+    Handles multipacks: "4 pack 330ml" = 1320ml, "6 x 25g" = 150g
+    Returns negative values for pack-only counts (no weight/volume).
+    """
+    text = text.lower()
+    unit_mult = {'ml': 1, 'cl': 10, 'l': 1000, 'ltr': 1000, 'litre': 1000, 'g': 1, 'kg': 1000}
+
+    # Multi-pack explicit: "4 x 330ml", "6x25g"
+    m = re.search(r'(\d+)\s*x\s*(\d+(?:\.\d+)?)\s*(ml|g|l|kg|cl|ltr)', text)
+    if m:
+        count, val, unit = int(m.group(1)), float(m.group(2)), m.group(3)
+        return count * val * unit_mult.get(unit, 1)
+
+    # Multi-pack with "pack": "4 pack 330 ml", "6 pack 25g"
+    m = re.search(r'(\d+)\s*(?:pack|pk)\s+(\d+(?:[.,]\d+)?)\s*(ml|g|l|kg|cl|ltr)', text)
+    if m:
+        count, val, unit = int(m.group(1)), float(m.group(2).replace(',', '.')), m.group(3)
+        return count * val * unit_mult.get(unit, 1)
+
+    # Single: "330ml", "1.5L", "500g", "1kg"
+    m = re.search(r'(\d+(?:[.,]\d+)?)\s*(ml|cl|l|ltr|litre|g|kg)\b', text)
+    if m:
+        val = float(m.group(1).replace(',', '.'))
+        unit = m.group(2)
+        return val * unit_mult.get(unit, 1)
+
+    # Pack count only (no weight): "6 pack", "12pk"
+    m = re.search(r'(\d+)\s*(pack|pk)\b', text)
+    if m:
+        return float(m.group(1)) * -1  # Negative = pack count
+
+    return None
+
+
+# Minimum word count for matching — reject very generic names
+MIN_PRODUCT_WORDS = 2
 
 
 def slug_to_words(slug: str) -> str:
@@ -280,6 +332,21 @@ class SitemapDiscoverer:
                     best_match = item
 
             if best_match and best_score >= self.min_score:
+                # Filter 1: Own-brand cross-match
+                if self._is_own_brand_cross_match(product['name'], product['brand']):
+                    self.stats['own_brand_rejected'] = self.stats.get('own_brand_rejected', 0) + 1
+                    continue
+
+                # Filter 2: Generic name (too few words = ambiguous match)
+                if len(product['words']) < MIN_PRODUCT_WORDS:
+                    self.stats['generic_name_rejected'] = self.stats.get('generic_name_rejected', 0) + 1
+                    continue
+
+                # Filter 3: Size mismatch — if both have size info, reject if >2x different
+                if self._is_size_mismatch(product['name'], best_match['slug']):
+                    self.stats['size_mismatch_rejected'] = self.stats.get('size_mismatch_rejected', 0) + 1
+                    continue
+
                 matches.append({
                     'product_id': product['product_id'],
                     'product_name': product['name'],
@@ -297,6 +364,45 @@ class SitemapDiscoverer:
         matches.sort(key=lambda x: x['score'], reverse=True)
         logger.info(f"Matches found: {len(matches)} (min score: {self.min_score})")
         return matches
+
+    def _is_size_mismatch(self, product_name: str, match_slug: str) -> bool:
+        """Check if product and match have significantly different sizes."""
+        product_size = extract_size_ml_or_g(product_name)
+        match_text = unquote(match_slug).replace('-', ' ')
+        match_size = extract_size_ml_or_g(match_text)
+
+        if product_size is None or match_size is None:
+            return False  # Can't compare — allow the match
+
+        # Both are pack counts (negative values)
+        if product_size < 0 and match_size < 0:
+            ratio = max(abs(product_size), abs(match_size)) / max(min(abs(product_size), abs(match_size)), 0.1)
+            return ratio > 2.0
+
+        # One is pack, other is weight — incomparable, allow
+        if (product_size < 0) != (match_size < 0):
+            return False
+
+        # Both are weight/volume — compare
+        if product_size > 0 and match_size > 0:
+            ratio = max(product_size, match_size) / max(min(product_size, match_size), 0.1)
+            return ratio > 2.0  # >2x size difference = likely different product
+
+        return False
+
+    def _is_own_brand_cross_match(self, product_name: str, product_brand: str) -> bool:
+        """Check if product belongs to a different store's own-brand."""
+        target_store = self.config['store_name']
+        name_lower = product_name.lower()
+        brand_lower = (product_brand or '').lower()
+
+        for store, brands in OWN_BRAND_NAMES.items():
+            if store == target_store:
+                continue  # Skip own store — matching Tesco product to Tesco alias is fine
+            for brand_name in brands:
+                if brand_name in name_lower or brand_name in brand_lower:
+                    return True
+        return False
 
     def create_alias(self, product_id: int, alias_name: str, url: str) -> bool:
         if self.dry_run:
@@ -380,6 +486,9 @@ class SitemapDiscoverer:
         logger.info(f"Candidates (no alias):    {self.stats['candidates']}")
         logger.info(f"Matches found:            {self.stats['matches_found']}")
         logger.info(f"Low score (skipped):      {self.stats['low_score']}")
+        logger.info(f"Own-brand rejected:       {self.stats.get('own_brand_rejected', 0)}")
+        logger.info(f"Generic name rejected:    {self.stats.get('generic_name_rejected', 0)}")
+        logger.info(f"Size mismatch rejected:   {self.stats.get('size_mismatch_rejected', 0)}")
         logger.info(f"Aliases created:          {self.stats['aliases_created']}")
         logger.info(f"Aliases failed:           {self.stats['aliases_failed']}")
         logger.info(f"Results: {output_file}")
