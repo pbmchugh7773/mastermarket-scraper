@@ -2160,6 +2160,22 @@ class SimpleLocalScraper:
                 html_content = response.text
                 logger.info(f"✅ Successfully fetched SuperValu page with requests ({len(html_content)} chars)")
 
+                # === DETECT REMOVED/DISCONTINUED PRODUCTS ===
+                # SuperValu returns HTTP 200 even for removed products, but with a generic
+                # "Storefront EN" title and price=0. Detect this to avoid false failures.
+                title_match = re.search(r'<title>(.*?)</title>', html_content)
+                page_title = title_match.group(1).strip() if title_match else ''
+                meta_price_match = re.search(r'itemprop="price"\s+content="([^"]*)"', html_content)
+                meta_price_raw = meta_price_match.group(1) if meta_price_match else ''
+
+                # Generic title without product name = product removed from catalog
+                if page_title == 'Storefront EN' or (meta_price_raw in ('0', '€0.00', '') and page_title == 'Storefront EN'):
+                    logger.warning(f"🚫 SuperValu product REMOVED/DISCONTINUED: {product_name}")
+                    logger.warning(f"   Page title: '{page_title}', meta price: '{meta_price_raw}'")
+                    logger.warning(f"   URL: {url}")
+                    logger.info("   → Returning None to mark alias for deactivation")
+                    return (None, {'product_removed': True, 'reason': 'Product no longer available on SuperValu online store'})
+
                 price = None
                 promotion_data = None
 
@@ -3116,6 +3132,28 @@ class SimpleLocalScraper:
 
             elapsed = time.time() - start_time
 
+            # Check if product was removed/discontinued from store
+            if not price and scraper_promotion_data and scraper_promotion_data.get('product_removed'):
+                reason = scraper_promotion_data.get('reason', 'Product removed from store')
+                logger.warning(f"🚫 PRODUCT REMOVED: {alias.get('alias_name', '?')} — {reason}")
+
+                # Always update alias status so admin dashboard shows the correct error
+                self.update_scraping_status(
+                    alias_id=alias['id'],
+                    success=False,
+                    error_message=f"Product removed: {reason}"
+                )
+
+                results.append({
+                    'alias_id': alias['id'],
+                    'name': alias['alias_name'],
+                    'price': None,
+                    'uploaded': False,
+                    'time': elapsed,
+                    'product_removed': True
+                })
+                continue
+
             if price:
                 # Initialize promotion variables
                 promotion_type = None
@@ -3247,12 +3285,18 @@ class SimpleLocalScraper:
         # Summary
         successful = sum(1 for r in results if r['price'] is not None)
         uploaded = sum(1 for r in results if r['uploaded'])
-        
+        removed = sum(1 for r in results if r.get('product_removed'))
+        failed = len(results) - successful - removed
+
         logger.info(f"\n{'='*50}")
         logger.info(f"📊 {store_name} Summary:")
         logger.info(f"   Processed: {len(results)}")
         logger.info(f"   Successful: {successful}")
         logger.info(f"   Uploaded: {uploaded}")
+        if removed > 0:
+            logger.info(f"   🚫 Products removed from store: {removed}")
+        if failed > 0:
+            logger.info(f"   ❌ Failed to extract: {failed}")
         logger.info(f"   Success Rate: {(successful/len(results)*100):.1f}%")
         logger.info(f"{'='*50}")
     
