@@ -3314,8 +3314,7 @@ class SimpleLocalScraper:
                 logger.info(f"⏱️ Waiting {delay:.1f}s before next {store_name} product (Akamai rate limiting)")
                 time.sleep(delay)
             elif store_name.lower() == 'supervalu':
-                delay = random.randint(3, 6)  # 3-6 seconds for heavy JS sites
-                logger.info(f"⏱️ Waiting {delay}s before next {store_name} product")
+                delay = random.uniform(0.5, 1.5)  # 0.5-1.5s — requests method, no anti-bot
                 time.sleep(delay)
             else:
                 time.sleep(1)  # Minimal delay for Aldi (fast scraping)
