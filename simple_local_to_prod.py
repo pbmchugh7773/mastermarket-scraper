@@ -2163,6 +2163,7 @@ class SimpleLocalScraper:
                 # === DETECT REMOVED/DISCONTINUED PRODUCTS ===
                 # SuperValu returns HTTP 200 even for removed products, but with a generic
                 # "Storefront EN" title and price=0. Detect this to avoid false failures.
+                import re
                 title_match = re.search(r'<title>(.*?)</title>', html_content)
                 page_title = title_match.group(1).strip() if title_match else ''
                 meta_price_match = re.search(r'itemprop="price"\s+content="([^"]*)"', html_content)
