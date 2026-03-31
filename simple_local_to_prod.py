@@ -2872,54 +2872,91 @@ class SimpleLocalScraper:
         return None
     
     def get_product_aliases(self, store_name: str = None, limit: int = 5, product_id: int = None) -> List[Dict]:
-        """Get product aliases from production API"""
+        """Get product aliases from production API (paginates if limit > 1000)"""
         try:
-            params = {'limit': limit}
-            if store_name:
-                params['store_name'] = store_name
             if product_id:
-                params['product_id'] = product_id
-                # When targeting specific product, set limit to ensure we get it
-                params['limit'] = 1000
-
-            response = self.session.get(f'{API_URL}/api/product-aliases/', params=params)
-            
-            if response.status_code == 200:
-                data = response.json()
-                aliases = data.get('aliases', [])  # Extract aliases from response
-                logger.info(f"✅ Retrieved {len(aliases)} aliases for {store_name}")
-                return aliases
-            else:
-                logger.error(f"❌ Failed to get aliases: {response.status_code}")
-                logger.error(f"Response: {response.text}")
+                params = {'limit': 1000, 'store_name': store_name, 'product_id': product_id}
+                response = self.session.get(f'{API_URL}/api/product-aliases/', params=params)
+                if response.status_code == 200:
+                    aliases = response.json().get('aliases', [])
+                    logger.info(f"✅ Retrieved {len(aliases)} aliases for product {product_id}")
+                    return aliases
                 return []
-                
+
+            # Paginate in chunks of 1000 (backend max)
+            all_aliases = []
+            page_size = min(limit, 1000)
+            offset = 0
+
+            while len(all_aliases) < limit:
+                params = {'limit': page_size, 'offset': offset}
+                if store_name:
+                    params['store_name'] = store_name
+
+                response = self.session.get(f'{API_URL}/api/product-aliases/', params=params)
+
+                if response.status_code != 200:
+                    logger.error(f"❌ Failed to get aliases: {response.status_code}")
+                    logger.error(f"Response: {response.text}")
+                    break
+
+                aliases = response.json().get('aliases', [])
+                if not aliases:
+                    break
+
+                all_aliases.extend(aliases)
+                offset += len(aliases)
+
+                if len(aliases) < page_size:
+                    break  # Last page
+
+            all_aliases = all_aliases[:limit]
+            logger.info(f"✅ Retrieved {len(all_aliases)} aliases for {store_name}")
+            return all_aliases
+
         except Exception as e:
             logger.error(f"❌ Error getting aliases: {e}")
             return []
 
     def get_pending_aliases(self, store_name: str, limit: int = 100) -> List[Dict]:
-        """Get pending aliases that need scraping (retry mode)"""
+        """Get pending aliases that need scraping (retry mode, paginates if limit > 1000)"""
         try:
-            params = {
-                'store_name': store_name,
-                'limit': limit,
-                'retry_mode': True,
-                'country': COUNTRY
-            }
+            all_aliases = []
+            page_size = min(limit, 1000)
+            offset = 0
 
-            response = self.session.get(f'{API_URL}/api/scraping/pending-aliases', params=params)
+            while len(all_aliases) < limit:
+                params = {
+                    'store_name': store_name,
+                    'limit': page_size,
+                    'offset': offset,
+                    'retry_mode': True,
+                    'country': COUNTRY
+                }
 
-            if response.status_code == 200:
+                response = self.session.get(f'{API_URL}/api/scraping/pending-aliases', params=params)
+
+                if response.status_code != 200:
+                    logger.error(f"❌ Failed to get pending aliases: {response.status_code}")
+                    logger.error(f"Response: {response.text}")
+                    break
+
                 data = response.json()
                 aliases = data.get('aliases', [])
                 total_pending = data.get('total_pending', 0)
-                logger.info(f"🔄 Retrieved {len(aliases)} pending aliases for {store_name} (total pending: {total_pending})")
-                return aliases
-            else:
-                logger.error(f"❌ Failed to get pending aliases: {response.status_code}")
-                logger.error(f"Response: {response.text}")
-                return []
+
+                if not aliases:
+                    break
+
+                all_aliases.extend(aliases)
+                offset += len(aliases)
+
+                if len(aliases) < page_size:
+                    break  # Last page
+
+            all_aliases = all_aliases[:limit]
+            logger.info(f"🔄 Retrieved {len(all_aliases)} pending aliases for {store_name}")
+            return all_aliases
 
         except Exception as e:
             logger.error(f"❌ Error getting pending aliases: {e}")
