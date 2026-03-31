@@ -1,23 +1,22 @@
-name: Daily Price Scraping
+name: Price Scraping (Mon/Wed/Fri)
 
 on:
-  # First run: 5:00 AM UTC (6:00 AM Irish time) - Full scraping
-  # Second run: 6:00 AM UTC (7:00 AM Irish time) - Early retry (1 hour after first)
-  # Third run: 14:00 UTC (3:00 PM Irish time) - Final retry failed products
-  # Fourth run: 8:00 AM UTC on Sundays (9:00 AM Irish time) - Weekly promotions scan
+  # All stores (Aldi, SuperValu, Lidl) run Mon/Wed/Fri
+  # 3 runs per day: 4AM, 6AM, 8AM UTC — 700 products each
+  # Promotions scan: Sundays 8AM UTC
   schedule:
-    - cron: '0 5 * * *'   # Daily run (normal mode)
-    - cron: '0 6 * * *'   # Early retry run (retry mode) - 1 hour after first
-    - cron: '0 14 * * *'  # Final retry run (retry mode)
-    - cron: '0 8 * * 0'   # Weekly promotions run (promotions mode) - Sundays
-  
+    - cron: '0 4 * * 1,3,5'  # Batch 1 (Mon/Wed/Fri 4AM UTC = 5AM Irish)
+    - cron: '0 6 * * 1,3,5'  # Batch 2 — retry mode (Mon/Wed/Fri 6AM UTC)
+    - cron: '0 8 * * 1,3,5'  # Batch 3 — retry mode (Mon/Wed/Fri 8AM UTC)
+    - cron: '0 8 * * 0'      # Weekly promotions scan (Sundays)
+
   # Allow manual triggering for testing
   workflow_dispatch:
     inputs:
       max_products:
         description: 'Max products per store'
         required: false
-        default: '2100'
+        default: '700'
         type: string
       promotions_mode:
         description: 'Enable promotions mode (captures promotional data)'
@@ -125,7 +124,7 @@ jobs:
           
           # Store Configuration
           STORE_NAME: ${{ matrix.store }}
-          MAX_PRODUCTS: ${{ github.event.inputs.max_products || '2100' }}
+          MAX_PRODUCTS: ${{ github.event.inputs.max_products || '700' }}
           MANUAL_PROMOTIONS_MODE: ${{ github.event.inputs.promotions_mode || 'false' }}
 
           # Country Configuration (for multi-country scraping)
@@ -149,17 +148,21 @@ jobs:
             echo "🎯 PROMOTIONS MODE: Weekly comprehensive promotions scan (Sundays 8:00 UTC)"
             EXTRA_FLAGS="--promotions-mode"
             RUN_TYPE="promotions"
+          elif [ "$CURRENT_HOUR" -eq "4" ]; then
+            echo "📦 BATCH 1: First run of the day (4AM UTC)"
+            EXTRA_FLAGS=""
+            RUN_TYPE="batch-1"
           elif [ "$CURRENT_HOUR" -eq "6" ]; then
-            echo "🔄 EARLY RETRY MODE: Quick retry of failed products (1 hour after first run)"
+            echo "🔄 BATCH 2: Retry failed products from batch 1 (6AM UTC)"
             EXTRA_FLAGS="--retry-mode"
-            RUN_TYPE="early-retry"
-          elif [ "$CURRENT_HOUR" -ge "14" ]; then
-            echo "🔄 FINAL RETRY MODE: Last attempt for remaining failed products"
+            RUN_TYPE="batch-2"
+          elif [ "$CURRENT_HOUR" -eq "8" ]; then
+            echo "🔄 BATCH 3: Final retry of remaining products (8AM UTC)"
             EXTRA_FLAGS="--retry-mode"
-            RUN_TYPE="final-retry"
+            RUN_TYPE="batch-3"
           else
-            echo "📦 NORMAL MODE: Processing all products (first run of the day)"
-            EXTRA_FLAGS="--retry-mode"
+            echo "📦 NORMAL MODE: Processing all products"
+            EXTRA_FLAGS=""
             RUN_TYPE="normal"
           fi
 
@@ -235,12 +238,12 @@ jobs:
             echo "• Combined daily success rate target: 98%+"
           else
             echo "📈 Expected Results (NORMAL MODE):"
-            echo "• Aldi: ~300 products in ~2 minutes"
-            echo "• SuperValu: ~2000 products in ~35 minutes"
-            echo "• Lidl: ~300 products in ~1 minute"
-            echo "• Total: ~2600 products updated"
+            echo "• Aldi: ~700 products per run"
+            echo "• SuperValu: ~700 products per run"
+            echo "• Lidl: ~700 products per run"
+            echo "• Schedule: Mon/Wed/Fri — 3 batches at 4AM, 6AM, 8AM UTC"
             echo "• NOTE: Dunnes/Tesco disabled (anti-bot blocks GitHub IPs)"
-            echo "• Failed products will be retried at 6:00 and 14:00 UTC"
+            echo "• Failed products retried in batch 2 (6AM) and batch 3 (8AM)"
           fi
           echo ""
           echo "🔗 Check results at: https://www.mastermarketapp.com/products"
