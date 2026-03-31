@@ -17,7 +17,7 @@ on:
       max_products:
         description: 'Max products per store'
         required: false
-        default: '300'
+        default: '2100'
         type: string
       promotions_mode:
         description: 'Enable promotions mode (captures promotional data)'
@@ -125,7 +125,7 @@ jobs:
           
           # Store Configuration
           STORE_NAME: ${{ matrix.store }}
-          MAX_PRODUCTS: ${{ github.event.inputs.max_products || '300' }}
+          MAX_PRODUCTS: ${{ github.event.inputs.max_products || '2100' }}
           MANUAL_PROMOTIONS_MODE: ${{ github.event.inputs.promotions_mode || 'false' }}
 
           # Country Configuration (for multi-country scraping)
@@ -236,9 +236,9 @@ jobs:
           else
             echo "📈 Expected Results (NORMAL MODE):"
             echo "• Aldi: ~300 products in ~2 minutes"
-            echo "• SuperValu: ~300 products in ~1 minute"
+            echo "• SuperValu: ~2000 products in ~35 minutes"
             echo "• Lidl: ~300 products in ~1 minute"
-            echo "• Total: ~900 products updated"
+            echo "• Total: ~2600 products updated"
             echo "• NOTE: Dunnes/Tesco disabled (anti-bot blocks GitHub IPs)"
             echo "• Failed products will be retried at 6:00 and 14:00 UTC"
           fi
