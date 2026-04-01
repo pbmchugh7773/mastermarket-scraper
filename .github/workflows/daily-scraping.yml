@@ -140,24 +140,25 @@ jobs:
           CURRENT_HOUR=$(date -u +%H)
           CURRENT_DAY=$(date -u +%u)  # 1=Monday, 7=Sunday
 
+          # GitHub Actions cron can delay 1-2 hours, so use ranges not exact hours
           if [ "$MANUAL_PROMOTIONS_MODE" = "true" ]; then
             echo "🎯 PROMOTIONS MODE: Manual promotions scan triggered"
             EXTRA_FLAGS="--promotions-mode"
             RUN_TYPE="promotions"
-          elif [ "$CURRENT_DAY" -eq "7" ] && [ "$CURRENT_HOUR" -eq "8" ]; then
-            echo "🎯 PROMOTIONS MODE: Weekly comprehensive promotions scan (Sundays 8:00 UTC)"
+          elif [ "$CURRENT_DAY" -eq "7" ] && [ "$CURRENT_HOUR" -ge "8" ] && [ "$CURRENT_HOUR" -le "10" ]; then
+            echo "🎯 PROMOTIONS MODE: Weekly comprehensive promotions scan (Sundays)"
             EXTRA_FLAGS="--promotions-mode"
             RUN_TYPE="promotions"
-          elif [ "$CURRENT_HOUR" -eq "4" ]; then
-            echo "📦 BATCH 1: First run of the day (4AM UTC)"
+          elif [ "$CURRENT_HOUR" -ge "4" ] && [ "$CURRENT_HOUR" -lt "6" ]; then
+            echo "📦 BATCH 1: First run of the day (scheduled 4AM UTC)"
             EXTRA_FLAGS=""
             RUN_TYPE="batch-1"
-          elif [ "$CURRENT_HOUR" -eq "6" ]; then
-            echo "🔄 BATCH 2: Retry failed products from batch 1 (6AM UTC)"
+          elif [ "$CURRENT_HOUR" -ge "6" ] && [ "$CURRENT_HOUR" -lt "8" ]; then
+            echo "🔄 BATCH 2: Retry failed products (scheduled 6AM UTC)"
             EXTRA_FLAGS="--retry-mode"
             RUN_TYPE="batch-2"
-          elif [ "$CURRENT_HOUR" -eq "8" ]; then
-            echo "🔄 BATCH 3: Final retry of remaining products (8AM UTC)"
+          elif [ "$CURRENT_HOUR" -ge "8" ] && [ "$CURRENT_HOUR" -lt "11" ]; then
+            echo "🔄 BATCH 3: Final retry (scheduled 8AM UTC)"
             EXTRA_FLAGS="--retry-mode"
             RUN_TYPE="batch-3"
           else
