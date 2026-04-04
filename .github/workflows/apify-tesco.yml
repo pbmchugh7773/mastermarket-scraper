@@ -2,16 +2,14 @@ name: Apify Tesco Scraper
 
 on:
   schedule:
-    # Lunes, Miércoles, Viernes y Sábado a las 6:00 AM UTC (normal mode)
+    # Lunes, Miércoles, Viernes a las 6:00 AM UTC (normal mode — all aliases)
     - cron: '0 6 * * 1'   # Monday
     - cron: '0 6 * * 3'   # Wednesday
     - cron: '0 6 * * 5'   # Friday
-    - cron: '0 6 * * 6'   # Saturday
     # Retry run 2 hours later (8:00 AM UTC) for failed/pending products
     - cron: '0 8 * * 1'   # Monday retry
     - cron: '0 8 * * 3'   # Wednesday retry
     - cron: '0 8 * * 5'   # Friday retry
-    - cron: '0 8 * * 6'   # Saturday retry
   workflow_dispatch:
     inputs:
       limit:

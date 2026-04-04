@@ -43,7 +43,7 @@ SCRAPER_PASSWORD = os.getenv('SCRAPER_PASSWORD', 'pricerIE')
 
 # Apify Actor configuration
 ACTOR_ID = 'radeance/tesco-scraper'
-FALLBACK_ACTOR_ID = os.getenv('APIFY_TESCO_FALLBACK_ACTOR_ID', 'pbmchugh7773/tesco-scraper')
+FALLBACK_ACTOR_ID = os.getenv('APIFY_TESCO_FALLBACK_ACTOR_ID') or 'pbmchugh7773/tesco-scraper'
 REGION = 'IE'  # Ireland (for Apify actor "region" parameter)
 STORE_NAME = 'Tesco'
 STORE_LOCATION = os.getenv('SCRAPER_COUNTRY', 'IE')
@@ -161,65 +161,102 @@ class ApifyTescoScraper:
             return False
 
     def get_tesco_aliases(self) -> List[Dict]:
-        """Get all Tesco product aliases with scraper URLs."""
+        """Get all Tesco product aliases with scraper URLs, paginating automatically."""
+        all_aliases = []
+        page_size = 1000
+        skip = 0
+
         try:
-            params = {"store_name": STORE_NAME, "limit": self.limit or 500}
-            response = self.session.get(
-                f"{API_URL}/api/product-aliases/",
-                params=params,
-                timeout=30
-            )
-            response.raise_for_status()
-            data = response.json()
+            while True:
+                params = {"store_name": STORE_NAME, "limit": page_size, "skip": skip}
+                response = self.session.get(
+                    f"{API_URL}/api/product-aliases/",
+                    params=params,
+                    timeout=30
+                )
+                response.raise_for_status()
+                data = response.json()
 
-            # Handle different response formats
-            if isinstance(data, list):
-                aliases = data
-            elif isinstance(data, dict):
-                aliases = data.get('aliases', [])
-            else:
-                aliases = []
+                # Handle different response formats
+                if isinstance(data, list):
+                    aliases = data
+                elif isinstance(data, dict):
+                    aliases = data.get('aliases', [])
+                else:
+                    aliases = []
 
-            self.stats['total_aliases'] = len(aliases)
-            return aliases
+                all_aliases.extend(aliases)
+
+                # If we got fewer than page_size, we've reached the end
+                if len(aliases) < page_size:
+                    break
+
+                skip += page_size
+                print(f"  Fetched {len(all_aliases)} aliases so far (paginating)...")
+
+            # Apply user limit if specified
+            if self.limit and len(all_aliases) > self.limit:
+                all_aliases = all_aliases[:self.limit]
+                print(f"  Limited to {self.limit} aliases")
+
+            self.stats['total_aliases'] = len(all_aliases)
+            print(f"  Total aliases fetched: {len(all_aliases)}")
+            return all_aliases
 
         except requests.RequestException as e:
             print(f"Failed to fetch aliases: {e}")
-            return []
+            return all_aliases if all_aliases else []
 
     def get_pending_aliases(self) -> List[Dict]:
-        """Get pending aliases that need scraping (retry mode, same as simple_local_to_prod.py)."""
+        """Get pending aliases that need scraping (retry mode), paginating automatically."""
+        all_aliases = []
+        page_size = 1000
+        skip = 0
+
         try:
-            params = {
-                'store_name': STORE_NAME,
-                'limit': self.limit or 500,
-                'retry_mode': True,
-                'country': STORE_LOCATION
-            }
+            while True:
+                params = {
+                    'store_name': STORE_NAME,
+                    'limit': page_size,
+                    'skip': skip,
+                    'retry_mode': True,
+                    'country': STORE_LOCATION
+                }
 
-            response = self.session.get(
-                f'{API_URL}/api/scraping/pending-aliases',
-                params=params,
-                timeout=30
-            )
-            response.raise_for_status()
-            data = response.json()
+                response = self.session.get(
+                    f'{API_URL}/api/scraping/pending-aliases',
+                    params=params,
+                    timeout=30
+                )
+                response.raise_for_status()
+                data = response.json()
 
-            # Handle different response formats
-            if isinstance(data, list):
-                aliases = data
-            elif isinstance(data, dict):
-                aliases = data.get('aliases', [])
-            else:
-                aliases = []
+                # Handle different response formats
+                if isinstance(data, list):
+                    aliases = data
+                elif isinstance(data, dict):
+                    aliases = data.get('aliases', [])
+                else:
+                    aliases = []
 
-            self.stats['total_aliases'] = len(aliases)
-            print(f"  Found {len(aliases)} pending aliases to retry")
-            return aliases
+                all_aliases.extend(aliases)
+
+                if len(aliases) < page_size:
+                    break
+
+                skip += page_size
+
+            # Apply user limit if specified
+            if self.limit and len(all_aliases) > self.limit:
+                all_aliases = all_aliases[:self.limit]
+
+            self.stats['total_aliases'] = len(all_aliases)
+            print(f"  Found {len(all_aliases)} pending aliases to retry")
+            return all_aliases
 
         except requests.RequestException as e:
             print(f"Failed to fetch pending aliases: {e}")
-            return []
+            return all_aliases if all_aliases else []
 
     def run_apify_scraper(self, urls: List[str]) -> List[Dict]:
         """
