@@ -589,6 +589,13 @@ class ApifyDunnesScraper:
         if price < 0.01 or price > 1000:
             return None
 
+        # Reject €1.00 exactly — known Apify bug where Dunnes returns €1
+        # for products it can't parse properly. Real grocery items at exactly
+        # €1.00 are extremely rare and not worth the false positive risk.
+        if price == 1.00:
+            print(f"    REJECTED: price=€1.00 (known Apify bug) for {item.get('title', item.get('name', 'unknown'))}")
+            return None
+
         result = {
             'price': price,
             'original_price': price,  # Default to same as price
