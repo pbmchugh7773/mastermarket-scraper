@@ -2,14 +2,10 @@ name: Apify Tesco Scraper
 
 on:
   schedule:
-    # Lunes, Miércoles, Viernes a las 6:00 AM UTC (normal mode — all aliases)
-    - cron: '0 6 * * 1'   # Monday
-    - cron: '0 6 * * 3'   # Wednesday
-    - cron: '0 6 * * 5'   # Friday
-    # Retry run 2 hours later (8:00 AM UTC) for failed/pending products
-    - cron: '0 8 * * 1'   # Monday retry
-    - cron: '0 8 * * 3'   # Wednesday retry
-    - cron: '0 8 * * 5'   # Friday retry
+    # Monday only — 3 runs to cover all ~1,713 aliases (500 per run)
+    - cron: '0 6 * * 1'    # Monday 6AM — batch 0 (aliases 1-500)
+    - cron: '0 8 * * 1'    # Monday 8AM — batch 1 (aliases 501-1000)
+    - cron: '0 10 * * 1'   # Monday 10AM — batch 2 (aliases 1001-1713)
   workflow_dispatch:
     inputs:
       limit:
@@ -58,13 +54,14 @@ jobs:
         run: |
           ARGS=""
 
-          # Detect if this is a retry run (scheduled at 8 AM or manual retry)
-          SCHEDULE="${{ github.event.schedule }}"
-          if [[ "$SCHEDULE" == "0 8 "* ]] || [ "${{ github.event.inputs.retry_mode }}" == "true" ]; then
+          # All 3 Monday runs use NORMAL MODE with hour-based batch rotation
+          # 6AM → batch 0 (aliases 1-500), 8AM → batch 1 (501-1000), 10AM → batch 2 (1001+)
+          # Manual dispatch and retry mode still supported via inputs
+          if [ "${{ github.event.inputs.retry_mode }}" == "true" ]; then
             ARGS="$ARGS --retry-mode --retry-failed-only --fallback-only"
-            echo "Running in RETRY MODE — only products that FAILED today (not unrotated ones)"
+            echo "Running in RETRY MODE (manual trigger)"
           else
-            echo "Running in NORMAL MODE (primary + inline fallback)"
+            echo "Running in NORMAL MODE — batch selected by current hour (UTC)"
           fi
 
           # Add limit if specified

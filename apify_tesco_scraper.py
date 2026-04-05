@@ -316,23 +316,22 @@ class ApifyTescoScraper:
         self.stats['urls_sent_to_apify'] = len(urls)
 
         # Apify Starter plan limits ~500 results per actor run.
-        # Instead of sending all URLs at once, rotate which 500 we send
-        # based on the day of the week. Over Mon/Wed/Fri all aliases get covered.
+        # We run 3 times on Monday (6AM, 8AM, 10AM), each picking a different batch.
+        # Batch selection is based on current hour: 6AM→0, 8AM→1, 10AM→2
         BATCH_SIZE = 500
         if len(urls) > BATCH_SIZE:
             total_batches = (len(urls) + BATCH_SIZE - 1) // BATCH_SIZE
-            # Pick which batch to run today based on day of week
-            # Monday=0 → batch 0, Wednesday=2 → batch 1, Friday=4 → batch 2
             from datetime import datetime
-            day = datetime.now().weekday()
-            day_to_batch = {0: 0, 2: 1, 4: 2, 1: 0, 3: 1, 5: 2, 6: 3}
-            batch_index = day_to_batch.get(day, 0) % total_batches
+            hour = datetime.utcnow().hour
+            # Map hour to batch: 6→0, 8→1, 10→2, anything else→0
+            hour_to_batch = {6: 0, 7: 0, 8: 1, 9: 1, 10: 2, 11: 2}
+            batch_index = hour_to_batch.get(hour, 0) % total_batches
 
             batch_start = batch_index * BATCH_SIZE
             batch_urls = urls[batch_start:batch_start + BATCH_SIZE]
 
-            print(f"  Total aliases: {len(urls)}, split into {total_batches} rotations of {BATCH_SIZE}")
-            print(f"  Today's rotation: batch {batch_index + 1}/{total_batches} (aliases {batch_start + 1}-{batch_start + len(batch_urls)})")
+            print(f"  Total aliases: {len(urls)}, split into {total_batches} batches of {BATCH_SIZE}")
+            print(f"  Current hour (UTC): {hour} → batch {batch_index + 1}/{total_batches} (aliases {batch_start + 1}-{batch_start + len(batch_urls)})")
             print(f"  Sending {len(batch_urls)} URLs to Apify")
 
             return self._run_single_apify_batch(batch_urls)
