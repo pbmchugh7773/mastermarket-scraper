@@ -296,16 +296,30 @@ class ApifyTescoScraper:
         urls = valid_urls
         self.stats['urls_sent_to_apify'] = len(urls)
 
+        # Batch URLs to avoid overwhelming the Apify actor
+        # The radeance/tesco-scraper works best with 500 URLs max per run
+        BATCH_SIZE = 500
+        if len(urls) > BATCH_SIZE:
+            print(f"  Splitting {len(urls)} URLs into batches of {BATCH_SIZE}...")
+            all_results = []
+            for batch_num, batch_start in enumerate(range(0, len(urls), BATCH_SIZE), 1):
+                batch_urls = urls[batch_start:batch_start + BATCH_SIZE]
+                total_batches = (len(urls) + BATCH_SIZE - 1) // BATCH_SIZE
+                print(f"\n  === Batch {batch_num}/{total_batches}: {len(batch_urls)} URLs ===")
+                batch_results = self._run_single_apify_batch(batch_urls)
+                all_results.extend(batch_results)
+                print(f"  Batch {batch_num} done: {len(batch_results)} results (total so far: {len(all_results)})")
+            return all_results
+        else:
+            return self._run_single_apify_batch(urls)
+
+    def _run_single_apify_batch(self, urls: List[str]) -> List[Dict]:
+        """Run a single batch of URLs through the Apify actor."""
         # Prepare actor input - using correct schema for radeance/tesco-scraper
-        # Key parameters:
-        # - urls: Array of strings (NOT startUrls with objects)
-        # - region: "IE" for Ireland (NOT country)
-        # - max_items: Maximum products to retrieve
-        # - include_product_details: Get full product info including EAN/GTIN
         actor_input = {
-            "urls": urls,  # Simple string array, not objects
-            "region": REGION,  # Ireland
-            "max_items": len(urls) + 50,  # Buffer for potential duplicates
+            "urls": urls,
+            "region": REGION,
+            "max_items": len(urls) + 50,
             "include_product_details": True,
             "only_unique": True
         }
