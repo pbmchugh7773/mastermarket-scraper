@@ -58,7 +58,7 @@ class ApifyTescoScraper:
     """Scraper that uses Apify's Tesco actor to fetch prices."""
 
     def __init__(self, dry_run: bool = False, limit: int = None, retry_mode: bool = False,
-                 fallback_only: bool = False):
+                 fallback_only: bool = False, retry_failed_only: bool = False):
         """
         Initialize the scraper.
 
@@ -67,6 +67,7 @@ class ApifyTescoScraper:
             limit: Maximum number of products to scrape (None = all)
             retry_mode: If True, only scrape pending/failed aliases
             fallback_only: If True, use only the custom fallback actor
+            retry_failed_only: If True, only retry aliases that failed TODAY
         """
         if not APIFY_TOKEN:
             raise ValueError("APIFY_API_TOKEN environment variable not set")
@@ -78,6 +79,7 @@ class ApifyTescoScraper:
         self.limit = limit
         self.retry_mode = retry_mode
         self.fallback_only = fallback_only
+        self.retry_failed_only = retry_failed_only
 
         # Statistics
         self.stats = {
@@ -208,7 +210,12 @@ class ApifyTescoScraper:
             return all_aliases if all_aliases else []
 
     def get_pending_aliases(self) -> List[Dict]:
-        """Get pending aliases that need scraping (retry mode), paginating automatically."""
+        """Get pending aliases that need scraping (retry mode), paginating automatically.
+
+        If retry_failed_only is set, only returns aliases that were attempted
+        today and failed (last_scrape_success=false, last_scraped_at=today).
+        This prevents retrying aliases that weren't in today's rotation.
+        """
         all_aliases = []
         page_size = 1000
         skip = 0
@@ -246,12 +253,24 @@ class ApifyTescoScraper:
 
                 skip += page_size
 
+            # Filter to only today's failures (not unrotated aliases)
+            if self.retry_failed_only:
+                from datetime import date
+                today = date.today().isoformat()
+                before_count = len(all_aliases)
+                all_aliases = [
+                    a for a in all_aliases
+                    if a.get('last_scrape_success') is False
+                    and a.get('last_scraped_at', '').startswith(today)
+                ]
+                print(f"  Filtered to failed-today-only: {before_count} pending → {len(all_aliases)} failed today")
+
             # Apply user limit if specified
             if self.limit and len(all_aliases) > self.limit:
                 all_aliases = all_aliases[:self.limit]
 
             self.stats['total_aliases'] = len(all_aliases)
-            print(f"  Found {len(all_aliases)} pending aliases to retry")
+            print(f"  Found {len(all_aliases)} aliases to retry")
             return all_aliases
 
         except requests.RequestException as e:
@@ -1013,6 +1032,12 @@ def main():
         help='Use only the custom fallback actor (skip primary radeance/tesco-scraper)'
     )
 
+    parser.add_argument(
+        '--retry-failed-only',
+        action='store_true',
+        help='Only retry aliases that failed TODAY (last_scrape_success=false AND last_scraped_at=today). Ignores aliases that were not attempted (e.g. not in today\'s rotation).'
+    )
+
     args = parser.parse_args()
 
     # Validate API token
@@ -1028,7 +1053,8 @@ def main():
             dry_run=args.dry_run,
             limit=args.limit,
             retry_mode=args.retry_mode,
-            fallback_only=args.fallback_only
+            fallback_only=args.fallback_only,
+            retry_failed_only=args.retry_failed_only
         )
         stats = scraper.run()
 

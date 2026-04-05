@@ -61,8 +61,8 @@ jobs:
           # Detect if this is a retry run (scheduled at 8 AM or manual retry)
           SCHEDULE="${{ github.event.schedule }}"
           if [[ "$SCHEDULE" == "0 8 "* ]] || [ "${{ github.event.inputs.retry_mode }}" == "true" ]; then
-            ARGS="$ARGS --retry-mode --fallback-only"
-            echo "Running in RETRY MODE with FALLBACK actor (pending/failed products only)"
+            ARGS="$ARGS --retry-mode --retry-failed-only --fallback-only"
+            echo "Running in RETRY MODE — only products that FAILED today (not unrotated ones)"
           else
             echo "Running in NORMAL MODE (primary + inline fallback)"
           fi
