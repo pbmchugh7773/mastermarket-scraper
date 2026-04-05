@@ -296,20 +296,27 @@ class ApifyTescoScraper:
         urls = valid_urls
         self.stats['urls_sent_to_apify'] = len(urls)
 
-        # Batch URLs to avoid overwhelming the Apify actor
-        # The radeance/tesco-scraper works best with 500 URLs max per run
+        # Apify Starter plan limits ~500 results per actor run.
+        # Instead of sending all URLs at once, rotate which 500 we send
+        # based on the day of the week. Over Mon/Wed/Fri all aliases get covered.
         BATCH_SIZE = 500
         if len(urls) > BATCH_SIZE:
-            print(f"  Splitting {len(urls)} URLs into batches of {BATCH_SIZE}...")
-            all_results = []
-            for batch_num, batch_start in enumerate(range(0, len(urls), BATCH_SIZE), 1):
-                batch_urls = urls[batch_start:batch_start + BATCH_SIZE]
-                total_batches = (len(urls) + BATCH_SIZE - 1) // BATCH_SIZE
-                print(f"\n  === Batch {batch_num}/{total_batches}: {len(batch_urls)} URLs ===")
-                batch_results = self._run_single_apify_batch(batch_urls)
-                all_results.extend(batch_results)
-                print(f"  Batch {batch_num} done: {len(batch_results)} results (total so far: {len(all_results)})")
-            return all_results
+            total_batches = (len(urls) + BATCH_SIZE - 1) // BATCH_SIZE
+            # Pick which batch to run today based on day of week
+            # Monday=0 → batch 0, Wednesday=2 → batch 1, Friday=4 → batch 2
+            from datetime import datetime
+            day = datetime.now().weekday()
+            day_to_batch = {0: 0, 2: 1, 4: 2, 1: 0, 3: 1, 5: 2, 6: 3}
+            batch_index = day_to_batch.get(day, 0) % total_batches
+
+            batch_start = batch_index * BATCH_SIZE
+            batch_urls = urls[batch_start:batch_start + BATCH_SIZE]
+
+            print(f"  Total aliases: {len(urls)}, split into {total_batches} rotations of {BATCH_SIZE}")
+            print(f"  Today's rotation: batch {batch_index + 1}/{total_batches} (aliases {batch_start + 1}-{batch_start + len(batch_urls)})")
+            print(f"  Sending {len(batch_urls)} URLs to Apify")
+
+            return self._run_single_apify_batch(batch_urls)
         else:
             return self._run_single_apify_batch(urls)
 
