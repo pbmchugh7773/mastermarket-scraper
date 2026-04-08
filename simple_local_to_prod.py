@@ -906,7 +906,7 @@ class SimpleLocalScraper:
                 r'regular[:\s]*price[:\s]*[€£]?\s*(\d+[.,]\d{2})(?!\s*/(?:kg|100g|g|ml|l|litre))',
                 r'class="[^"]*was[^"]*"[^>]*>[^€£]*[€£]\s*(\d+[.,]\d{2})(?!\s*/(?:kg|100g|g|ml|l|litre))',
                 r'class="[^"]*original[^"]*"[^>]*>[^€£]*[€£]\s*(\d+[.,]\d{2})(?!\s*/(?:kg|100g|g|ml|l|litre))',
-                r'<s[^>]*>\s*[€£]?\s*(\d+[.,]\d{2})(?!\s*/(?:kg|100g|g|ml|l|litre))',         # Strikethrough price
+                r'<s\b[^>]*>\s*[€£]?\s*(\d+[.,]\d{2})(?!\s*/(?:kg|100g|g|ml|l|litre))',        # Strikethrough price (word boundary avoids <span>, <svg>, etc.)
                 r'<del[^>]*>\s*[€£]?\s*(\d+[.,]\d{2})(?!\s*/(?:kg|100g|g|ml|l|litre))',       # Deleted/crossed out price
             ]
 
@@ -2180,8 +2180,35 @@ class SimpleLocalScraper:
                 price = None
                 promotion_data = None
 
-                # === 1. JSON-LD EXTRACTION ===
+                # === 0. ITEMPROP PRICE (most reliable for SuperValu) ===
                 import re
+                meta_price_match = re.search(r'itemprop="price"\s+content="€?(\d+[.,]\d{2})"', html_content, re.IGNORECASE)
+                if meta_price_match:
+                    try:
+                        price = float(meta_price_match.group(1).replace(',', '.'))
+                        if 0.01 <= price <= 1000:
+                            logger.info(f"✅ SuperValu price via itemprop: €{price}")
+                            promotion_data = self.detect_supervalu_promotion_data(html_content, price)
+
+                            if promotion_data and promotion_data.get('real_rewards_price'):
+                                real_rewards_price = promotion_data['real_rewards_price']
+                                normal_price = promotion_data.get('original_price') or price
+
+                                if real_rewards_price < normal_price:
+                                    logger.info(f"🎯 Using Real Rewards price as main price: €{real_rewards_price:.2f} (normal: €{normal_price:.2f})")
+                                    promotion_data['original_price'] = normal_price
+                                    return (real_rewards_price, promotion_data)
+                                else:
+                                    logger.info(f"⚠️ Real Rewards price (€{real_rewards_price:.2f}) not lower than normal (€{normal_price:.2f}), using normal price")
+                                    return (price, promotion_data if promotion_data.get('promotion_type') else None)
+                            else:
+                                return (price, promotion_data if promotion_data.get('promotion_type') else None)
+                        else:
+                            price = None
+                    except (ValueError, TypeError):
+                        price = None
+
+                # === 1. JSON-LD EXTRACTION ===
                 json_pattern = r'<script type="application/ld\+json"[^>]*>(.*?)</script>'
                 json_matches = re.findall(json_pattern, html_content, re.DOTALL | re.IGNORECASE)
                 logger.info(f"🔍 Found {len(json_matches)} JSON-LD patterns via requests")
@@ -2242,9 +2269,6 @@ class SimpleLocalScraper:
                     r'(\d+[.,]\d{2})\s*€(?!\s*/(?:kg|100g|g|ml|l|litre|ltr))',
                     r'"amount"[:\s]*"?(\d+[.,]\d{2})"?(?![^"]*(?:/kg|/100g|per))',
                     r'value["\s:]*(\d+[.,]\d{2})(?![^"]*(?:/kg|/100g|per))',
-                    # Additional SuperValu patterns
-                    r'pricing[^}]*?(\d+[.,]\d{2})(?![^}]*(?:/kg|/100g|per))',
-                    r'cost[^}]*?(\d+[.,]\d{2})(?![^}]*(?:/kg|/100g|per))'
                 ]
 
                 # Per-unit price indicators to filter out
@@ -2294,32 +2318,17 @@ class SimpleLocalScraper:
                             continue
 
                 if found_prices:
-                    # Remove duplicates and sort
-                    unique_prices = sorted(list(set(found_prices)))
-                    logger.info(f"Found potential prices: {unique_prices[:10]}")
+                    # Pick the most frequently occurring price (most likely the real one)
+                    from collections import Counter
+                    price_counts = Counter(found_prices)
+                    most_common = price_counts.most_common()
+                    logger.info(f"Found potential prices (by frequency): {most_common[:10]}")
 
-                    # SuperValu-specific heuristic: tea products are typically €2-€10
-                    # Filter for realistic tea prices first
-                    tea_prices = [p for p in unique_prices if 2.00 <= p <= 10.00]
-                    if tea_prices:
-                        # For Barry's Gold Blend Tea, typical price range is €3-€6
-                        # Select price in optimal range
-                        optimal_prices = [p for p in tea_prices if 3.00 <= p <= 6.00]
-                        if optimal_prices:
-                            price = optimal_prices[0]  # Take the first in optimal range
-                            logger.info(f"✅ SuperValu price found via requests (tea-optimized): €{price}")
-                        else:
-                            price = tea_prices[0]  # Take first reasonable tea price
-                            logger.info(f"✅ SuperValu price found via requests (tea range): €{price}")
-                    else:
-                        # Fallback: general grocery prices
-                        grocery_prices = [p for p in unique_prices if 1.00 <= p <= 15.00]
-                        if grocery_prices:
-                            price = grocery_prices[0]
-                            logger.info(f"✅ SuperValu price found via requests (grocery range): €{price}")
-                        elif unique_prices:
-                            price = unique_prices[0]
-                            logger.info(f"✅ SuperValu price found via requests (any price): €{price}")
+                    # Use the most frequent price; on ties, prefer the lowest
+                    top_count = most_common[0][1]
+                    top_prices = sorted([p for p, c in most_common if c == top_count])
+                    price = top_prices[0]
+                    logger.info(f"✅ SuperValu price found via requests (most frequent): €{price}")
 
                     if price:
                         # Detect promotions with the extracted price
