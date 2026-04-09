@@ -2,10 +2,8 @@ name: Apify Tesco Scraper
 
 on:
   schedule:
-    # Monday only — 3 runs to cover all ~1,713 aliases (500 per run)
-    - cron: '0 6 * * 1'    # Monday 6AM — batch 0 (aliases 1-500)
-    - cron: '0 8 * * 1'    # Monday 8AM — batch 1 (aliases 501-1000)
-    - cron: '0 10 * * 1'   # Monday 10AM — batch 2 (aliases 1001-1713)
+    # Monday 6AM — scrape all Tesco aliases in a single run
+    - cron: '0 6 * * 1'
   workflow_dispatch:
     inputs:
       limit:
@@ -26,7 +24,7 @@ on:
 jobs:
   scrape-tesco:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 120
 
     steps:
       - name: Checkout repository
@@ -48,20 +46,16 @@ jobs:
           API_URL: ${{ secrets.API_URL }}
           SCRAPER_USERNAME: ${{ secrets.SCRAPER_USERNAME }}
           SCRAPER_PASSWORD: ${{ secrets.SCRAPER_PASSWORD }}
-          APIFY_TESCO_FALLBACK_ACTOR_ID: ${{ secrets.APIFY_TESCO_FALLBACK_ACTOR_ID }}
           SCRAPER_COUNTRY: 'IE'
           SCRAPER_CURRENCY: 'EUR'
         run: |
           ARGS=""
 
-          # All 3 Monday runs use NORMAL MODE with hour-based batch rotation
-          # 6AM → batch 0 (aliases 1-500), 8AM → batch 1 (501-1000), 10AM → batch 2 (1001+)
-          # Manual dispatch and retry mode still supported via inputs
           if [ "${{ github.event.inputs.retry_mode }}" == "true" ]; then
-            ARGS="$ARGS --retry-mode --retry-failed-only --fallback-only"
-            echo "Running in RETRY MODE (manual trigger)"
+            ARGS="$ARGS --retry-mode --retry-failed-only"
+            echo "Running in RETRY MODE"
           else
-            echo "Running in NORMAL MODE — batch selected by current hour (UTC)"
+            echo "Running in NORMAL MODE — all aliases in single run"
           fi
 
           # Add limit if specified
