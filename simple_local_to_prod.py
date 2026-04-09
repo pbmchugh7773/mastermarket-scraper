@@ -2333,7 +2333,13 @@ class SimpleLocalScraper:
                     top_count = most_common[0][1]
                     top_prices = sorted([p for p, c in most_common if c == top_count])
                     price = top_prices[0]
-                    logger.info(f"✅ SuperValu price found via requests (most frequent): €{price}")
+
+                    # Reject €1.00 placeholder — same bug as Dunnes (scraper returns €1.00 when it can't parse)
+                    if price == 1.00:
+                        logger.warning(f"⚠️ SuperValu regex price is €1.00 (placeholder) — rejecting for {product_name}")
+                        price = None
+                    else:
+                        logger.info(f"✅ SuperValu price found via requests (most frequent): €{price}")
 
                     if price:
                         # Detect promotions with the extracted price
@@ -3013,6 +3019,11 @@ class SimpleLocalScraper:
 
     def upload_price(self, alias: Dict, price: float, store_name: str, promotion_data: dict = None) -> bool:
         """Upload price with optional promotion data to production API with retry logic"""
+        # Defense-in-depth: reject known placeholder prices before uploading
+        if price == 1.00:
+            logger.warning(f"⚠️ Rejecting €1.00 placeholder price for product {alias['product_id']} ({store_name}) — not uploading")
+            return False
+
         max_retries = 3
         retry_delay = 2
 
