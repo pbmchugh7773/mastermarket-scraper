@@ -1057,7 +1057,10 @@ def main():
         )
         stats = scraper.run()
 
-        # Exit with error code if uploads failed
+        # Exit with error code if no results or all uploads failed
+        if stats.get('results_from_apify', 0) == 0:
+            print("ERROR: Apify returned zero results — exiting with failure")
+            sys.exit(1)
         if stats['prices_failed'] > 0 and stats['prices_uploaded'] == 0:
             sys.exit(1)
 

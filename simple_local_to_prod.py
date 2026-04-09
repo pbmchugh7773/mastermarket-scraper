@@ -2186,7 +2186,12 @@ class SimpleLocalScraper:
                 if meta_price_match:
                     try:
                         price = float(meta_price_match.group(1).replace(',', '.'))
-                        if 0.01 <= price <= 1000:
+                        # Reject €1.00 from itemprop — SuperValu uses it as a placeholder
+                        # when the real price is unavailable
+                        if price == 1.00:
+                            logger.warning(f"⚠️ SuperValu itemprop price is €1.00 (placeholder) — rejecting for {product_name}")
+                            price = None
+                        elif 0.01 <= price <= 1000:
                             logger.info(f"✅ SuperValu price via itemprop: €{price}")
                             promotion_data = self.detect_supervalu_promotion_data(html_content, price)
 
