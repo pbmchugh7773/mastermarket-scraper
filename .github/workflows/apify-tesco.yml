@@ -2,8 +2,10 @@ name: Apify Tesco Scraper
 
 on:
   schedule:
-    # Monday 6AM — scrape all Tesco aliases in a single run
-    - cron: '0 6 * * 1'
+    # 2x per week — Monday + Thursday at 6AM UTC. Matches other stores.
+    # Was 1x/week (Monday only) — 2026-04-18 freshness fix.
+    - cron: '0 6 * * 1'  # Monday
+    - cron: '0 6 * * 4'  # Thursday
   workflow_dispatch:
     inputs:
       limit:

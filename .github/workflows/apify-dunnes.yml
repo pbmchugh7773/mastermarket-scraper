@@ -2,12 +2,12 @@ name: Apify Dunnes Scraper
 
 on:
   schedule:
-    # Tuesday and Friday at 6:00 AM UTC (normal mode)
-    - cron: '0 6 * * 2'   # Tuesday
-    - cron: '0 6 * * 5'   # Friday
-    # Retry run 2 hours later (8:00 AM UTC) for failed/pending products
-    - cron: '0 8 * * 2'   # Tuesday retry
-    - cron: '0 8 * * 5'   # Friday retry
+    # Aligned with other stores on Mon + Thu (was Tue + Fri) — 2026-04-18.
+    - cron: '0 6 * * 1'  # Monday — main run
+    - cron: '0 6 * * 4'  # Thursday — main run
+    # Retry runs 2 hours later (8:00 AM UTC) for failed/pending products
+    - cron: '0 8 * * 1'  # Monday — retry
+    - cron: '0 8 * * 4'  # Thursday — retry
   workflow_dispatch:
     inputs:
       limit:
