@@ -262,56 +262,80 @@ class ApifyDunnesScraper:
         urls = valid_urls
         self.stats['urls_sent_to_apify'] = len(urls)
 
-        # Prepare actor input for custom Dunnes actor
-        # The actor should accept these parameters:
-        actor_input = {
-            "urls": urls,
-            "maxConcurrency": 5,  # Conservative to avoid blocking
-            "maxRequestRetries": 3,
-            "requestHandlerTimeoutSecs": 120,  # Allow time for Cloudflare
-            "useResidentialProxies": self.use_residential_proxy,  # Datacenter by default, residential if --use-residential-proxy
-        }
+        # Batch URLs into sequential actor runs to stay well under the Apify
+        # platform timeout and give Cloudflare breathing room between batches.
+        # Partial progress is preserved if a single batch fails.
+        BATCH_SIZE = 150
+        BATCH_TIMEOUT_SECS = 1500  # 25 min per batch (safety margin vs 40-min cap)
+        INTER_BATCH_PAUSE_SECS = 15
+
+        batches = [urls[i:i + BATCH_SIZE] for i in range(0, len(urls), BATCH_SIZE)]
 
         print(f"  URLs sample: {urls[:2]}..." if len(urls) > 2 else f"  URLs: {urls}")
+        print(f"Running Apify actor '{ACTOR_ID}' with {len(urls)} URLs in {len(batches)} batch(es) of up to {BATCH_SIZE}")
+        print(f"Per-batch timeout: {BATCH_TIMEOUT_SECS}s ({BATCH_TIMEOUT_SECS // 60} min)")
 
-        print(f"Starting Apify actor '{ACTOR_ID}' with {len(urls)} URLs...")
-        print("This may take 5-20 minutes depending on the number of products...")
+        all_items: List[Dict] = []
+        batch_run_ids: List[str] = []
+        last_run_info: Optional[Dict] = None
 
-        try:
-            # Start actor and wait for completion
-            run = self.apify_client.actor(ACTOR_ID).call(
-                run_input=actor_input,
-                timeout_secs=2400  # 40 minutes max (Dunnes is slower due to Cloudflare)
-            )
+        for idx, batch in enumerate(batches, start=1):
+            actor_input = {
+                "urls": batch,
+                "maxConcurrency": 5,  # Conservative to avoid blocking
+                "maxRequestRetries": 2,  # 3 total attempts (retry run picks up the rest)
+                "requestHandlerTimeoutSecs": 120,  # Allow time for Cloudflare
+                "useResidentialProxies": self.use_residential_proxy,
+            }
 
-            if not run:
-                print("ERROR: Apify actor run failed (no response)")
-                return []
+            print(f"\n  [Batch {idx}/{len(batches)}] Starting with {len(batch)} URLs...")
+            batch_start = time.time()
 
-            # Check run status
-            status = run.get('status')
-            if status not in ('SUCCEEDED', 'FINISHED'):
-                print(f"WARNING: Actor run status: {status}")
+            try:
+                run = self.apify_client.actor(ACTOR_ID).call(
+                    run_input=actor_input,
+                    timeout_secs=BATCH_TIMEOUT_SECS
+                )
 
-            # Get results from dataset
-            dataset_id = run.get('defaultDatasetId')
-            if not dataset_id:
-                print("ERROR: No dataset ID returned from actor run")
-                return []
+                if not run:
+                    print(f"  [Batch {idx}/{len(batches)}] ERROR: no response, skipping")
+                    continue
 
-            dataset_items = self.apify_client.dataset(dataset_id).list_items().items
-            self.stats['results_from_apify'] = len(dataset_items)
+                status = run.get('status')
+                if status not in ('SUCCEEDED', 'FINISHED'):
+                    print(f"  [Batch {idx}/{len(batches)}] WARNING: status={status}")
 
-            print(f"Got {len(dataset_items)} results from Apify")
+                dataset_id = run.get('defaultDatasetId')
+                if not dataset_id:
+                    print(f"  [Batch {idx}/{len(batches)}] ERROR: no dataset ID, skipping")
+                    continue
 
-            # Save complete JSON response for later review/reprocessing
-            self.save_apify_response(dataset_items, run)
+                items = self.apify_client.dataset(dataset_id).list_items().items
+                elapsed = time.time() - batch_start
+                print(f"  [Batch {idx}/{len(batches)}] Got {len(items)} results in {elapsed:.1f}s (status={status})")
 
-            return dataset_items
+                all_items.extend(items)
+                last_run_info = run
+                if run.get('id'):
+                    batch_run_ids.append(run['id'])
 
-        except Exception as e:
-            print(f"ERROR running Apify actor: {e}")
-            return []
+            except Exception as e:
+                print(f"  [Batch {idx}/{len(batches)}] ERROR: {e} — continuing with next batch")
+                continue
+
+            # Pause between batches (except after the last) to let Cloudflare/IP pool rotate
+            if idx < len(batches):
+                time.sleep(INTER_BATCH_PAUSE_SECS)
+
+        self.stats['results_from_apify'] = len(all_items)
+        print(f"\nTotal: {len(all_items)} results from Apify across {len(batches)} batch(es)")
+
+        if all_items and last_run_info:
+            # Tag with all batch run IDs so the saved JSON is traceable
+            last_run_info = {**last_run_info, 'batchRunIds': batch_run_ids}
+            self.save_apify_response(all_items, last_run_info)
+
+        return all_items
 
     def save_apify_response(self, items: List[Dict], run_info: Dict) -> Optional[Path]:
         """
