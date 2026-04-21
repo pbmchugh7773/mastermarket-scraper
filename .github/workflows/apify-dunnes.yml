@@ -33,7 +33,7 @@ on:
 jobs:
   scrape-dunnes:
     runs-on: ubuntu-latest
-    timeout-minutes: 60  # Dunnes may take longer due to Cloudflare
+    timeout-minutes: 120  # 4 batches × 25 min + upload + startup overhead
 
     steps:
       - name: Checkout repository
