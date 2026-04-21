@@ -81,13 +81,22 @@ jobs:
             ARGS="$ARGS --dry-run"
           fi
 
-          # Use residential proxy by default (required for Cloudflare)
-          # Only skip if explicitly set to false in manual run
-          if [ "${{ github.event.inputs.use_residential_proxy }}" != "false" ]; then
+          # Proxy strategy (cost optimization):
+          # - Scheduled 06:00 UTC (main run, --all)   → DATACENTER (cheap first pass)
+          # - Scheduled 08:00 UTC (retry, pending)    → RESIDENTIAL (handles CF-blocked)
+          # - Manual dispatch                         → honor input (default: residential)
+          USE_RESIDENTIAL="true"
+          if [ "${{ github.event_name }}" == "schedule" ] && [ "$CURRENT_HOUR" == "06" ]; then
+            USE_RESIDENTIAL="false"
+          elif [ "${{ github.event.inputs.use_residential_proxy }}" == "false" ]; then
+            USE_RESIDENTIAL="false"
+          fi
+
+          if [ "$USE_RESIDENTIAL" == "true" ]; then
             ARGS="$ARGS --use-residential-proxy"
-            echo "Using RESIDENTIAL proxy (required for Cloudflare)"
+            echo "Using RESIDENTIAL proxy (expensive, bypasses Cloudflare)"
           else
-            echo "Using DATACENTER proxy (may be blocked by Cloudflare)"
+            echo "Using DATACENTER proxy (cheap; CF-blocked items retry at 08:00 with residential)"
           fi
 
           python apify_dunnes_scraper.py $ARGS 2>&1 | tee apify_dunnes_scraper.log

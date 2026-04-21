@@ -262,7 +262,10 @@ const crawler = new PuppeteerCrawler({
 
     // Pre-navigation hooks
     preNavigationHooks: [
-        async ({ page }) => {
+        async ({ page }, gotoOptions) => {
+            // Return control once DOM is ready — avoids waiting for late analytics XHRs
+            gotoOptions.waitUntil = 'domcontentloaded';
+
             // Set realistic viewport
             await page.setViewport({ width: 1920, height: 1080 });
 
