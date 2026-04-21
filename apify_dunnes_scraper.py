@@ -652,6 +652,11 @@ class ApifyDunnesScraper:
         Returns:
             True if upload succeeded
         """
+        # Defense-in-depth: reject €1.00 placeholder even if it slipped past extract
+        if price_data.get('price') == 1.00:
+            print(f"    REJECTED at upload: price=€1.00 placeholder for product_id={product_id}")
+            return False
+
         if self.dry_run:
             promo_info = f", promo={price_data.get('promotion_type')}" if price_data.get('promotion_type') else ""
             print(f"  [DRY RUN] Would upload: product_id={product_id}, price={price_data['price']}{promo_info}")

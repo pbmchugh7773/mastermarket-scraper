@@ -66,6 +66,10 @@ function extractPrice(text) {
                 const priceMatch = match.match(pattern);
                 if (priceMatch) {
                     const price = parseFloat(priceMatch[1].replace(',', '.'));
+                    // Reject €1.00 placeholder: Dunnes returns €1 when a product
+                    // can't be parsed properly. Real items at exactly €1.00 are
+                    // rare enough that the false-positive risk is acceptable.
+                    if (price === 1) continue;
                     if (price >= 0.01 && price <= 1000) {
                         return price;
                     }
@@ -173,6 +177,8 @@ function extractFromJsonLd(scripts) {
             if (data['@type'] === 'Product') {
                 const offers = data.offers || {};
                 const price = parseFloat(offers.price);
+                // Reject €1.00 placeholder (see extractPrice).
+                if (price === 1) continue;
                 if (price >= 0.01 && price <= 1000) {
                     return {
                         title: data.name || '',
