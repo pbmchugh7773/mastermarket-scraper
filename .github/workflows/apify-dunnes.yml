@@ -81,22 +81,15 @@ jobs:
             ARGS="$ARGS --dry-run"
           fi
 
-          # Proxy strategy (cost optimization):
-          # - Scheduled 06:00 UTC (main run, --all)   → DATACENTER (cheap first pass)
-          # - Scheduled 08:00 UTC (retry, pending)    → RESIDENTIAL (handles CF-blocked)
-          # - Manual dispatch                         → honor input (default: residential)
-          USE_RESIDENTIAL="true"
-          if [ "${{ github.event_name }}" == "schedule" ] && [ "$CURRENT_HOUR" == "06" ]; then
-            USE_RESIDENTIAL="false"
-          elif [ "${{ github.event.inputs.use_residential_proxy }}" == "false" ]; then
-            USE_RESIDENTIAL="false"
-          fi
-
-          if [ "$USE_RESIDENTIAL" == "true" ]; then
+          # Always use residential proxy — datacenter is 100% blocked by Dunnes
+          # Cloudflare (verified 2026-04-21: 42/42 URLs returned 403 on datacenter).
+          # Manual dispatch can still override with use_residential_proxy=false
+          # for debugging, but scheduled runs always use residential.
+          if [ "${{ github.event.inputs.use_residential_proxy }}" != "false" ]; then
             ARGS="$ARGS --use-residential-proxy"
-            echo "Using RESIDENTIAL proxy (expensive, bypasses Cloudflare)"
+            echo "Using RESIDENTIAL proxy (required — datacenter gets 403 on Dunnes)"
           else
-            echo "Using DATACENTER proxy (cheap; CF-blocked items retry at 08:00 with residential)"
+            echo "Using DATACENTER proxy (manual override; expect ~100% failure rate)"
           fi
 
           python apify_dunnes_scraper.py $ARGS 2>&1 | tee apify_dunnes_scraper.log
