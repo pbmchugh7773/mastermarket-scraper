@@ -51,6 +51,7 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, NoSuchElementException
 from webdriver_manager.chrome import ChromeDriverManager
 from selenium.webdriver.chrome.service import Service
+from bs4 import BeautifulSoup
 
 # Configure logging
 logging.basicConfig(
@@ -628,6 +629,37 @@ class SimpleLocalScraper:
 
         return promotion_data
 
+    def _extract_aldi_product_scope(self, page_source: str) -> str:
+        """
+        Return the lowercased HTML of the Aldi product-detail region only.
+
+        The Aldi.ie site-wide navigation contains a "Specialbuys" category link
+        which previously caused the full page_source regex to tag every product
+        as a `flash_sale` promotion. Scoping detection to the product-detail
+        container removes that false-positive source. Falls back to `<main>` and
+        finally to the full page_source if neither can be located.
+        """
+        try:
+            soup = BeautifulSoup(page_source, 'html.parser')
+        except Exception:
+            return page_source.lower()
+
+        # Known Aldi.ie product-detail containers (in order of specificity)
+        candidates = [
+            {'name': 'div', 'attrs': {'class': re.compile(r'product-detail', re.I)}},
+            {'name': 'section', 'attrs': {'class': re.compile(r'product-detail', re.I)}},
+            {'name': 'div', 'attrs': {'class': re.compile(r'product-page', re.I)}},
+            {'name': 'div', 'attrs': {'id': re.compile(r'product', re.I)}},
+            {'name': 'main', 'attrs': {}},
+        ]
+
+        for candidate in candidates:
+            node = soup.find(candidate['name'], **({'attrs': candidate['attrs']} if candidate['attrs'] else {}))
+            if node:
+                return str(node).lower()
+
+        return page_source.lower()
+
     def detect_aldi_promotion_data(self, page_source: str, current_price: float = None) -> dict:
         """
         Detect and extract promotion information from Aldi Ireland product pages
@@ -655,7 +687,10 @@ class SimpleLocalScraper:
             'promotion_discount_value': None
         }
 
-        page_lower = page_source.lower()
+        # Scope to product-detail DOM only — Aldi.ie has a site-wide "Specialbuys"
+        # nav link that would otherwise cause every product to be tagged as a
+        # flash_sale (MASA-94 / MASA-97 root cause).
+        page_lower = self._extract_aldi_product_scope(page_source)
 
         # === 1. Detect "Was" price (original price before discount) ===
         was_price_patterns = [
@@ -700,12 +735,12 @@ class SimpleLocalScraper:
                 break
 
         # === 3. Detect "Special Buy" / "Specialbuy" promotions ===
+        # NOTE: `limited\s*time` and `while\s*stocks\s*last` removed — unreliable
+        # signals that matched generic marketing copy on product pages (MASA-97).
         special_buy_patterns = [
             r'special\s*buy',
             r'specialbuy',
             r'special\s*offer',
-            r'limited\s*time',
-            r'while\s*stocks\s*last',
         ]
 
         for pattern in special_buy_patterns:
@@ -730,12 +765,16 @@ class SimpleLocalScraper:
                 try:
                     value = match.group(1).replace(',', '.')
                     if '%' in pattern:
-                        # Percentage discount
+                        # Percentage discount — schema expects EUR value in
+                        # promotion_discount_value, not the raw percentage (MASA-97).
                         discount_pct = float(value)
                         if 0 < discount_pct <= 90:  # Reasonable percentage range
                             promotion_data['promotion_type'] = 'percentage_off'
                             promotion_data['promotion_text'] = f'{int(discount_pct)}% Off'
-                            promotion_data['promotion_discount_value'] = discount_pct
+                            if current_price:
+                                promotion_data['promotion_discount_value'] = round(
+                                    current_price * (discount_pct / 100.0), 2
+                                )
                             logger.info(f"🏷️ Aldi {int(discount_pct)}% discount detected")
                     else:
                         # Fixed amount discount
