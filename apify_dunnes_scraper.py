@@ -156,12 +156,32 @@ class ApifyDunnesScraper:
 
             if self.token:
                 self.session.headers['Authorization'] = f'Bearer {self.token}'
+                self.token_acquired_at = time.time()
                 return True
             return False
 
         except requests.RequestException as e:
             print(f"Authentication failed: {e}")
             return False
+
+    def _authed_post(self, url: str, **kwargs):
+        """
+        POST helper that survives mid-run JWT expiry (MASA-106).
+        Backend ACCESS_TOKEN_EXPIRE_MINUTES=60 but Apify Dunnes runs hit ~65m+.
+          1. Proactive: re-auth if current token age > 50 min.
+          2. Reactive: on 401, re-auth once and retry.
+        """
+        token_age = time.time() - getattr(self, 'token_acquired_at', 0)
+        if token_age > 3000:
+            print(f"  🔄 Token age {int(token_age)}s — proactively re-authenticating")
+            self.authenticate_mastermarket()
+
+        response = self.session.post(url, **kwargs)
+        if response.status_code == 401 and '/auth/login' not in url:
+            print(f"  ⚠️ 401 on {url} — re-authenticating and retrying once")
+            if self.authenticate_mastermarket():
+                response = self.session.post(url, **kwargs)
+        return response
 
     def get_dunnes_aliases(self) -> List[Dict]:
         """Get all Dunnes product aliases with scraper URLs."""
@@ -691,7 +711,7 @@ class ApifyDunnesScraper:
         # Retry logic
         for attempt in range(3):
             try:
-                response = self.session.post(
+                response = self._authed_post(
                     f"{API_URL}/api/community-prices/submit-scraped",
                     json=payload,
                     timeout=30
@@ -734,7 +754,7 @@ class ApifyDunnesScraper:
                 'original_price': original_price
             }
 
-            response = self.session.post(
+            response = self._authed_post(
                 f'{API_URL}/api/scraping/update-status',
                 json=data,
                 timeout=30

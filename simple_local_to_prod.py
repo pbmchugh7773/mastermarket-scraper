@@ -187,17 +187,38 @@ class SimpleLocalScraper:
                 data = response.json()
                 self.api_token = data['access_token']
                 self.session.headers['Authorization'] = f'Bearer {self.api_token}'
+                self.token_acquired_at = time.time()
                 logger.info("✅ Authentication successful")
                 return True
             else:
                 logger.error(f"❌ Authentication failed: {response.status_code}")
                 logger.error(f"Response: {response.text}")
                 return False
-                
+
         except Exception as e:
             logger.error(f"❌ Authentication error: {e}")
             return False
-    
+
+    def _authed_post(self, url: str, **kwargs):
+        """
+        POST helper that survives mid-run JWT expiry (MASA-106).
+        Backend issues tokens with ACCESS_TOKEN_EXPIRE_MINUTES=60 but Apify
+        runs can exceed 60 min. Two layers of defense:
+          1. Proactive: re-auth if current token is older than 50 min.
+          2. Reactive: if response is 401, re-auth once and retry.
+        """
+        token_age = time.time() - getattr(self, 'token_acquired_at', 0)
+        if token_age > 3000:  # 50 min
+            logger.info(f"🔄 Token age {int(token_age)}s > 3000s — proactively re-authenticating")
+            self.authenticate()
+
+        response = self.session.post(url, **kwargs)
+        if response.status_code == 401 and '/auth/login' not in url:
+            logger.warning(f"⚠️ Got 401 on {url} — token expired mid-run, re-authenticating and retrying")
+            if self.authenticate():
+                response = self.session.post(url, **kwargs)
+        return response
+
     def setup_chrome(self) -> Optional[webdriver.Chrome]:
         """
         Setup Chrome WebDriver with Advanced Anti-Detection
@@ -3038,7 +3059,7 @@ class SimpleLocalScraper:
                 'original_price': original_price
             }
 
-            response = self.session.post(f'{API_URL}/api/scraping/update-status', json=data, timeout=30)
+            response = self._authed_post(f'{API_URL}/api/scraping/update-status', json=data, timeout=30)
 
             if response.status_code == 200:
                 result = response.json()
@@ -3108,7 +3129,7 @@ class SimpleLocalScraper:
                 
                 # Use the community prices endpoint
                 # response = self.session.post(f'{API_URL}/api/community-prices/submit', json=data, timeout=30)
-                response = self.session.post(f'{API_URL}/api/community-prices/submit-scraped', json=data, timeout=30)
+                response = self._authed_post(f'{API_URL}/api/community-prices/submit-scraped', json=data, timeout=30)
                 if response.status_code in [200, 201]:
                     logger.info(f"✅ Uploaded price for product {alias['product_id']}: €{price}")
                     return True
