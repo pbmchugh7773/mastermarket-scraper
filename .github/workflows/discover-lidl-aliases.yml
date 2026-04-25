@@ -1,0 +1,111 @@
+name: Discover Lidl Aliases (Weekly)
+
+# Weekly Lidl URL discovery for MASA-114 / MASA-117.
+# Emits a JSON proposal of Lidl URLs that probably match MM products with an
+# Aldi alias but no Lidl alias. NEVER writes to DB or API — VP Data reviews
+# the artifact and creates aliases manually (or via a follow-up tool).
+#
+# Schedule: Sundays 10:00 UTC — after the 08:00 UTC promotions scan in
+# daily-scraping.yml so the candidate set has fresh signal.
+
+on:
+  schedule:
+    - cron: '0 10 * * 0'  # Sundays 10:00 UTC
+  workflow_dispatch:
+    inputs:
+      threshold:
+        description: 'Match threshold (0..1)'
+        required: false
+        default: '0.55'
+        type: string
+      limit:
+        description: 'Cap candidate volume (blank = no cap)'
+        required: false
+        default: ''
+        type: string
+      no_verify_collisions:
+        description: 'Skip JSON-LD verification for collision URLs'
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  discover:
+    name: Lidl alias discovery
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: Install Python deps
+        run: |
+          pip install --upgrade pip
+          # Only `requests` is strictly required — install the full repo
+          # requirements to avoid drift from selenium/etc that the candidate
+          # query path doesn't use here.
+          pip install -r requirements.txt
+
+      - name: Run discovery
+        env:
+          API_URL: ${{ secrets.API_URL }}
+          SCRAPER_USERNAME: ${{ secrets.SCRAPER_USERNAME }}
+          SCRAPER_PASSWORD: ${{ secrets.SCRAPER_PASSWORD }}
+        run: |
+          set -euo pipefail
+          THRESHOLD="${{ github.event.inputs.threshold || '0.55' }}"
+          LIMIT_FLAG=""
+          if [ -n "${{ github.event.inputs.limit || '' }}" ]; then
+            LIMIT_FLAG="--limit ${{ github.event.inputs.limit }}"
+          fi
+          NO_VERIFY_FLAG=""
+          if [ "${{ github.event.inputs.no_verify_collisions || 'false' }}" = "true" ]; then
+            NO_VERIFY_FLAG="--no-verify-collisions"
+          fi
+
+          mkdir -p out
+          python discover_lidl_aliases.py \
+            --source api \
+            --threshold "$THRESHOLD" \
+            $LIMIT_FLAG \
+            $NO_VERIFY_FLAG \
+            --output-dir out
+
+      - name: Upload proposal artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lidl-discovery-${{ github.run_number }}
+          path: |
+            out/lidl_discovery_*.json
+            discover_lidl_*.log
+          retention-days: 30
+
+      - name: Surface summary in run log
+        if: always()
+        run: |
+          echo "📊 Lidl Discovery Summary"
+          echo "========================="
+          JSON=$(ls -t out/lidl_discovery_*.json 2>/dev/null | head -1 || true)
+          if [ -z "$JSON" ]; then
+            echo "❌ No proposal JSON produced — see run log above."
+            exit 1
+          fi
+          jq -r '
+            "  Source:                    \(.source)",
+            "  Sitemap URLs:              \(.sitemap_url_count)",
+            "  Candidate products:        \(.candidate_product_count)",
+            "  Threshold:                 \(.threshold)",
+            "  Raw matches:               \(.raw_match_count)",
+            "  Unambiguous (slug-only):   \(.unambiguous_count)",
+            "  Collision URLs:            \(.collision_url_count)",
+            "  Recovered via JSON-LD:     \(.collision_resolved_count)",
+            "  Still ambiguous:           \(.collision_unresolved_count)",
+            "  Total promotable:          \(.proposals | length)"
+          ' "$JSON"
