@@ -1,169 +1,176 @@
 #!/usr/bin/env python3
 """
-Lidl URL Discovery for MasterMarket — MASA-117 / parent MASA-114.
+Lidl URL Discovery for MasterMarket — v2 (MASA-119).
 
-Sister to discover_aldi_aliases.py for Lidl.ie. Three Lidl-specific quirks:
-  1. Sitemap is gzipped: https://www.lidl.ie/p/export/IE/en/product_sitemap.xml.gz
-  2. Lidl URL slugs DO NOT include size/variant info (e.g. "hellmanns-mayonnaise")
-     — unlike Aldi where slugs encode the variant — so collisions are common.
-  3. To break collisions we fetch the Lidl product page and parse the
-     JSON-LD `<script type="application/ld+json">` Product block to extract
-     size from `name`/`description`/`weight`/`additionalProperty`.
+Changes vs v1:
+  * Per-candidate HTML fetch with size extraction from visible spans
+    (Lidl JSON-LD does NOT expose pack size; rendered HTML does — see MASA-116).
+  * Mandatory size gate: a Lidl proposal MUST carry a non-null lidl_size.
+  * Collision disambiguation: when several MM products map to one Lidl URL,
+    fetch HTML once and keep only candidates whose size matches AND whose
+    variant tokens are compatible with the page title.
+  * 24h disk cache at ~/.cache/mastermarket/lidl_html/<sku>.html for re-runs.
+  * 0.5–1.5s polite delay between LIVE fetches (skipped on cache hits).
+  * Product-side size derivation: try the name first; fall back to `unit`
+    only if name yields nothing AND `unit` is not "1 portion (200ml)" garbage
+    (portion|serving|cup|glass|slice|bowl in unit → treat as unknown).
 
-This script NEVER writes to the DB or API. It emits a JSON proposal only;
-VP Data reviews and creates aliases manually (or via a follow-up script).
-
-Strategy
---------
-1. Fetch + decompress Lidl sitemap → index URLs by normalised slug.
-2. Get candidate products: branded products that have an Aldi alias but no
-   Lidl alias (proxy for "Lidl-likely products we're missing").
-   Two sources:
-     --source api    (default) — uses MM API like discover_aldi_aliases.py.
-     --source local  — runs scripts/query_prod.sh on the local machine.
-3. Score by token overlap + brand-presence bonus + hard size gate.
-4. For URLs that are claimed by ≥2 distinct MM products (collisions),
-   fetch the Lidl page, extract size from JSON-LD, then re-gate the
-   colliding candidates against the verified Lidl size. The winner (if any)
-   gets promoted into the unambiguous proposal set.
-5. Emit proposal JSON to cwd (CI uploads as artifact).
-
-Usage
------
-    # Dry-mode discovery via MM API (the default)
-    python discover_lidl_aliases.py
-
-    # Local DB query (VP Engineering only — needs query_prod.sh)
-    python discover_lidl_aliases.py --source local
-
-    # Skip the JSON-LD verification step (faster, but loses collision recovery)
-    python discover_lidl_aliases.py --no-verify-collisions
-
-    # Tune match threshold or cap candidate volume
-    python discover_lidl_aliases.py --threshold 0.5 --limit 500
+Output: /tmp/lidl_proposal_<timestamp>.json — proposal-only, NO DB writes.
+VP Data signs off the next batch.
 """
-
-import argparse
 import gzip
+import io
 import json
-import logging
 import os
+import random
 import re
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
-
-import requests
-
-# ----------------------------------------------------------------------------
-# Configuration
-# ----------------------------------------------------------------------------
-
-API_URL = os.getenv("API_URL", "https://api.mastermarketapp.com")
-USERNAME = os.getenv("SCRAPER_USERNAME", "pricerIE@mastermarket.com")
-PASSWORD = os.getenv("SCRAPER_PASSWORD", "pricerIE")
 
 LIDL_SITEMAP_URL = "https://www.lidl.ie/p/export/IE/en/product_sitemap.xml.gz"
-QUERY_PROD = os.getenv(
-    "QUERY_PROD_PATH",
-    "/home/pbmchugh7773/projects/MasterMarket/scripts/query_prod.sh",
-)
+QUERY_PROD = "/home/pbmchugh7773/projects/MasterMarket/scripts/query_prod.sh"
+USER_AGENT = "Mozilla/5.0 (compatible; MasterMarket-Discovery/0.2)"
+CACHE_DIR = Path.home() / ".cache" / "mastermarket" / "lidl_html"
+CACHE_TTL_SECONDS = 24 * 3600
+LIVE_FETCH_MIN_DELAY = 0.5
+LIVE_FETCH_MAX_DELAY = 1.5
+HTTP_TIMEOUT = 15
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0.0.0 Safari/537.36"
-    ),
-    "Accept-Language": "en-IE,en;q=0.9",
-}
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler(
-            f'discover_lidl_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log'
-        ),
-    ],
-)
-logger = logging.getLogger(__name__)
-
-
-# ----------------------------------------------------------------------------
-# Normalisation (kept identical to discover_aldi_aliases.py to preserve scoring parity)
-# ----------------------------------------------------------------------------
-
+# Same normalisation rules as discover_aldi_aliases.py — keep behaviour parallel.
 SIZE_RE = re.compile(
-    r"\b(\d+(?:\.\d+)?)\s*(g|kg|ml|l|ltr|litre|liter|cl|oz|pk|pack)\b", re.I
+    r"\b(\d+(?:\.\d+)?)\s*(g|kg|ml|l|ltr|litre|liter|cl|oz|pk|pack)\b",
+    re.I,
 )
 MULTIPACK_RE = re.compile(r"\b(\d+)\s*x\s*(\d+(?:\.\d+)?)\s*(g|ml|kg)\b", re.I)
 RATING_RE = re.compile(r"\d+\.?\d*\s*stars?\s*\(.*?\)", re.I)
-FILLER_RE = re.compile(
+FILLER = re.compile(
     r"\b(the|a|an|of|in|with|and|&|for|from|style|original|classic)\b", re.I
 )
 
+# Detect "garbage" unit fields on the MM side (rule #5 from the issue spec).
+PORTION_GUARD_RE = re.compile(
+    r"\b(portion|serving|cup|glass|slice|bowl)\b", re.I
+)
 
-def normalize(text: str) -> str:
-    text = (text or "").lower().strip()
+# HTML size patterns — ordered: multipack first (most specific), then weight/volume, then pack-count.
+HTML_MULTIPACK_RE = re.compile(
+    r"\b(\d+)\s*x\s*(\d+(?:\.\d+)?)\s*(g|ml|kg|l|cl)\b", re.I
+)
+HTML_WEIGHT_VOLUME_RE = re.compile(
+    r"\b(\d+(?:\.\d+)?)\s*(kg|g|ml|cl|l|ltr|litre|liter)\b", re.I
+)
+HTML_PACK_RE = re.compile(r"\b(\d+)\s*(pack|pk)\b", re.I)
+
+# Variant tokens we use to gate ambiguous matches against the Lidl page title.
+VARIANT_TOKENS = (
+    "light",
+    "real",
+    "regular",
+    "diet",
+    "zero",
+    "decaf",
+    "organic",
+    "salted",
+    "unsalted",
+    "spreadable",
+    "low",
+    "fat",
+    "skim",
+    "skimmed",
+    "whole",
+    "smooth",
+    "crunchy",
+)
+
+
+# --------------------------------------------------------------------------- #
+# Normalisation + product-side size derivation
+# --------------------------------------------------------------------------- #
+def normalise(text: str) -> str:
+    text = text.lower().strip()
     text = MULTIPACK_RE.sub("", text)
     text = SIZE_RE.sub("", text)
     text = RATING_RE.sub("", text)
-    text = FILLER_RE.sub("", text)
+    text = FILLER.sub("", text)
     text = re.sub(r"[^a-z0-9\s]", " ", text)
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
 
-def extract_size(text: str) -> Optional[str]:
-    """Return canonical 'NNNunit' (e.g. '500g', '1.5l') or None."""
+def extract_size_from_text(text: str):
+    """Generic helper used for sitemap slugs (legacy parity)."""
     if not text:
         return None
+    m_multi = MULTIPACK_RE.search(text)
+    if m_multi:
+        return f"{m_multi.group(1)}x{m_multi.group(2).lower()}{m_multi.group(3).lower()}"
     m = SIZE_RE.search(text)
     if not m:
         return None
     return f"{m.group(1).lower()}{m.group(2).lower()}"
 
 
-# ----------------------------------------------------------------------------
-# Lidl sitemap fetch
-# ----------------------------------------------------------------------------
+def product_size(name: str, unit: str):
+    """
+    Derive a usable size for an MM product.
 
-def fetch_lidl_sitemap_urls() -> List[Dict]:
-    """Fetch + decompress Lidl sitemap and index entries."""
-    logger.info(f"Fetching Lidl sitemap: {LIDL_SITEMAP_URL}")
-    resp = requests.get(LIDL_SITEMAP_URL, headers=HEADERS, timeout=30)
-    resp.raise_for_status()
+    Priority:
+      1. From the product `name` (most reliable — curated by data team).
+      2. From `unit`, but only if it does NOT contain portion/serving/cup/etc.
+         (those are brewed-tea / serving descriptions, not pack sizes).
+    Returns None if nothing trustworthy is available.
+    """
+    s = extract_size_from_text(name or "")
+    if s:
+        return s
+    if unit and not PORTION_GUARD_RE.search(unit):
+        return extract_size_from_text(unit)
+    return None
 
-    raw = gzip.decompress(resp.content).decode("utf-8", errors="replace")
-    raw_urls = re.findall(r"<loc>([^<]+)</loc>", raw)
-    out: List[Dict] = []
-    for u in raw_urls:
-        m = re.search(r"/p/([^/]+)/p\d+", u)
+
+def variant_tokens(text: str) -> set:
+    if not text:
+        return set()
+    tokens = set(re.findall(r"[a-z]+", text.lower()))
+    return tokens & set(VARIANT_TOKENS)
+
+
+# --------------------------------------------------------------------------- #
+# Sitemap + DB
+# --------------------------------------------------------------------------- #
+def fetch_lidl_sitemap_urls():
+    req = urllib.request.Request(LIDL_SITEMAP_URL, headers={"User-Agent": USER_AGENT})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        gz = resp.read()
+    raw = gzip.decompress(gz).decode("utf-8", errors="replace")
+    urls = re.findall(r"<loc>([^<]+)</loc>", raw)
+    out = []
+    for u in urls:
+        m = re.search(r"/p/([^/]+)/p(\d+)", u)
         if not m:
             continue
         slug = m.group(1).replace("-", " ")
+        sku = m.group(2)
         out.append(
             {
                 "url": u,
                 "slug": slug,
-                "norm": normalize(slug),
-                "size": extract_size(slug),
+                "sku": sku,
+                "norm": normalise(slug),
+                "slug_size": extract_size_from_text(slug),
             }
         )
-    logger.info(f"  {len(out)} product URLs in sitemap (after slug filter)")
     return out
 
 
-# ----------------------------------------------------------------------------
-# Candidate products — two sources
-# ----------------------------------------------------------------------------
-
-CANDIDATE_SQL = """
+def query_candidate_products():
+    """Branded products that have an Aldi alias but no Lidl alias."""
+    sql = """
 SELECT p.id, p.name, COALESCE(p.brand,''), COALESCE(p.unit,'')
 FROM products p
 JOIN product_aliases a_aldi ON a_aldi.product_id = p.id AND a_aldi.store_name='Aldi'
@@ -174,162 +181,138 @@ WHERE a_lidl.id IS NULL
   AND p.brand NOT ILIKE '%aldi%'
   AND p.brand NOT ILIKE '%specially selected%'
   AND p.brand NOT ILIKE '%simply%'
-ORDER BY p.id
-{LIMIT};
+ORDER BY p.id;
 """
-
-
-def query_candidates_local(limit: Optional[int]) -> List[Dict]:
-    """VP-only path: use scripts/query_prod.sh against prod read replica."""
-    if not Path(QUERY_PROD).exists():
-        raise FileNotFoundError(
-            f"query_prod.sh not found at {QUERY_PROD}. "
-            "Use --source api or set QUERY_PROD_PATH."
-        )
-    sql = CANDIDATE_SQL.replace("{LIMIT}", f"LIMIT {limit}" if limit else "")
-    logger.info("Querying candidate products via local query_prod.sh …")
-    res = subprocess.run(
-        [QUERY_PROD, sql], capture_output=True, text=True, check=True
-    )
-    products: List[Dict] = []
+    res = subprocess.run([QUERY_PROD, sql], capture_output=True, text=True, check=True)
+    products = []
     for line in res.stdout.splitlines():
         parts = [p.strip() for p in line.split("|")]
         if len(parts) < 4 or not parts[0].isdigit():
             continue
         pid, name, brand, unit = int(parts[0]), parts[1], parts[2], parts[3]
-        text = f"{name} {unit}".strip()
+        size = product_size(name, unit)
         products.append(
             {
                 "id": pid,
                 "name": name,
                 "brand": brand,
                 "unit": unit,
-                "norm": normalize(f"{brand} {name}"),
-                "size": extract_size(text),
+                "norm": normalise(f"{brand} {name}"),
+                "size": size,
+                "variant": variant_tokens(name),
             }
         )
-    logger.info(f"  {len(products)} candidate products from local query")
     return products
 
 
-def authenticate_api() -> requests.Session:
-    """Authenticate with MasterMarket API (mirrors discover_aldi_aliases.py)."""
-    s = requests.Session()
-    resp = s.post(
-        f"{API_URL}/auth/login",
-        data={"username": USERNAME, "password": PASSWORD},
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
-        timeout=15,
-    )
-    resp.raise_for_status()
-    token = resp.json().get("access_token")
-    if not token:
-        raise RuntimeError("MM API auth response missing access_token")
-    s.headers["Authorization"] = f"Bearer {token}"
-    s.headers["User-Agent"] = HEADERS["User-Agent"]
-    return s
+# --------------------------------------------------------------------------- #
+# HTTP layer with 24h disk cache + polite delay between LIVE fetches
+# --------------------------------------------------------------------------- #
+def _cache_path_for(url: str) -> Path:
+    sku_match = re.search(r"/p(\d+)\b", url)
+    key = sku_match.group(1) if sku_match else re.sub(r"[^a-z0-9]+", "_", url.lower())
+    return CACHE_DIR / f"{key}.html"
 
 
-def query_candidates_api(limit: Optional[int]) -> List[Dict]:
-    """API path: get aliases, derive products that have Aldi but not Lidl."""
-    logger.info("Authenticating with MM API …")
-    s = authenticate_api()
+def fetch_lidl_page(url: str, fetch_log: dict) -> str | None:
+    """Returns the HTML body, or None on failure. Caches to disk for 24h."""
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    cache_path = _cache_path_for(url)
+    if cache_path.exists():
+        age = time.time() - cache_path.stat().st_mtime
+        if age < CACHE_TTL_SECONDS:
+            fetch_log["cache_hits"] = fetch_log.get("cache_hits", 0) + 1
+            return cache_path.read_text(encoding="utf-8", errors="replace")
 
-    # Step 1: page through all aliases. We need to see Aldi+Lidl ownership per product.
-    logger.info("Fetching aliases (paginated) …")
-    page_size = 1000
-    offset = 0
-    aliases: List[Dict] = []
-    while True:
-        r = s.get(
-            f"{API_URL}/api/aliases",
-            params={"limit": page_size, "offset": offset},
-            timeout=30,
+    fetch_log["live_fetch_attempts"] = fetch_log.get("live_fetch_attempts", 0) + 1
+    delay = random.uniform(LIVE_FETCH_MIN_DELAY, LIVE_FETCH_MAX_DELAY)
+    time.sleep(delay)
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+        cache_path.write_text(body, encoding="utf-8")
+        return body
+    except Exception as e:
+        fetch_log["live_fetch_failures"] = fetch_log.get("live_fetch_failures", 0) + 1
+        fetch_log.setdefault("failure_samples", []).append(
+            {"url": url, "error": f"{type(e).__name__}: {e}"}
         )
-        r.raise_for_status()
-        batch = r.json() if isinstance(r.json(), list) else r.json().get("aliases", [])
-        if not batch:
-            break
-        aliases.extend(batch)
-        if len(batch) < page_size:
-            break
-        offset += page_size
-        if offset > 50000:  # safety belt
-            logger.warning("Alias pagination cap hit at 50k — truncating.")
-            break
-    logger.info(f"  {len(aliases)} aliases total")
+        return None
 
-    by_product: Dict[int, set] = {}
-    for a in aliases:
-        pid = a.get("product_id")
-        sn = (a.get("store_name") or "").strip()
-        if pid is None or not sn:
-            continue
-        by_product.setdefault(pid, set()).add(sn)
 
-    target_pids = [
-        pid
-        for pid, stores in by_product.items()
-        if "Aldi" in stores and "Lidl" not in stores
+# --------------------------------------------------------------------------- #
+# HTML parsing — extract size + variant tokens from a Lidl page
+# --------------------------------------------------------------------------- #
+def _visible_spans(html: str) -> list[str]:
+    return [
+        s.strip()
+        for s in re.findall(r"<span[^>]*>([^<]{1,200})</span>", html)
+        if s.strip()
     ]
-    if limit:
-        target_pids = target_pids[:limit]
-    logger.info(f"  {len(target_pids)} products with Aldi alias but no Lidl alias")
 
-    # Step 2: hydrate products
-    products: List[Dict] = []
-    excluded_brands = {
-        "Aldi",
-        "Lidl",
-        "Tesco",
-        "SuperValu",
-        "Dunnes",
-        "Dunnes Stores",
-    }
-    for pid in target_pids:
+
+def extract_size_from_html(html: str) -> str | None:
+    """
+    Try in order: multipack → weight/volume → pack-count.
+    Look first inside visible <span> content; fall back to whole HTML
+    only if nothing trips on spans (avoids picking up sizes from script
+    blocks, UTM params, etc.).
+    """
+    spans = _visible_spans(html)
+    span_text = " | ".join(spans)
+    for source in (span_text, html):
+        m = HTML_MULTIPACK_RE.search(source)
+        if m:
+            return f"{m.group(1)}x{m.group(2).lower()}{m.group(3).lower()}"
+        m = HTML_WEIGHT_VOLUME_RE.search(source)
+        if m:
+            unit = m.group(2).lower()
+            unit = "l" if unit in ("ltr", "litre", "liter") else unit
+            return f"{m.group(1).lower()}{unit}"
+        m = HTML_PACK_RE.search(source)
+        if m:
+            return f"{m.group(1)}pack"
+    return None
+
+
+def extract_page_text_signals(html: str) -> dict:
+    """
+    Return tokens we can use to disambiguate collisions. We pull from:
+      - <title>...</title>
+      - JSON-LD `name`
+      - The first <h1> if present (some Lidl skins render it)
+    """
+    bits = []
+    m = re.search(r"<title[^>]*>([^<]{1,300})</title>", html)
+    if m:
+        bits.append(m.group(1))
+    m = re.search(r"<h1[^>]*>([^<]{1,300})</h1>", html)
+    if m:
+        bits.append(m.group(1))
+    for ld in re.finditer(
+        r'<script[^>]+type="application/ld\+json"[^>]*>(.*?)</script>', html, re.S
+    ):
         try:
-            r = s.get(f"{API_URL}/products/{pid}", timeout=15)
-            if r.status_code != 200:
-                continue
-            p = r.json()
-            brand = (p.get("brand") or "").strip()
-            name = (p.get("name") or "").strip()
-            unit = (p.get("unit") or "").strip()
-            if not brand or brand in excluded_brands:
-                continue
-            blow = brand.lower()
-            if (
-                "aldi" in blow
-                or "specially selected" in blow
-                or "simply" in blow
-            ):
-                continue
-            products.append(
-                {
-                    "id": pid,
-                    "name": name,
-                    "brand": brand,
-                    "unit": unit,
-                    "norm": normalize(f"{brand} {name}"),
-                    "size": extract_size(f"{name} {unit}"),
-                }
-            )
-        except requests.RequestException as e:
-            logger.debug(f"Skipped product {pid}: {e}")
+            obj = json.loads(ld.group(1))
+        except Exception:
             continue
-        # Be polite to the API
-        if len(products) % 100 == 0 and len(products) > 0:
-            time.sleep(0.2)
-    logger.info(f"  {len(products)} branded candidates after hydration")
-    return products
+        if isinstance(obj, dict) and obj.get("@type") in ("Product", "ProductGroup"):
+            n = obj.get("name")
+            if isinstance(n, str):
+                bits.append(n)
+            d = obj.get("description")
+            if isinstance(d, str):
+                bits.append(d)
+    text = " ".join(bits)
+    return {"text": text, "variant": variant_tokens(text)}
 
 
-# ----------------------------------------------------------------------------
-# Scoring
-# ----------------------------------------------------------------------------
-
-def score(product: Dict, sitemap_entry: Dict) -> float:
-    """Token-overlap with size gating, identical scoring to /tmp prototype."""
+# --------------------------------------------------------------------------- #
+# Token-overlap scoring (phase 1 candidate gating)
+# --------------------------------------------------------------------------- #
+def token_score(product, sitemap_entry):
+    """0..1 token overlap score. Used only to pick PHASE-1 candidates."""
     p_tokens = set(product["norm"].split())
     s_tokens = set(sitemap_entry["norm"].split())
     if not p_tokens or not s_tokens:
@@ -337,369 +320,220 @@ def score(product: Dict, sitemap_entry: Dict) -> float:
     overlap = len(p_tokens & s_tokens)
     union = len(p_tokens | s_tokens)
     jaccard = overlap / union if union else 0.0
-
-    brand_norm = normalize(product["brand"])
+    brand_norm = normalise(product["brand"])
     brand_bonus = 0.15 if brand_norm and brand_norm in sitemap_entry["norm"] else 0.0
-
-    if (
-        product.get("size")
-        and sitemap_entry.get("size")
-        and product["size"] != sitemap_entry["size"]
-    ):
-        return 0.0
-
     if overlap < 2:
         return 0.0
-
     return min(jaccard + brand_bonus, 1.0)
 
 
-# ----------------------------------------------------------------------------
-# JSON-LD verification — the new piece in MASA-117
-# ----------------------------------------------------------------------------
-
-LD_SIZE_PROPERTY_KEYS = {
-    "weight",
-    "size",
-    "netcontent",
-    "net content",
-    "package size",
-    "content",
-    "quantity",
-}
-
-
-def _coerce_value(v) -> str:
-    """Schema.org Quantity may be string '500 g', dict {value, unitText}, etc."""
-    if isinstance(v, str):
-        return v
-    if isinstance(v, dict):
-        val = v.get("value") or v.get("name") or ""
-        unit = v.get("unitText") or v.get("unitCode") or ""
-        return f"{val} {unit}".strip()
-    return str(v)
-
-
-def parse_jsonld_size(html: str) -> Optional[str]:
-    """Extract canonical size token (e.g. '500g') from a Lidl product page HTML.
-
-    Tries, in order:
-      1. Schema.org Product `weight`
-      2. Schema.org Product `additionalProperty` (key matches LD_SIZE_PROPERTY_KEYS)
-      3. Regex over the Product `name`
-      4. Regex over the Product `description`
-    Returns None if no size can be extracted with confidence.
+# --------------------------------------------------------------------------- #
+# Phase 2: HTML-gated resolution per URL group
+# --------------------------------------------------------------------------- #
+def resolve_url_group(url: str, candidates: list, fetch_log: dict, threshold: float):
     """
-    blocks = re.findall(
-        r'<script type="application/ld\+json"[^>]*>(.*?)</script>',
-        html,
-        re.DOTALL,
-    )
-    for raw in blocks:
-        try:
-            data = json.loads(raw.strip())
-        except json.JSONDecodeError:
-            continue
+    Given a Lidl URL and the list of MM products that scored >= threshold for it,
+    fetch the HTML, extract size + variant tokens, and return:
+      (accepted_proposal_dict | None, rejection_records: list)
 
-        # Schema.org sometimes wraps Product in @graph
-        candidates = []
-        if isinstance(data, list):
-            candidates.extend(data)
-        elif isinstance(data, dict):
-            candidates.append(data)
-            graph = data.get("@graph")
-            if isinstance(graph, list):
-                candidates.extend(graph)
-
+    Rules (zero-tolerance):
+      - HTML must yield a size. If none → reject ALL candidates with reason 'no_html_size'.
+      - For each candidate: MM size must equal HTML size. If MM size is None → reject 'unknown_mm_size'.
+      - After size filter, if multiple still match, gate by variant_tokens
+        being a subset of HTML's variant tokens. If still >1 → reject 'unresolved_variant'.
+      - Exactly one survivor → accept.
+    """
+    rejections = []
+    html = fetch_lidl_page(url, fetch_log)
+    if html is None:
         for c in candidates:
-            if not isinstance(c, dict):
-                continue
-            t = c.get("@type")
-            if isinstance(t, list):
-                is_product = any(str(x).lower() == "product" for x in t)
-            else:
-                is_product = str(t).lower() == "product"
-            if not is_product:
-                continue
-
-            # 1) explicit weight
-            if c.get("weight"):
-                size = extract_size(_coerce_value(c["weight"]))
-                if size:
-                    return size
-
-            # 2) additionalProperty
-            ap = c.get("additionalProperty")
-            if isinstance(ap, list):
-                for prop in ap:
-                    if not isinstance(prop, dict):
-                        continue
-                    pname = (prop.get("name") or prop.get("propertyID") or "").lower()
-                    if any(key in pname for key in LD_SIZE_PROPERTY_KEYS):
-                        size = extract_size(_coerce_value(prop.get("value")))
-                        if size:
-                            return size
-
-            # 3) name
-            for field in ("name", "description"):
-                size = extract_size(c.get(field, ""))
-                if size:
-                    return size
-
-    return None
-
-
-def verify_lidl_url(url: str, session: requests.Session) -> Tuple[Optional[str], bool]:
-    """Returns (size_token_or_None, page_was_reachable_bool)."""
-    try:
-        r = session.get(url, headers=HEADERS, timeout=15)
-        if r.status_code != 200:
-            logger.debug(f"  page {url} HTTP {r.status_code}")
-            return (None, False)
-        return (parse_jsonld_size(r.text), True)
-    except requests.RequestException as e:
-        logger.debug(f"  page {url} fetch error: {e}")
-        return (None, False)
-
-
-def resolve_collisions(
-    by_url: Dict[str, List[Dict]],
-    products_by_id: Dict[int, Dict],
-    session: requests.Session,
-    max_calls: int,
-) -> Tuple[List[Dict], List[Dict], List[Dict]]:
-    """For each colliding URL, fetch JSON-LD size and re-gate candidates.
-
-    Returns (recovered_proposals, still_unresolved, verified_collision_meta).
-      - recovered_proposals: collisions where exactly one MM candidate matches
-        the verified Lidl size — promoted to the unambiguous set.
-      - still_unresolved: collisions where 0 or ≥2 candidates still match
-        (or the page was unreachable / no size found).
-      - verified_collision_meta: per-URL detail for the proposal JSON audit log.
-    """
-    recovered: List[Dict] = []
-    unresolved: List[Dict] = []
-    audit: List[Dict] = []
-    calls_made = 0
-
-    for url, group in by_url.items():
-        if len(group) <= 1:
-            continue
-        if calls_made >= max_calls:
-            audit.append(
-                {"url": url, "status": "skipped_call_cap", "candidates": len(group)}
+            rejections.append(
+                {**_proposal_record(c, url, None, c["score"]), "reason": "html_fetch_failed"}
             )
-            unresolved.extend(group)
-            continue
+        return None, rejections
 
-        verified_size, reachable = verify_lidl_url(url, session)
-        calls_made += 1
-
-        record = {
-            "url": url,
-            "verified_size": verified_size,
-            "reachable": reachable,
-            "candidate_count": len(group),
-        }
-
-        if not reachable or not verified_size:
-            record["status"] = "no_size_extracted"
-            audit.append(record)
-            unresolved.extend(group)
-            continue
-
-        # Re-gate: only candidates whose own size matches the verified Lidl size pass.
-        passing = [
-            p
-            for p in group
-            if products_by_id[p["product_id"]].get("size") == verified_size
-        ]
-        if len(passing) == 1:
-            winner = passing[0]
-            winner = {**winner, "lidl_verified_size": verified_size}
-            recovered.append(winner)
-            record["status"] = "resolved_to_one"
-            record["winner_product_id"] = winner["product_id"]
-        else:
-            record["status"] = (
-                "still_ambiguous"
-                if passing
-                else "no_candidate_matches_verified_size"
+    html_size = extract_size_from_html(html)
+    if not html_size:
+        fetch_log["no_size_in_html"] = fetch_log.get("no_size_in_html", 0) + 1
+        for c in candidates:
+            rejections.append(
+                {**_proposal_record(c, url, None, c["score"]), "reason": "no_html_size"}
             )
-            record["passing_count"] = len(passing)
-            unresolved.extend(group)
+        return None, rejections
 
-        audit.append(record)
-        time.sleep(0.5)  # be nice to Lidl
+    page_signals = extract_page_text_signals(html)
 
-    return recovered, unresolved, audit
-
-
-# ----------------------------------------------------------------------------
-# Main
-# ----------------------------------------------------------------------------
-
-def parse_args() -> argparse.Namespace:
-    ap = argparse.ArgumentParser(description="Discover Lidl URLs for MM products.")
-    ap.add_argument(
-        "--source",
-        choices=["api", "local"],
-        default="api",
-        help="Where to read candidate products from. 'local' uses query_prod.sh.",
-    )
-    ap.add_argument("--limit", type=int, default=None, help="Cap candidate volume.")
-    ap.add_argument(
-        "--threshold",
-        type=float,
-        default=0.55,
-        help="Minimum match score to keep a proposal (0..1).",
-    )
-    ap.add_argument(
-        "--no-verify-collisions",
-        action="store_true",
-        help="Skip JSON-LD verification for collision URLs.",
-    )
-    ap.add_argument(
-        "--max-verify-calls",
-        type=int,
-        default=200,
-        help="Cap on Lidl page fetches during collision verification.",
-    )
-    ap.add_argument(
-        "--output-dir",
-        default=".",
-        help="Where to write the proposal JSON. Defaults to cwd.",
-    )
-    return ap.parse_args()
-
-
-def main() -> int:
-    args = parse_args()
-    started_at = datetime.now(timezone.utc)
-
-    # 1. Sitemap
-    try:
-        sitemap = fetch_lidl_sitemap_urls()
-    except Exception as e:
-        logger.error(f"Sitemap fetch failed: {e}")
-        return 2
-
-    # 2. Candidates
-    try:
-        if args.source == "local":
-            products = query_candidates_local(args.limit)
+    # Step 1: size filter.
+    survivors = []
+    for c in candidates:
+        if c["size"] is None:
+            rejections.append(
+                {**_proposal_record(c, url, html_size, c["score"]), "reason": "unknown_mm_size"}
+            )
+            continue
+        if c["size"].lower() == html_size.lower():
+            survivors.append(c)
         else:
-            products = query_candidates_api(args.limit)
-    except Exception as e:
-        logger.error(f"Candidate query failed ({args.source}): {e}")
-        return 3
+            rejections.append(
+                {**_proposal_record(c, url, html_size, c["score"]), "reason": "size_mismatch"}
+            )
 
-    if not products:
-        logger.warning("No candidate products — nothing to match. Exiting clean.")
+    if not survivors:
+        return None, rejections
 
-    products_by_id = {p["id"]: p for p in products}
+    if len(survivors) == 1:
+        return _proposal_record(survivors[0], url, html_size, survivors[0]["score"]), rejections
 
-    # 3. Score
-    proposals: List[Dict] = []
-    for prod in products:
-        best: Tuple[float, Optional[Dict]] = (0.0, None)
-        for entry in sitemap:
-            s = score(prod, entry)
-            if s > best[0]:
-                best = (s, entry)
-        if best[1] and best[0] >= args.threshold:
-            proposals.append(
+    # Step 2: variant-token gate. Each survivor must declare a non-empty variant
+    # set that is a subset of the page's variant tokens (e.g. MM "Light" matches
+    # page "Light", but MM "Real" against a "Light"-only page is rejected).
+    page_variants = page_signals["variant"]
+    final = []
+    for c in survivors:
+        if not c["variant"]:
+            # No variant signal on MM side — keep, but treat as ambiguous if peer has variant info.
+            final.append((c, "no_variant"))
+        elif c["variant"].issubset(page_variants):
+            final.append((c, "variant_match"))
+        else:
+            rejections.append(
                 {
-                    "product_id": prod["id"],
-                    "product_name": prod["name"],
-                    "product_brand": prod["brand"],
-                    "product_size": prod.get("size"),
-                    "lidl_url": best[1]["url"],
-                    "lidl_slug": best[1]["slug"],
-                    "lidl_size": best[1].get("size"),
-                    "confidence": round(best[0], 3),
+                    **_proposal_record(c, url, html_size, c["score"]),
+                    "reason": "variant_mismatch",
+                    "page_variants": sorted(page_variants),
                 }
             )
-    proposals.sort(key=lambda p: -p["confidence"])
-    logger.info(f"Raw matches above threshold {args.threshold}: {len(proposals)}")
 
-    # 4. Detect collisions
-    by_url: Dict[str, List[Dict]] = {}
-    for p in proposals:
-        by_url.setdefault(p["lidl_url"], []).append(p)
-    unambiguous = [g[0] for g in by_url.values() if len(g) == 1]
-    collisions = [g for g in by_url.values() if len(g) > 1]
-    logger.info(
-        f"Unambiguous: {len(unambiguous)} | "
-        f"colliding URLs: {len(collisions)} (covering {sum(len(g) for g in collisions)} candidates)"
-    )
+    if len(final) == 1:
+        c, _ = final[0]
+        return _proposal_record(c, url, html_size, c["score"]), rejections
 
-    # 5. JSON-LD verification (the MASA-117 addition)
-    verification_audit: List[Dict] = []
-    recovered: List[Dict] = []
-    rejected_collisions: List[Dict] = []
-    if collisions and not args.no_verify_collisions:
-        logger.info(
-            f"Verifying {len(collisions)} collision URLs via JSON-LD …"
-        )
-        verify_session = requests.Session()
-        recovered, rejected_collisions, verification_audit = resolve_collisions(
-            by_url, products_by_id, verify_session, args.max_verify_calls
-        )
-        logger.info(
-            f"  recovered (size disambiguated): {len(recovered)} | "
-            f"still ambiguous: {len(rejected_collisions)}"
-        )
-    else:
-        rejected_collisions = [p for g in collisions for p in g]
-        if collisions:
-            logger.info("Skipping collision verification (per --no-verify-collisions)")
-
-    final_proposals = sorted(
-        unambiguous + recovered, key=lambda p: -p["confidence"]
-    )
-
-    # 6. Emit JSON
-    out_dir = Path(args.output_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / f"lidl_discovery_{started_at.strftime('%Y%m%d_%H%M%S')}.json"
-    out_path.write_text(
-        json.dumps(
+    # Still >1 — unresolved.
+    for c, _ in final:
+        rejections.append(
             {
-                "generated_at": started_at.isoformat(),
-                "source": args.source,
-                "sitemap_url_count": len(sitemap),
-                "candidate_product_count": len(products),
-                "threshold": args.threshold,
-                "raw_match_count": len(proposals),
-                "unambiguous_count": len(unambiguous),
-                "collision_url_count": len(collisions),
-                "collision_resolved_count": len(recovered),
-                "collision_unresolved_count": len(rejected_collisions),
-                "proposals": final_proposals,
-                "rejected_collisions": rejected_collisions,
-                "verification_audit": verification_audit,
-            },
-            indent=2,
+                **_proposal_record(c, url, html_size, c["score"]),
+                "reason": "unresolved_variant",
+                "page_variants": sorted(page_variants),
+            }
         )
-    )
-    logger.info(f"Wrote {out_path}")
-    print(f"\nWrote {out_path}")
-    print(f"  unambiguous (slug-only): {len(unambiguous)}")
-    print(f"  recovered (JSON-LD size verified): {len(recovered)}")
-    print(f"  total promotable proposals: {len(final_proposals)}")
-    print(f"  unresolved collisions: {len(rejected_collisions)}")
-    if final_proposals[:15]:
-        print("\nTop proposals:")
-        for p in final_proposals[:15]:
-            tag = " (verified)" if "lidl_verified_size" in p else ""
-            print(
-                f"  [{p['confidence']:.2f}] {p['product_brand']} :: "
-                f"{p['product_name'][:60]}{tag}  →  {p['lidl_url']}"
-            )
+    return None, rejections
 
-    return 0
+
+def _proposal_record(product, url, lidl_size, score):
+    return {
+        "product_id": product["id"],
+        "product_name": product["name"],
+        "product_brand": product["brand"],
+        "product_size": product["size"],
+        "product_variant": sorted(product["variant"]),
+        "lidl_url": url,
+        "lidl_size": lidl_size,
+        "confidence": round(score, 3),
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Main
+# --------------------------------------------------------------------------- #
+def main():
+    print(f"[{datetime.utcnow().isoformat()}] Fetching Lidl sitemap …", file=sys.stderr)
+    sitemap = fetch_lidl_sitemap_urls()
+    print(f"  {len(sitemap)} product URLs in sitemap", file=sys.stderr)
+
+    print(f"[{datetime.utcnow().isoformat()}] Querying candidate products …", file=sys.stderr)
+    products = query_candidate_products()
+    print(
+        f"  {len(products)} branded products with Aldi alias but no Lidl alias",
+        file=sys.stderr,
+    )
+    products_with_known_size = sum(1 for p in products if p["size"])
+    print(
+        f"  {products_with_known_size} of those have a derivable size "
+        f"(after portion-guard)",
+        file=sys.stderr,
+    )
+
+    threshold = 0.55
+    # Phase 1 — token overlap candidates per URL.
+    by_url: dict[str, list] = {}
+    for prod in products:
+        for entry in sitemap:
+            s = token_score(prod, entry)
+            if s >= threshold:
+                by_url.setdefault(entry["url"], []).append({**prod, "score": s})
+
+    # Phase 2 — HTML-gated resolution per URL group.
+    fetch_log: dict = {}
+    proposals: list = []
+    rejected: list = []
+    for url, group in by_url.items():
+        accepted, rejs = resolve_url_group(url, group, fetch_log, threshold)
+        if accepted:
+            proposals.append(accepted)
+        rejected.extend(rejs)
+
+    proposals.sort(key=lambda p: -p["confidence"])
+
+    # Final invariant: NO proposal may have null lidl_size (acceptance criterion).
+    bad = [p for p in proposals if not p.get("lidl_size")]
+    if bad:
+        # Defensive: should be impossible given resolve_url_group, but assert anyway.
+        for p in bad:
+            rejected.append({**p, "reason": "null_lidl_size_post_resolve"})
+        proposals = [p for p in proposals if p.get("lidl_size")]
+
+    out = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "sitemap_url_count": len(sitemap),
+        "candidate_product_count": len(products),
+        "candidates_with_known_size": products_with_known_size,
+        "threshold": threshold,
+        "phase1_url_groups": len(by_url),
+        "html_fetch": {
+            "live_attempts": fetch_log.get("live_fetch_attempts", 0),
+            "live_failures": fetch_log.get("live_fetch_failures", 0),
+            "cache_hits": fetch_log.get("cache_hits", 0),
+            "no_size_in_html": fetch_log.get("no_size_in_html", 0),
+            "failure_samples": fetch_log.get("failure_samples", [])[:5],
+        },
+        "unambiguous_count": len(proposals),
+        "rejected_count": len(rejected),
+        "rejection_breakdown": _summarise_reasons(rejected),
+        "proposals": proposals,
+        "rejected": rejected,
+    }
+    out_path = Path(
+        f"/tmp/lidl_proposal_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.json"
+    )
+    out_path.write_text(json.dumps(out, indent=2))
+    print(f"\nWrote {out_path}")
+    print(f"  phase1 url groups: {len(by_url)}")
+    print(f"  live fetches: {fetch_log.get('live_fetch_attempts', 0)} "
+          f"(failures={fetch_log.get('live_fetch_failures', 0)}, "
+          f"cache_hits={fetch_log.get('cache_hits', 0)})")
+    print(f"  no_size_in_html: {fetch_log.get('no_size_in_html', 0)}")
+    print(f"  unambiguous: {len(proposals)}")
+    print(f"  rejected: {len(rejected)}")
+    print("  rejection breakdown:")
+    for reason, n in _summarise_reasons(rejected).items():
+        print(f"    {reason}: {n}")
+    print("\nUnambiguous proposals (top 15):")
+    for p in proposals[:15]:
+        print(
+            f"  [{p['confidence']:.2f}] {p['product_brand']} :: "
+            f"{p['product_name'][:60]}  →  {p['lidl_url']}  "
+            f"(MM={p['product_size']}, Lidl={p['lidl_size']})"
+        )
+
+
+def _summarise_reasons(records: list) -> dict:
+    out: dict = {}
+    for r in records:
+        reason = r.get("reason", "unknown")
+        out[reason] = out.get(reason, 0) + 1
+    return dict(sorted(out.items(), key=lambda kv: -kv[1]))
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
