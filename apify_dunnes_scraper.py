@@ -443,64 +443,79 @@ class ApifyDunnesScraper:
         text_to_search = promo_text if promo_text else html_lower
 
         # === 1. DETECT MULTI-BUY OFFERS (Primary for Dunnes) ===
+        # MASA-115: require strict mechanic regex with explicit `.\d{2}` cents
+        # format. Pre-fix the bare `(\d+) for (\d+)` pattern matched random
+        # body copy ("3 for 2 portions"), producing 2,547 noise rows in the
+        # `multi_buy` bucket since 2026-01.
+        def _bundle_math_ok(qty, total):
+            if current_price is None:
+                return True
+            if not current_price or qty < 1 or total <= 0:
+                return False
+            per_unit = total / qty
+            return current_price * 0.5 <= per_unit <= current_price * 1.05
+
         multibuy_patterns = [
-            # Standard "Buy X for Y" format
-            (r'buy\s*(\d+)\s*for\s*[^\d]*(\d+(?:[.,]\d{2})?)', 'buy_x_for'),
-            # "Any X for Y" format (Mix & Match style)
-            (r'(?:mix\s*&?\s*match\s+)?any\s*(\d+)\s*for\s*[^\d]*(\d+(?:[.,]\d{2})?)', 'any_x_for'),
-            # Standard "X for Y" without "buy"
-            (r'(\d+)\s*for\s*[^\d]*(\d+(?:[.,]\d{2})?)', 'x_for'),
-            # "Buy X get Y free" style
-            (r'buy\s*(\d+)\s*get\s*(\d+)\s*free', 'bogo'),
-            # "3 for 2" style (buy 3 pay for 2)
-            (r'(\d+)\s*for\s*(\d+)\s*\*', 'x_for_y'),
+            (r'buy\s*(\d+)\s*for\s*€?\s*(\d+[.,]\d{2})\b', 'buy_x_for'),
+            (r'(?:mix\s*&?\s*match\s+)?any\s*(\d+)\s*for\s*€?\s*(\d+[.,]\d{2})\b', 'any_x_for'),
+            (r'buy\s*(\d+)\s*get\s*(\d+)\s*free\b', 'bogo'),
         ]
 
         for pattern, ptype in multibuy_patterns:
             match = re.search(pattern, text_to_search)
-            if match:
-                groups = match.groups()
+            if not match:
+                continue
+            groups = match.groups()
 
-                if ptype == 'buy_x_for' and len(groups) >= 2:
-                    qty = groups[0]
-                    price = groups[1].replace(',', '.')
-                    if '.' not in price:
-                        price += '.00'
-                    promotion_data['promotion_type'] = 'multi_buy'
-                    promotion_data['promotion_text'] = f'Buy {qty} for {price}'
-                    return promotion_data
+            if ptype == 'buy_x_for' and len(groups) >= 2:
+                qty = int(groups[0])
+                price = float(groups[1].replace(',', '.'))
+                if not _bundle_math_ok(qty, price):
+                    continue
+                promotion_data['promotion_type'] = 'multi_buy'
+                promotion_data['promotion_text'] = f'Buy {qty} for {price:.2f}'
+                return promotion_data
 
-                elif ptype == 'any_x_for' and len(groups) >= 2:
-                    qty = groups[0]
-                    price = groups[1].replace(',', '.')
-                    if '.' not in price:
-                        price += '.00'
-                    promotion_data['promotion_type'] = 'multi_buy'
-                    promotion_data['promotion_text'] = f'Any {qty} for {price}'
-                    return promotion_data
+            elif ptype == 'any_x_for' and len(groups) >= 2:
+                qty = int(groups[0])
+                price = float(groups[1].replace(',', '.'))
+                if not _bundle_math_ok(qty, price):
+                    continue
+                promotion_data['promotion_type'] = 'multi_buy'
+                promotion_data['promotion_text'] = f'Any {qty} for {price:.2f}'
+                return promotion_data
 
-                elif ptype == 'x_for' and len(groups) >= 2:
-                    qty = groups[0]
-                    price = groups[1].replace(',', '.')
-                    if '.' not in price:
-                        price += '.00'
-                    promotion_data['promotion_type'] = 'multi_buy'
-                    promotion_data['promotion_text'] = f'{qty} for {price}'
-                    return promotion_data
+            elif ptype == 'bogo' and len(groups) >= 2:
+                buy_qty = groups[0]
+                free_qty = groups[1]
+                promotion_data['promotion_type'] = 'multi_buy'
+                promotion_data['promotion_text'] = f'Buy {buy_qty} Get {free_qty} Free'
+                return promotion_data
 
-                elif ptype == 'bogo' and len(groups) >= 2:
-                    buy_qty = groups[0]
-                    free_qty = groups[1]
-                    promotion_data['promotion_type'] = 'multi_buy'
-                    promotion_data['promotion_text'] = f'Buy {buy_qty} Get {free_qty} Free'
-                    return promotion_data
-
-                elif ptype == 'x_for_y' and len(groups) >= 2:
-                    qty_buy = groups[0]
-                    qty_pay = groups[1]
-                    promotion_data['promotion_type'] = 'multi_buy'
-                    promotion_data['promotion_text'] = f'Buy {qty_buy} for {qty_pay}'
-                    return promotion_data
+        # MASA-115: gate fixed_amount_off / percentage_off on parseable
+        # was/now evidence. Decorative "Save €X" / "25% Off" copy renders on
+        # non-discounted Dunnes products. Audit (MASA-113) found 1,680
+        # fixed_amount_off + 417 percentage_off historical noise rows tagged
+        # without any actual reduction.
+        original_price_evidence = None
+        if current_price:
+            was_patterns = [
+                r'was\s*€?\s*(\d+[.,]\d{2})',
+                r'original\s*price[:\s]*€?\s*(\d+[.,]\d{2})',
+                r'<s\b[^>]*>\s*€?\s*(\d+[.,]\d{2})',
+                r'<del\b[^>]*>\s*€?\s*(\d+[.,]\d{2})',
+            ]
+            for wp in was_patterns:
+                for m in re.finditer(wp, text_to_search):
+                    try:
+                        candidate = float(m.group(1).replace(',', '.'))
+                    except (ValueError, IndexError):
+                        continue
+                    if candidate > current_price:
+                        original_price_evidence = round(candidate, 2)
+                        break
+                if original_price_evidence is not None:
+                    break
 
         # === 2. DETECT PERCENTAGE DISCOUNTS ===
         percentage_patterns = [
@@ -512,22 +527,31 @@ class ApifyDunnesScraper:
 
         for pattern in percentage_patterns:
             match = re.search(pattern, text_to_search)
-            if match:
-                if 'half' in pattern:
-                    promotion_data['promotion_type'] = 'percentage_off'
-                    promotion_data['promotion_text'] = 'Half Price'
-                    promotion_data['promotion_discount_value'] = 50.0
-                    return promotion_data
-                else:
-                    try:
-                        discount_pct = float(match.group(1))
-                        if 0 < discount_pct <= 90:
-                            promotion_data['promotion_type'] = 'percentage_off'
-                            promotion_data['promotion_text'] = f'{int(discount_pct)}% Off'
-                            promotion_data['promotion_discount_value'] = discount_pct
-                            return promotion_data
-                    except (ValueError, IndexError):
-                        continue
+            if not match:
+                continue
+            if original_price_evidence is None:
+                # Decorative badge — drop. Don't try other patterns either.
+                break
+            if 'half' in pattern:
+                promotion_data['promotion_type'] = 'percentage_off'
+                promotion_data['promotion_text'] = 'Half Price'
+                promotion_data['original_price'] = original_price_evidence
+                promotion_data['promotion_discount_value'] = round(
+                    original_price_evidence - current_price, 2
+                )
+                return promotion_data
+            try:
+                discount_pct = float(match.group(1))
+            except (ValueError, IndexError):
+                continue
+            if 0 < discount_pct <= 90:
+                promotion_data['promotion_type'] = 'percentage_off'
+                promotion_data['promotion_text'] = f'{int(discount_pct)}% Off'
+                promotion_data['original_price'] = original_price_evidence
+                promotion_data['promotion_discount_value'] = round(
+                    original_price_evidence - current_price, 2
+                )
+                return promotion_data
 
         # === 3. DETECT FIXED AMOUNT SAVINGS ===
         savings_patterns = [
@@ -538,16 +562,22 @@ class ApifyDunnesScraper:
 
         for pattern in savings_patterns:
             match = re.search(pattern, text_to_search)
-            if match:
-                try:
-                    discount_amount = float(match.group(1).replace(',', '.'))
-                    if 0 < discount_amount < 100:
-                        promotion_data['promotion_type'] = 'fixed_amount_off'
-                        promotion_data['promotion_text'] = f'Save {discount_amount:.2f}'
-                        promotion_data['promotion_discount_value'] = discount_amount
-                        return promotion_data
-                except ValueError:
-                    continue
+            if not match:
+                continue
+            if original_price_evidence is None:
+                break  # Decorative badge — drop bucket entirely.
+            try:
+                discount_amount = float(match.group(1).replace(',', '.'))
+            except ValueError:
+                continue
+            if 0 < discount_amount < 100:
+                promotion_data['promotion_type'] = 'fixed_amount_off'
+                promotion_data['promotion_text'] = f'Save {discount_amount:.2f}'
+                promotion_data['original_price'] = original_price_evidence
+                promotion_data['promotion_discount_value'] = round(
+                    original_price_evidence - current_price, 2
+                )
+                return promotion_data
 
         # === 4. DETECT "WAS/NOW" PRICING ===
         # Check for original price from the actor data first

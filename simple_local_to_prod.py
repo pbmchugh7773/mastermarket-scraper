@@ -681,6 +681,89 @@ class SimpleLocalScraper:
 
         return page_source.lower()
 
+    def _extract_dunnes_product_scope(self, page_source: str) -> str:
+        """
+        Return the lowercased HTML of the Dunnes product-detail region only.
+
+        Dunnes PDPs render "Customers also bought" / "Related products" carousels
+        whose multi-buy offers belonged to OTHER products and contaminated the
+        full-page regex in detect_dunnes_promotion_data (e.g. a €1.99 pizza was
+        tagged with "Buy 2 for €11.50" coming from a different carousel item).
+        Scoping detection to the product-detail container eliminates that source
+        of false positives. Falls back to <main>, then to the full page_source.
+        """
+        try:
+            soup = BeautifulSoup(page_source, 'html.parser')
+        except Exception:
+            return page_source.lower()
+
+        candidates = [
+            {'name': 'div', 'attrs': {'class': re.compile(r'product[-_]?detail', re.I)}},
+            {'name': 'section', 'attrs': {'class': re.compile(r'product[-_]?detail', re.I)}},
+            {'name': 'div', 'attrs': {'data-testid': re.compile(r'product[-_]?detail', re.I)}},
+            {'name': 'div', 'attrs': {'class': re.compile(r'pdp[-_]', re.I)}},
+            {'name': 'div', 'attrs': {'class': re.compile(r'product[-_]?info', re.I)}},
+            {'name': 'main', 'attrs': {}},
+        ]
+
+        for candidate in candidates:
+            node = soup.find(candidate['name'], **({'attrs': candidate['attrs']} if candidate['attrs'] else {}))
+            if node:
+                return str(node).lower()
+
+        return page_source.lower()
+
+    def _is_plausible_multibuy(self, qty: int, total: float, current_price: Optional[float]) -> bool:
+        """
+        Sanity-check a detected multi-buy (qty, total) against the product's
+        current unit price. A real multi-buy offers a discount, so the deal's
+        per-unit price must be ≤ current_price (with 5% tolerance for rounding)
+        and ≥ 50% of current_price (retail grocery deals rarely exceed -50%).
+        If current_price is unknown, accept (rely on DOM scoping alone).
+        """
+        if current_price is None:
+            return True
+        if not current_price or qty < 1 or total <= 0:
+            return False
+        per_unit = total / qty
+        return current_price * 0.5 <= per_unit <= current_price * 1.05
+
+    def _find_dunnes_original_price(
+        self, html_lower: str, current_price: Optional[float]
+    ) -> Optional[float]:
+        """
+        Search the (already DOM-scoped) Dunnes HTML for evidence of a real
+        original/was price. Used to gate percentage_off and fixed_amount_off
+        promotion tagging — Dunnes renders decorative "Save €X" / "25% Off"
+        copy even on non-discounted products (MASA-113), so the badge text
+        alone is not sufficient evidence of a real promotion.
+
+        Returns the parsed original_price ONLY if it is strictly greater than
+        current_price. Otherwise returns None.
+        """
+        if not current_price:
+            return None
+        # Word boundary `\b` after `<s` / `<del` is critical — without it,
+        # `<s[^>]*>` greedily matches `<span ...>` and the helper ends up
+        # parsing the *current* price as the original price.
+        was_patterns = [
+            r'was\s*€\s*(\d+[.,]\d{2})',
+            r'original\s*price[:\s]*€\s*(\d+[.,]\d{2})',
+            r'<s\b[^>]*>\s*€?\s*(\d+[.,]\d{2})',
+            r'<del\b[^>]*>\s*€?\s*(\d+[.,]\d{2})',
+            r'class="[^"]*was[^"]*"[^>]*>[^€]*€\s*(\d+[.,]\d{2})',
+            r'class="[^"]*original[^"]*"[^>]*>[^€]*€\s*(\d+[.,]\d{2})',
+        ]
+        for pattern in was_patterns:
+            for match in re.finditer(pattern, html_lower):
+                try:
+                    original_price = float(match.group(1).replace(',', '.'))
+                except (ValueError, IndexError):
+                    continue
+                if original_price > current_price:
+                    return round(original_price, 2)
+        return None
+
     def detect_aldi_promotion_data(self, page_source: str, current_price: float = None) -> dict:
         """
         Detect and extract promotion information from Aldi Ireland product pages
@@ -1162,21 +1245,24 @@ class SimpleLocalScraper:
             'offer_valid_to': None
         }
 
-        html_lower = html_content.lower()
+        html_lower = self._extract_dunnes_product_scope(html_content)
 
         # === 1. DETECT MULTI-BUY OFFERS (Primary for Dunnes) ===
         # Patterns: "Buy 3 for €10", "Mix & Match any 3 for €10", "Any 3 for €10", etc.
 
+        # MASA-115: require strict mechanic regex with explicit `.\d{2}` cents
+        # format. Dunnes promotional badges always render bundle prices as
+        # "€5.00", never bare "€5" — requiring two-decimal format filters out
+        # spurious matches like "1 for 1" hidden in body copy. The bare
+        # `(\d+) for (\d+)` "x_for" variant was the worst offender pre-fix,
+        # matching anything from review counts to size selectors.
         multibuy_patterns = [
-            # Standard "Buy X for €Y" format
-            (r'buy\s*(\d+)\s*for\s*€\s*(\d+(?:[.,]\d{2})?)', 'buy_x_for'),
-            # "Any X for €Y" format (Mix & Match style)
-            (r'(?:mix\s*&?\s*match\s+)?any\s*(\d+)\s*for\s*€\s*(\d+(?:[.,]\d{2})?)', 'any_x_for'),
-            # Standard "X for €Y" without "buy"
-            (r'(\d+)\s*for\s*€\s*(\d+(?:[.,]\d{2})?)', 'x_for'),
-            # "Buy X get Y free" / "3 for 2" style (buy 3 pay for 2)
-            (r'buy\s*(\d+)\s*get\s*(\d+)\s*free', 'bogo'),
-            (r'(\d+)\s*for\s*(\d+)\s*\*', 'x_for_y'),  # "3 for 2*"
+            # Standard "Buy X for €Y.YY" format
+            (r'buy\s*(\d+)\s*for\s*€\s*(\d+[.,]\d{2})\b', 'buy_x_for'),
+            # "Any X for €Y.YY" / "Mix & Match any X for €Y.YY"
+            (r'(?:mix\s*&?\s*match\s+)?any\s*(\d+)\s*for\s*€\s*(\d+[.,]\d{2})\b', 'any_x_for'),
+            # "Buy X get Y free" — no price, but explicit mechanic
+            (r'buy\s*(\d+)\s*get\s*(\d+)\s*free\b', 'bogo'),
         ]
 
         for pattern, ptype in multibuy_patterns:
@@ -1190,6 +1276,9 @@ class SimpleLocalScraper:
                     # Add .00 if no decimal
                     if '.' not in price:
                         price += '.00'
+                    if not self._is_plausible_multibuy(int(qty), float(price), current_price):
+                        logger.info(f"🚫 Dunnes multi-buy rejected (inconsistent with €{current_price}): Buy {qty} for €{price}")
+                        continue
                     promotion_data['promotion_type'] = 'multi_buy'
                     promotion_data['promotion_text'] = f'Buy {qty} for €{price}'
                     logger.info(f"🏷️ Dunnes multi-buy detected: {promotion_data['promotion_text']}")
@@ -1200,19 +1289,12 @@ class SimpleLocalScraper:
                     price = groups[1].replace(',', '.')
                     if '.' not in price:
                         price += '.00'
+                    if not self._is_plausible_multibuy(int(qty), float(price), current_price):
+                        logger.info(f"🚫 Dunnes Mix & Match rejected (inconsistent with €{current_price}): Any {qty} for €{price}")
+                        continue
                     promotion_data['promotion_type'] = 'multi_buy'
                     promotion_data['promotion_text'] = f'Any {qty} for €{price}'
                     logger.info(f"🏷️ Dunnes Mix & Match detected: {promotion_data['promotion_text']}")
-                    break
-
-                elif ptype == 'x_for' and len(groups) >= 2:
-                    qty = groups[0]
-                    price = groups[1].replace(',', '.')
-                    if '.' not in price:
-                        price += '.00'
-                    promotion_data['promotion_type'] = 'multi_buy'
-                    promotion_data['promotion_text'] = f'{qty} for €{price}'
-                    logger.info(f"🏷️ Dunnes multi-buy detected: {promotion_data['promotion_text']}")
                     break
 
                 elif ptype == 'bogo' and len(groups) >= 2:
@@ -1221,14 +1303,6 @@ class SimpleLocalScraper:
                     promotion_data['promotion_type'] = 'multi_buy'
                     promotion_data['promotion_text'] = f'Buy {buy_qty} Get {free_qty} Free'
                     logger.info(f"🏷️ Dunnes BOGO detected: {promotion_data['promotion_text']}")
-                    break
-
-                elif ptype == 'x_for_y' and len(groups) >= 2:
-                    qty_buy = groups[0]
-                    qty_pay = groups[1]
-                    promotion_data['promotion_type'] = 'multi_buy'
-                    promotion_data['promotion_text'] = f'Buy {qty_buy} for {qty_pay}'
-                    logger.info(f"🏷️ Dunnes Buy X for Y detected: {promotion_data['promotion_text']}")
                     break
 
         # === 2. DETECT OFFER VALIDITY PERIOD ===
@@ -1278,28 +1352,51 @@ class SimpleLocalScraper:
             r'half\s*price',
         ]
 
+        # MASA-115: percentage_off may only be tagged if the page contains
+        # parseable evidence of a real reduction (was/now/strikethrough with
+        # original_price > current_price). Dunnes renders decorative "25% Off"
+        # / "Half Price" copy on non-discounted PDPs; the audit found 417
+        # historical noise rows in this bucket vs 0 real ones. Without
+        # original_price evidence, leave promotion_type NULL.
+        original_price_evidence = self._find_dunnes_original_price(html_lower, current_price)
+
         if not promotion_data['promotion_type']:  # Don't override multi-buy
             for pattern in percentage_patterns:
                 match = re.search(pattern, html_lower)
-                if match:
-                    # Check for half price pattern (no capture group)
-                    if 'half' in pattern:
-                        promotion_data['promotion_type'] = 'percentage_off'
-                        promotion_data['promotion_text'] = 'Half Price'
-                        promotion_data['promotion_discount_value'] = 50.0
-                        logger.info(f"🏷️ Dunnes half price detected")
-                        break
-                    else:
-                        try:
-                            discount_pct = float(match.group(1))
-                            if 0 < discount_pct <= 90:
-                                promotion_data['promotion_type'] = 'percentage_off'
-                                promotion_data['promotion_text'] = f'{int(discount_pct)}% Off'
-                                promotion_data['promotion_discount_value'] = discount_pct
-                                logger.info(f"🏷️ Dunnes percentage discount: {int(discount_pct)}%")
-                                break
-                        except (ValueError, IndexError):
-                            continue
+                if not match:
+                    continue
+                if original_price_evidence is None:
+                    logger.info(
+                        "🚫 Dunnes percentage_off badge ignored — no was/now "
+                        "evidence on PDP (likely decorative copy)"
+                    )
+                    break
+                # Check for half price pattern (no capture group)
+                if 'half' in pattern:
+                    promotion_data['promotion_type'] = 'percentage_off'
+                    promotion_data['promotion_text'] = 'Half Price'
+                    promotion_data['original_price'] = original_price_evidence
+                    promotion_data['promotion_discount_value'] = round(
+                        original_price_evidence - current_price, 2
+                    )
+                    logger.info(f"🏷️ Dunnes half price detected (was €{original_price_evidence:.2f})")
+                    break
+                try:
+                    discount_pct = float(match.group(1))
+                except (ValueError, IndexError):
+                    continue
+                if 0 < discount_pct <= 90:
+                    promotion_data['promotion_type'] = 'percentage_off'
+                    promotion_data['promotion_text'] = f'{int(discount_pct)}% Off'
+                    promotion_data['original_price'] = original_price_evidence
+                    promotion_data['promotion_discount_value'] = round(
+                        original_price_evidence - current_price, 2
+                    )
+                    logger.info(
+                        f"🏷️ Dunnes percentage discount: {int(discount_pct)}% "
+                        f"(was €{original_price_evidence:.2f})"
+                    )
+                    break
 
         # === 4. DETECT FIXED AMOUNT SAVINGS ===
 
@@ -1310,20 +1407,37 @@ class SimpleLocalScraper:
             r'reduction[:\s]*€\s*(\d+[.,]\d{2})',
         ]
 
+        # MASA-115: fixed_amount_off requires the same was/now evidence as
+        # percentage_off. The audit found 1,680 historical noise rows in this
+        # bucket vs 0 real ones — "Save €0.50" badges render site-wide on
+        # Dunnes without indicating an actual reduction.
         if not promotion_data['promotion_type']:  # Don't override existing types
             for pattern in savings_patterns:
                 match = re.search(pattern, html_lower)
-                if match:
-                    try:
-                        discount_amount = float(match.group(1).replace(',', '.'))
-                        if 0 < discount_amount < 100:
-                            promotion_data['promotion_type'] = 'fixed_amount_off'
-                            promotion_data['promotion_text'] = f'Save €{discount_amount:.2f}'
-                            promotion_data['promotion_discount_value'] = discount_amount
-                            logger.info(f"🏷️ Dunnes fixed discount: €{discount_amount:.2f}")
-                            break
-                    except ValueError:
-                        continue
+                if not match:
+                    continue
+                if original_price_evidence is None:
+                    logger.info(
+                        "🚫 Dunnes fixed_amount_off badge ignored — no was/now "
+                        "evidence on PDP (likely decorative copy)"
+                    )
+                    break
+                try:
+                    discount_amount = float(match.group(1).replace(',', '.'))
+                except ValueError:
+                    continue
+                if 0 < discount_amount < 100:
+                    promotion_data['promotion_type'] = 'fixed_amount_off'
+                    promotion_data['promotion_text'] = f'Save €{discount_amount:.2f}'
+                    promotion_data['original_price'] = original_price_evidence
+                    promotion_data['promotion_discount_value'] = round(
+                        original_price_evidence - current_price, 2
+                    )
+                    logger.info(
+                        f"🏷️ Dunnes fixed discount: €{discount_amount:.2f} "
+                        f"(was €{original_price_evidence:.2f})"
+                    )
+                    break
 
         # === 5. DETECT "WAS/NOW" PRICING ===
         # Pattern: Original price before discount
@@ -1332,8 +1446,8 @@ class SimpleLocalScraper:
             was_patterns = [
                 r'was\s*€\s*(\d+[.,]\d{2})',
                 r'original\s*price[:\s]*€\s*(\d+[.,]\d{2})',
-                r'<s[^>]*>\s*€?\s*(\d+[.,]\d{2})',  # Strikethrough
-                r'<del[^>]*>\s*€?\s*(\d+[.,]\d{2})',  # Deleted price
+                r'<s\b[^>]*>\s*€?\s*(\d+[.,]\d{2})',  # Strikethrough (\b stops <span match)
+                r'<del\b[^>]*>\s*€?\s*(\d+[.,]\d{2})',  # Deleted price
                 r'class="[^"]*was[^"]*"[^>]*>[^€]*€\s*(\d+[.,]\d{2})',
                 r'class="[^"]*original[^"]*"[^>]*>[^€]*€\s*(\d+[.,]\d{2})',
             ]

@@ -28,12 +28,14 @@ const PRICE_PATTERNS = [
     /"amount"[:\s]*"?(\d+[.,]\d{2})"?/i,
 ];
 
-// Multi-buy promotion patterns
+// Multi-buy promotion patterns.
+// MASA-115: require explicit `.\d{2}` cents — bare `(\d+) for (\d+)` was
+// matching arbitrary body copy ("3 for 2 portions of cereal"). Bundle math
+// is also validated against the current price before tagging.
 const MULTIBUY_PATTERNS = [
-    { pattern: /buy\s*(\d+)\s*for\s*€?\s*(\d+(?:[.,]\d{2})?)/i, type: 'buy_x_for' },
-    { pattern: /(?:mix\s*&?\s*match\s+)?any\s*(\d+)\s*for\s*€?\s*(\d+(?:[.,]\d{2})?)/i, type: 'any_x_for' },
-    { pattern: /(\d+)\s*for\s*€?\s*(\d+(?:[.,]\d{2})?)/i, type: 'x_for' },
-    { pattern: /buy\s*(\d+)\s*get\s*(\d+)\s*free/i, type: 'bogo' },
+    { pattern: /buy\s*(\d+)\s*for\s*€?\s*(\d+[.,]\d{2})\b/i, type: 'buy_x_for' },
+    { pattern: /(?:mix\s*&?\s*match\s+)?any\s*(\d+)\s*for\s*€?\s*(\d+[.,]\d{2})\b/i, type: 'any_x_for' },
+    { pattern: /buy\s*(\d+)\s*get\s*(\d+)\s*free\b/i, type: 'bogo' },
 ];
 
 // Percentage discount patterns
@@ -49,10 +51,14 @@ const SAVINGS_PATTERNS = [
     /€?\s*(\d+[.,]\d{2})\s*off/i,
 ];
 
-// Was/Now price patterns
+// Was/Now price patterns. `\b` after `<s` / `<del` is critical — without
+// it, `<s[^>]*>` greedily matches `<span ...>` and we'd parse the current
+// price as the original.
 const WAS_PATTERNS = [
     /was\s*€?\s*(\d+[.,]\d{2})/i,
     /original\s*price[:\s]*€?\s*(\d+[.,]\d{2})/i,
+    /<s\b[^>]*>\s*€?\s*(\d+[.,]\d{2})/i,
+    /<del\b[^>]*>\s*€?\s*(\d+[.,]\d{2})/i,
 ];
 
 /**
@@ -81,6 +87,43 @@ function extractPrice(text) {
 }
 
 /**
+ * Sanity-check a detected multi-buy (qty, total) against the product's
+ * current unit price. Per-unit must be ≤ current_price (5% rounding
+ * tolerance) and ≥ 50% (retail grocery deals rarely exceed -50%). If
+ * currentPrice is unknown, accept.
+ */
+function isPlausibleMultibuy(qty, total, currentPrice) {
+    if (currentPrice == null) return true;
+    if (!currentPrice || qty < 1 || total <= 0) return false;
+    const perUnit = total / qty;
+    return currentPrice * 0.5 <= perUnit && perUnit <= currentPrice * 1.05;
+}
+
+/**
+ * Search HTML for evidence of a real original/was price. Used to gate
+ * percentage_off / fixed_amount_off — Dunnes renders decorative "Save €X"
+ * / "25% Off" badges on non-discounted PDPs (MASA-113), so the badge text
+ * alone is not sufficient evidence of a real promotion.
+ *
+ * Returns the parsed original price ONLY if strictly greater than
+ * currentPrice. Otherwise returns null.
+ */
+function findOriginalPrice(htmlLower, currentPrice) {
+    if (!currentPrice) return null;
+    for (const pattern of WAS_PATTERNS) {
+        const re = new RegExp(pattern.source, 'gi');
+        let m;
+        while ((m = re.exec(htmlLower)) !== null) {
+            const candidate = parseFloat(m[1].replace(',', '.'));
+            if (Number.isFinite(candidate) && candidate > currentPrice) {
+                return Math.round(candidate * 100) / 100;
+            }
+        }
+    }
+    return null;
+}
+
+/**
  * Detect promotion data from page content
  */
 function detectPromotion(html, currentPrice) {
@@ -93,75 +136,86 @@ function detectPromotion(html, currentPrice) {
 
     const htmlLower = html.toLowerCase();
 
-    // 1. Check for multi-buy promotions (highest priority for Dunnes)
+    // 1. Multi-buy (highest priority for Dunnes). Strict mechanic regex +
+    //    bundle-math validation (MASA-115). Pre-fix the loose `(\d+) for
+    //    (\d+)` pattern matched random body copy.
     for (const { pattern, type } of MULTIBUY_PATTERNS) {
         const match = htmlLower.match(pattern);
-        if (match) {
-            if (type === 'buy_x_for' || type === 'any_x_for' || type === 'x_for') {
-                const qty = match[1];
-                let price = match[2].replace(',', '.');
-                if (!price.includes('.')) price += '.00';
+        if (!match) continue;
 
-                const prefix = type === 'any_x_for' ? 'Any ' : (type === 'buy_x_for' ? 'Buy ' : '');
-                result.promotionType = 'multi_buy';
-                result.promotionText = `${prefix}${qty} for €${price}`;
-                return result;
-            } else if (type === 'bogo') {
-                result.promotionType = 'multi_buy';
-                result.promotionText = `Buy ${match[1]} Get ${match[2]} Free`;
-                return result;
+        if (type === 'buy_x_for' || type === 'any_x_for') {
+            const qty = parseInt(match[1], 10);
+            const price = parseFloat(match[2].replace(',', '.'));
+            if (!isPlausibleMultibuy(qty, price, currentPrice)) {
+                continue;
             }
+            const prefix = type === 'any_x_for' ? 'Any' : 'Buy';
+            result.promotionType = 'multi_buy';
+            result.promotionText = `${prefix} ${qty} for €${price.toFixed(2)}`;
+            return result;
+        } else if (type === 'bogo') {
+            result.promotionType = 'multi_buy';
+            result.promotionText = `Buy ${match[1]} Get ${match[2]} Free`;
+            return result;
         }
     }
 
-    // 2. Check for percentage discounts
+    // 2. Was/Now evidence — required to gate percentage_off / fixed_amount_off.
+    //    MASA-113 audit: 1,680 fixed_amount_off + 417 percentage_off historical
+    //    rows tagged on non-discounted Dunnes products since 2026-01.
+    const originalPrice = findOriginalPrice(htmlLower, currentPrice);
+
+    // 3. Percentage discounts — only if was/now evidence is present.
     for (const pattern of PERCENTAGE_PATTERNS) {
         const match = htmlLower.match(pattern);
-        if (match) {
-            if (pattern.source.includes('half')) {
-                result.promotionType = 'percentage_off';
-                result.promotionText = 'Half Price';
-                result.promotionDiscountValue = 50.0;
-                return result;
-            } else {
-                const discount = parseFloat(match[1]);
-                if (discount > 0 && discount <= 90) {
-                    result.promotionType = 'percentage_off';
-                    result.promotionText = `${Math.round(discount)}% Off`;
-                    result.promotionDiscountValue = discount;
-                    return result;
-                }
-            }
+        if (!match) continue;
+        if (originalPrice == null) {
+            // Decorative badge, drop bucket entirely.
+            break;
+        }
+        if (pattern.source.includes('half')) {
+            result.promotionType = 'percentage_off';
+            result.promotionText = 'Half Price';
+            result.originalPrice = originalPrice;
+            result.promotionDiscountValue = Math.round((originalPrice - currentPrice) * 100) / 100;
+            return result;
+        }
+        const discount = parseFloat(match[1]);
+        if (discount > 0 && discount <= 90) {
+            result.promotionType = 'percentage_off';
+            result.promotionText = `${Math.round(discount)}% Off`;
+            result.originalPrice = originalPrice;
+            result.promotionDiscountValue = Math.round((originalPrice - currentPrice) * 100) / 100;
+            return result;
         }
     }
 
-    // 3. Check for fixed amount savings
+    // 4. Fixed amount savings — only if was/now evidence is present.
     for (const pattern of SAVINGS_PATTERNS) {
         const match = htmlLower.match(pattern);
-        if (match) {
-            const amount = parseFloat(match[1].replace(',', '.'));
-            if (amount > 0 && amount < 100) {
-                result.promotionType = 'fixed_amount_off';
-                result.promotionText = `Save €${amount.toFixed(2)}`;
-                result.promotionDiscountValue = amount;
-                return result;
-            }
+        if (!match) continue;
+        if (originalPrice == null) {
+            break;
+        }
+        const amount = parseFloat(match[1].replace(',', '.'));
+        if (amount > 0 && amount < 100) {
+            result.promotionType = 'fixed_amount_off';
+            result.promotionText = `Save €${amount.toFixed(2)}`;
+            result.originalPrice = originalPrice;
+            result.promotionDiscountValue = Math.round((originalPrice - currentPrice) * 100) / 100;
+            return result;
         }
     }
 
-    // 4. Check for was/now pricing
-    for (const pattern of WAS_PATTERNS) {
-        const match = htmlLower.match(pattern);
-        if (match) {
-            const originalPrice = parseFloat(match[1].replace(',', '.'));
-            if (currentPrice && originalPrice > currentPrice) {
-                result.originalPrice = originalPrice;
-                result.promotionType = 'temporary_discount';
-                result.promotionText = `Was €${originalPrice.toFixed(2)}`;
-                result.promotionDiscountValue = Math.round((originalPrice - currentPrice) * 100) / 100;
-                return result;
-            }
-        }
+    // 5. Standalone was/now (no badge text) — surface as a temporary_discount
+    //    so downstream callers still get an originalPrice when a strikethrough
+    //    is present without an explicit "Save €X" badge.
+    if (originalPrice != null) {
+        result.originalPrice = originalPrice;
+        result.promotionType = 'temporary_discount';
+        result.promotionText = `Was €${originalPrice.toFixed(2)}`;
+        result.promotionDiscountValue = Math.round((originalPrice - currentPrice) * 100) / 100;
+        return result;
     }
 
     return result;
