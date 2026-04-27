@@ -1265,43 +1265,76 @@ class SimpleLocalScraper:
             (r'buy\s*(\d+)\s*get\s*(\d+)\s*free\b', 'bogo'),
         ]
 
+        # MASA-115 follow-up (MASA-130 verifier): bundle math also writes the
+        # per-unit deal back as `price_override` so the row ships with
+        # price = X/N (deal unit) and original_price = current_price (shelf).
+        # Pre-fix all 58 multi_buy production rows had price == original_price.
         for pattern, ptype in multibuy_patterns:
             match = re.search(pattern, html_lower)
             if match:
                 groups = match.groups()
 
                 if ptype == 'buy_x_for' and len(groups) >= 2:
-                    qty = groups[0]
-                    price = groups[1].replace(',', '.')
-                    # Add .00 if no decimal
-                    if '.' not in price:
-                        price += '.00'
-                    if not self._is_plausible_multibuy(int(qty), float(price), current_price):
-                        logger.info(f"🚫 Dunnes multi-buy rejected (inconsistent with €{current_price}): Buy {qty} for €{price}")
+                    qty_str = groups[0]
+                    total_str = groups[1].replace(',', '.')
+                    if '.' not in total_str:
+                        total_str += '.00'
+                    qty = int(qty_str)
+                    total = float(total_str)
+                    if not self._is_plausible_multibuy(qty, total, current_price):
+                        logger.info(f"🚫 Dunnes multi-buy rejected (inconsistent with €{current_price}): Buy {qty} for €{total_str}")
                         continue
                     promotion_data['promotion_type'] = 'multi_buy'
-                    promotion_data['promotion_text'] = f'Buy {qty} for €{price}'
+                    promotion_data['promotion_text'] = f'Buy {qty} for €{total_str}'
+                    if current_price and qty > 0:
+                        per_unit = round(total / qty, 2)
+                        if per_unit < current_price:
+                            promotion_data['price_override'] = per_unit
+                            promotion_data['original_price'] = round(current_price, 2)
+                            promotion_data['promotion_discount_value'] = round(
+                                current_price - per_unit, 2
+                            )
                     logger.info(f"🏷️ Dunnes multi-buy detected: {promotion_data['promotion_text']}")
                     break
 
                 elif ptype == 'any_x_for' and len(groups) >= 2:
-                    qty = groups[0]
-                    price = groups[1].replace(',', '.')
-                    if '.' not in price:
-                        price += '.00'
-                    if not self._is_plausible_multibuy(int(qty), float(price), current_price):
-                        logger.info(f"🚫 Dunnes Mix & Match rejected (inconsistent with €{current_price}): Any {qty} for €{price}")
+                    qty_str = groups[0]
+                    total_str = groups[1].replace(',', '.')
+                    if '.' not in total_str:
+                        total_str += '.00'
+                    qty = int(qty_str)
+                    total = float(total_str)
+                    if not self._is_plausible_multibuy(qty, total, current_price):
+                        logger.info(f"🚫 Dunnes Mix & Match rejected (inconsistent with €{current_price}): Any {qty} for €{total_str}")
                         continue
                     promotion_data['promotion_type'] = 'multi_buy'
-                    promotion_data['promotion_text'] = f'Any {qty} for €{price}'
+                    promotion_data['promotion_text'] = f'Any {qty} for €{total_str}'
+                    if current_price and qty > 0:
+                        per_unit = round(total / qty, 2)
+                        if per_unit < current_price:
+                            promotion_data['price_override'] = per_unit
+                            promotion_data['original_price'] = round(current_price, 2)
+                            promotion_data['promotion_discount_value'] = round(
+                                current_price - per_unit, 2
+                            )
                     logger.info(f"🏷️ Dunnes Mix & Match detected: {promotion_data['promotion_text']}")
                     break
 
                 elif ptype == 'bogo' and len(groups) >= 2:
-                    buy_qty = groups[0]
-                    free_qty = groups[1]
+                    buy_qty = int(groups[0])
+                    free_qty = int(groups[1])
                     promotion_data['promotion_type'] = 'multi_buy'
                     promotion_data['promotion_text'] = f'Buy {buy_qty} Get {free_qty} Free'
+                    if current_price and buy_qty > 0 and free_qty > 0:
+                        per_unit = round(
+                            (current_price * buy_qty) / (buy_qty + free_qty), 2
+                        )
+                        if per_unit < current_price:
+                            promotion_data['price_override'] = per_unit
+                            promotion_data['original_price'] = round(current_price, 2)
+                            promotion_data['promotion_discount_value'] = round(
+                                current_price - per_unit, 2
+                            )
                     logger.info(f"🏷️ Dunnes BOGO detected: {promotion_data['promotion_text']}")
                     break
 
@@ -3404,6 +3437,11 @@ class SimpleLocalScraper:
                     promotion_text = scraper_promotion_data.get('promotion_text')
                     promotion_discount_value = scraper_promotion_data.get('promotion_discount_value')
                     original_price = scraper_promotion_data.get('original_price')
+                    # Multi-buy bundle math (MASA-115 follow-up): override the
+                    # shelf price with the per-unit deal price when the detector
+                    # produced one. Otherwise the row ships with price == orig.
+                    if scraper_promotion_data.get('price_override') is not None:
+                        price = scraper_promotion_data['price_override']
                     if promotion_type:
                         logger.info(f"🏷️ {store_name} promotion detected: {promotion_type} - {promotion_text}")
 

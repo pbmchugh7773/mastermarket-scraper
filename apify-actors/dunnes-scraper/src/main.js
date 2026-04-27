@@ -139,23 +139,51 @@ function detectPromotion(html, currentPrice) {
     // 1. Multi-buy (highest priority for Dunnes). Strict mechanic regex +
     //    bundle-math validation (MASA-115). Pre-fix the loose `(\d+) for
     //    (\d+)` pattern matched random body copy.
+    //
+    //    MASA-115 follow-up (MASA-130 verifier): bundle math also writes the
+    //    per-unit deal back as `priceOverride` so the result's `price` is the
+    //    deal unit (X/N) and `originalPrice` is the regular shelf unit. Without
+    //    this, rows ship with price == original_price == shelf and fail the
+    //    "real reduction evidence" exit criterion (58/58 noisy in prod 24h).
     for (const { pattern, type } of MULTIBUY_PATTERNS) {
         const match = htmlLower.match(pattern);
         if (!match) continue;
 
         if (type === 'buy_x_for' || type === 'any_x_for') {
             const qty = parseInt(match[1], 10);
-            const price = parseFloat(match[2].replace(',', '.'));
-            if (!isPlausibleMultibuy(qty, price, currentPrice)) {
+            const total = parseFloat(match[2].replace(',', '.'));
+            if (!isPlausibleMultibuy(qty, total, currentPrice)) {
                 continue;
             }
             const prefix = type === 'any_x_for' ? 'Any' : 'Buy';
             result.promotionType = 'multi_buy';
-            result.promotionText = `${prefix} ${qty} for €${price.toFixed(2)}`;
+            result.promotionText = `${prefix} ${qty} for €${total.toFixed(2)}`;
+            if (currentPrice && qty > 0) {
+                const perUnit = Math.round((total / qty) * 100) / 100;
+                if (perUnit < currentPrice) {
+                    result.priceOverride = perUnit;
+                    result.originalPrice = Math.round(currentPrice * 100) / 100;
+                    result.promotionDiscountValue =
+                        Math.round((currentPrice - perUnit) * 100) / 100;
+                }
+            }
             return result;
         } else if (type === 'bogo') {
+            const buyQty = parseInt(match[1], 10);
+            const freeQty = parseInt(match[2], 10);
             result.promotionType = 'multi_buy';
-            result.promotionText = `Buy ${match[1]} Get ${match[2]} Free`;
+            result.promotionText = `Buy ${buyQty} Get ${freeQty} Free`;
+            if (currentPrice && buyQty > 0 && freeQty > 0) {
+                const perUnit = Math.round(
+                    ((currentPrice * buyQty) / (buyQty + freeQty)) * 100,
+                ) / 100;
+                if (perUnit < currentPrice) {
+                    result.priceOverride = perUnit;
+                    result.originalPrice = Math.round(currentPrice * 100) / 100;
+                    result.promotionDiscountValue =
+                        Math.round((currentPrice - perUnit) * 100) / 100;
+                }
+            }
             return result;
         }
     }
@@ -470,11 +498,18 @@ const crawler = new PuppeteerCrawler({
         // Detect promotions
         const promotionData = detectPromotion(html, price);
 
+        // Multi-buy bundle math (MASA-115 follow-up) may override the unit
+        // price with the deal price (total/qty). When set, ship the deal unit
+        // as `price` and the regular shelf unit as `originalPrice`.
+        const finalPrice = promotionData.priceOverride != null
+            ? promotionData.priceOverride
+            : price;
+
         // Build result object
         const result = {
             url,
             title: productTitle,
-            price,
+            price: finalPrice,
             originalPrice: promotionData.originalPrice,
             promotionType: promotionData.promotionType,
             promotionText: promotionData.promotionText,
@@ -482,7 +517,7 @@ const crawler = new PuppeteerCrawler({
             scrapedAt: new Date().toISOString(),
         };
 
-        log.info(`Scraped: ${productTitle} - €${price}${promotionData.promotionType ? ` (${promotionData.promotionText})` : ''}`);
+        log.info(`Scraped: ${productTitle} - €${finalPrice}${promotionData.promotionType ? ` (${promotionData.promotionText})` : ''}`);
 
         // Save to dataset
         await Dataset.pushData(result);

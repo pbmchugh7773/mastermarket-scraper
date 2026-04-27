@@ -177,6 +177,58 @@ class DunnesPromotionDetectionTests(unittest.TestCase):
         self.assertEqual(result['promotion_type'], 'fixed_amount_off')
         self.assertEqual(result['original_price'], 2.79)
 
+    # ---------------------------------------------------------------------
+    # MASA-115 follow-up (MASA-130 verifier): bundle math for multi_buy must
+    # write back original_price + price_override so the row ships with
+    # price < original_price. Pre-fix shipped 58/58 multi_buy rows in last
+    # 24h with price == original_price (regex worked, bundle math didn't).
+    # ---------------------------------------------------------------------
+
+    def test_multibuy_writes_per_unit_price_and_original_price(self) -> None:
+        """Any 3 for €5.00 on €1.99 shelf → per_unit ≈ €1.67, original = €1.99."""
+        html = _load('dunnes_real_multibuy.html')
+        result = self.scraper.detect_dunnes_promotion_data(html, current_price=1.99)
+        self.assertEqual(result['promotion_type'], 'multi_buy')
+        self.assertEqual(result['original_price'], 1.99)
+        self.assertEqual(result['price_override'], 1.67)
+        self.assertAlmostEqual(result['promotion_discount_value'], 0.32, places=2)
+
+    def test_multibuy_buy_x_for_y_writes_per_unit_override(self) -> None:
+        """Buy 2 for €4.50 on €2.99 shelf → per_unit €2.25, original = €2.99.
+        This is the exact pattern that produced 27/58 noisy prod rows."""
+        html = """
+        <html><body><main>
+          <div class="product-detail">
+            <h1>Multi Buy Test</h1>
+            <span class="ProductPrice">€2.99</span>
+            <span class="promo-badge">Buy 2 for €4.50</span>
+          </div>
+        </main></body></html>
+        """
+        result = self.scraper.detect_dunnes_promotion_data(html, current_price=2.99)
+        self.assertEqual(result['promotion_type'], 'multi_buy')
+        self.assertEqual(result['original_price'], 2.99)
+        self.assertEqual(result['price_override'], 2.25)
+        self.assertAlmostEqual(result['promotion_discount_value'], 0.74, places=2)
+
+    def test_multibuy_no_override_when_per_unit_equals_shelf(self) -> None:
+        """Buy 2 for €3.98 on €1.99 shelf → per_unit = €1.99 (no actual discount).
+        Should still classify but NOT set price_override / original_price."""
+        html = """
+        <html><body><main>
+          <div class="product-detail">
+            <h1>Trivial Multi Buy</h1>
+            <span class="ProductPrice">€1.99</span>
+            <span class="promo-badge">Buy 2 for €3.98</span>
+          </div>
+        </main></body></html>
+        """
+        result = self.scraper.detect_dunnes_promotion_data(html, current_price=1.99)
+        self.assertEqual(result['promotion_type'], 'multi_buy')
+        self.assertIsNone(result.get('price_override'))
+        # original_price stays None — caller falls back to shelf price.
+        self.assertIsNone(result.get('original_price'))
+
     def test_loose_x_for_y_pattern_no_longer_matches(self) -> None:
         """Pre-fix, the bare `(\\d+) for (\\d+)` pattern matched random body
         copy and a "1 for 1" / "3 for 2" string would tag a multi_buy with

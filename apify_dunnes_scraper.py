@@ -467,29 +467,60 @@ class ApifyDunnesScraper:
                 continue
             groups = match.groups()
 
+            # MASA-115 follow-up (MASA-130 verifier): bundle math also writes
+            # the per-unit deal back as `price_override` so the row ships with
+            # price = X/N (deal unit) and original_price = current_price (shelf
+            # unit). Pre-fix shipped 58/58 multi_buy rows with price == original
+            # and failed the "real reduction evidence" exit criterion.
             if ptype == 'buy_x_for' and len(groups) >= 2:
                 qty = int(groups[0])
-                price = float(groups[1].replace(',', '.'))
-                if not _bundle_math_ok(qty, price):
+                total = float(groups[1].replace(',', '.'))
+                if not _bundle_math_ok(qty, total):
                     continue
                 promotion_data['promotion_type'] = 'multi_buy'
-                promotion_data['promotion_text'] = f'Buy {qty} for {price:.2f}'
+                promotion_data['promotion_text'] = f'Buy {qty} for {total:.2f}'
+                if current_price and qty > 0:
+                    per_unit = round(total / qty, 2)
+                    if per_unit < current_price:
+                        promotion_data['price_override'] = per_unit
+                        promotion_data['original_price'] = round(current_price, 2)
+                        promotion_data['promotion_discount_value'] = round(
+                            current_price - per_unit, 2
+                        )
                 return promotion_data
 
             elif ptype == 'any_x_for' and len(groups) >= 2:
                 qty = int(groups[0])
-                price = float(groups[1].replace(',', '.'))
-                if not _bundle_math_ok(qty, price):
+                total = float(groups[1].replace(',', '.'))
+                if not _bundle_math_ok(qty, total):
                     continue
                 promotion_data['promotion_type'] = 'multi_buy'
-                promotion_data['promotion_text'] = f'Any {qty} for {price:.2f}'
+                promotion_data['promotion_text'] = f'Any {qty} for {total:.2f}'
+                if current_price and qty > 0:
+                    per_unit = round(total / qty, 2)
+                    if per_unit < current_price:
+                        promotion_data['price_override'] = per_unit
+                        promotion_data['original_price'] = round(current_price, 2)
+                        promotion_data['promotion_discount_value'] = round(
+                            current_price - per_unit, 2
+                        )
                 return promotion_data
 
             elif ptype == 'bogo' and len(groups) >= 2:
-                buy_qty = groups[0]
-                free_qty = groups[1]
+                buy_qty = int(groups[0])
+                free_qty = int(groups[1])
                 promotion_data['promotion_type'] = 'multi_buy'
                 promotion_data['promotion_text'] = f'Buy {buy_qty} Get {free_qty} Free'
+                if current_price and buy_qty > 0 and free_qty > 0:
+                    per_unit = round(
+                        (current_price * buy_qty) / (buy_qty + free_qty), 2
+                    )
+                    if per_unit < current_price:
+                        promotion_data['price_override'] = per_unit
+                        promotion_data['original_price'] = round(current_price, 2)
+                        promotion_data['promotion_discount_value'] = round(
+                            current_price - per_unit, 2
+                        )
                 return promotion_data
 
         # MASA-115: gate fixed_amount_off / percentage_off on parseable
@@ -683,6 +714,11 @@ class ApifyDunnesScraper:
         if promotion_data.get('promotion_type'):
             result['promotion_type'] = promotion_data['promotion_type']
             result['promotion_text'] = promotion_data['promotion_text']
+            # Multi-buy bundle math may override the unit price with the deal
+            # unit (X/N). When set, ship price=deal_unit, original_price=shelf
+            # so the row passes the MASA-130 "real reduction" exit criterion.
+            if promotion_data.get('price_override') is not None:
+                result['price'] = promotion_data['price_override']
             if promotion_data.get('original_price'):
                 result['original_price'] = promotion_data['original_price']
             if promotion_data.get('promotion_discount_value'):
