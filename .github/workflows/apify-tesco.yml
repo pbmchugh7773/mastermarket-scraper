@@ -70,7 +70,55 @@ jobs:
             ARGS="$ARGS --dry-run"
           fi
 
+          set -o pipefail
           python apify_tesco_scraper.py $ARGS 2>&1 | tee apify_scraper.log
+
+      - name: 🩺 Validate scrape success
+        if: always()
+        # Loud-fail health check (MASA-108). Detects silent ingestion failures
+        # like the MASA-106 4h outage where every API call returned 401 but the
+        # workflow reported success. Hard-fails the job if:
+        #   - log file missing (scraper crashed pre-logging)
+        #   - "Authentication failed:" > 0 (initial auth fatal)
+        #   - TOTAL > 0 and UPLOADS < 5% of TOTAL (silent failure)
+        #   - 401-retry-thrashing > 50 (post-MASA-106 helper running hot)
+        run: |
+          set -u
+          LOG="apify_scraper.log"
+          if [ ! -f "$LOG" ]; then
+            echo "::error::Log file $LOG not found — scraper crashed before producing logs."
+            exit 1
+          fi
+
+          AUTH_FAILS=$(grep -cE "Authentication failed:" "$LOG" || true)
+          AUTH_RETRIES=$(grep -cE "401 on .* re-authenticating and retrying" "$LOG" || true)
+          TOTAL=$(grep -E "Total aliases:\s+[0-9]+" "$LOG" | grep -oE "[0-9]+" | tail -1)
+          UPLOADS=$(grep -E "Prices uploaded:\s+[0-9]+" "$LOG" | grep -oE "[0-9]+" | tail -1)
+          TOTAL=${TOTAL:-0}
+          UPLOADS=${UPLOADS:-0}
+
+          echo "::notice::tesco health: total_aliases=$TOTAL uploads=$UPLOADS auth_fails=$AUTH_FAILS auth_retries=$AUTH_RETRIES"
+
+          FAIL=0
+          if [ "$AUTH_FAILS" -gt 0 ]; then
+            echo "::error::tesco: $AUTH_FAILS fatal auth failures detected."
+            FAIL=1
+          fi
+          if [ "$AUTH_RETRIES" -gt 50 ]; then
+            echo "::error::tesco: $AUTH_RETRIES 401-retry events — JWT TTL likely too short, MASA-107 territory."
+            FAIL=1
+          fi
+          if [ "$TOTAL" -gt 0 ]; then
+            PCT=$(( UPLOADS * 100 / TOTAL ))
+            if [ "$UPLOADS" -lt 5 ] || [ "$PCT" -lt 5 ]; then
+              echo "::error::tesco: silent-ingestion alarm — $UPLOADS uploads from $TOTAL aliases (${PCT}%, threshold 5%)."
+              FAIL=1
+            fi
+          fi
+          if [ "$FAIL" -ne 0 ]; then
+            exit 1
+          fi
+          echo "✅ tesco health check passed: $UPLOADS/$TOTAL uploaded, $AUTH_FAILS fatal auth fails, $AUTH_RETRIES re-auth events."
 
       - name: Upload logs
         if: always()

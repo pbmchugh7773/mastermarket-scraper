@@ -161,14 +161,71 @@ jobs:
           # Start virtual display for headless Chrome
           Xvfb :99 -screen 0 1920x1080x24 > /dev/null 2>&1 &
 
-          # Run the scraper with appropriate mode
+          # Run the scraper with appropriate mode.
+          # tee output to a log file so the validation step (and artifact upload)
+          # can grep for auth-failure patterns and upload counts. Selenium scraper
+          # uses logging.basicConfig (stderr only); without `2>&1 | tee` no log
+          # file exists for post-run validation.
+          set -o pipefail
           python simple_local_to_prod.py \
             --store "$STORE_NAME" \
             --products "$MAX_PRODUCTS" \
-            $EXTRA_FLAGS
+            $EXTRA_FLAGS 2>&1 | tee "scrape_${STORE_NAME}.log"
 
           echo "✅ ${{ matrix.store }} scraping ($RUN_TYPE mode) completed at: $(date)"
-      
+
+      - name: 🩺 Validate scrape success (${{ matrix.store }})
+        if: always()
+        env:
+          STORE_NAME: ${{ matrix.store }}
+        # Loud-fail health check (MASA-108). Detects silent ingestion failures
+        # like the MASA-106 4h outage where every API call returned 401 but the
+        # workflow reported success. Hard-fails the job if:
+        #   - log file missing (scraper crashed pre-logging)
+        #   - "❌ Authentication failed/error" > 0 (initial auth fatal)
+        #   - PROCESSED > 0 and UPLOADS < 5% of PROCESSED (silent failure)
+        #   - 401-retry-thrashing > 50 (post-MASA-106 helper running hot ⇒ JWT TTL too short)
+        # Skips upload-percent check if PROCESSED = 0 (retry-mode no-op is valid).
+        run: |
+          set -u
+          LOG="scrape_${STORE_NAME}.log"
+          if [ ! -f "$LOG" ]; then
+            echo "::error::Log file $LOG not found — scraper crashed before producing logs."
+            exit 1
+          fi
+
+          AUTH_FAILS=$(grep -cE "❌ Authentication (failed|error)" "$LOG" || true)
+          AUTH_RETRIES=$(grep -cE "Got 401 on .* token expired mid-run" "$LOG" || true)
+          # No leading anchor — Python logger prefixes lines with `timestamp - INFO -`,
+          # but "Processed:" / "Uploaded:" only appears in the end-of-run summary block.
+          PROCESSED=$(grep -E "Processed:\s+[0-9]+" "$LOG" | grep -oE "Processed:\s+[0-9]+" | grep -oE "[0-9]+" | tail -1)
+          UPLOADS=$(grep -E "Uploaded:\s+[0-9]+" "$LOG" | grep -oE "Uploaded:\s+[0-9]+" | grep -oE "[0-9]+" | tail -1)
+          PROCESSED=${PROCESSED:-0}
+          UPLOADS=${UPLOADS:-0}
+
+          echo "::notice::${STORE_NAME} health: processed=$PROCESSED uploads=$UPLOADS auth_fails=$AUTH_FAILS auth_retries=$AUTH_RETRIES"
+
+          FAIL=0
+          if [ "$AUTH_FAILS" -gt 0 ]; then
+            echo "::error::${STORE_NAME}: $AUTH_FAILS fatal auth failures detected (initial login or unrecoverable 401)."
+            FAIL=1
+          fi
+          if [ "$AUTH_RETRIES" -gt 50 ]; then
+            echo "::error::${STORE_NAME}: $AUTH_RETRIES 401-retry events — JWT TTL likely too short, MASA-107 territory."
+            FAIL=1
+          fi
+          if [ "$PROCESSED" -gt 0 ]; then
+            PCT=$(( UPLOADS * 100 / PROCESSED ))
+            if [ "$UPLOADS" -lt 5 ] || [ "$PCT" -lt 5 ]; then
+              echo "::error::${STORE_NAME}: silent-ingestion alarm — $UPLOADS uploads from $PROCESSED processed (${PCT}%, threshold 5%)."
+              FAIL=1
+            fi
+          fi
+          if [ "$FAIL" -ne 0 ]; then
+            exit 1
+          fi
+          echo "✅ ${STORE_NAME} health check passed: $UPLOADS/$PROCESSED uploaded, $AUTH_FAILS fatal auth fails, $AUTH_RETRIES re-auth events."
+
       - name: 📊 Upload Results Summary
         if: always()
         uses: actions/upload-artifact@v4
