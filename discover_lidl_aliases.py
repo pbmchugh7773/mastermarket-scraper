@@ -1,23 +1,31 @@
 #!/usr/bin/env python3
 """
-Lidl URL Discovery for MasterMarket — v2 (MASA-119).
+Lidl URL Discovery for MasterMarket — v3 (MASA-135).
 
-Changes vs v1:
-  * Per-candidate HTML fetch with size extraction from visible spans
-    (Lidl JSON-LD does NOT expose pack size; rendered HTML does — see MASA-116).
-  * Mandatory size gate: a Lidl proposal MUST carry a non-null lidl_size.
-  * Collision disambiguation: when several MM products map to one Lidl URL,
-    fetch HTML once and keep only candidates whose size matches AND whose
-    variant tokens are compatible with the page title.
-  * 24h disk cache at ~/.cache/mastermarket/lidl_html/<sku>.html for re-runs.
-  * 0.5–1.5s polite delay between LIVE fetches (skipped on cache hits).
-  * Product-side size derivation: try the name first; fall back to `unit`
-    only if name yields nothing AND `unit` is not "1 portion (200ml)" garbage
-    (portion|serving|cup|glass|slice|bowl in unit → treat as unknown).
+v2 (MASA-119) groundwork preserved:
+  * Per-candidate HTML fetch with size extraction from visible spans.
+  * Mandatory size gate (non-null lidl_size).
+  * Variant-token collision disambiguation.
+  * 24h disk cache + 0.5–1.5s polite delay.
+  * Product-side `product_size()` honoring the portion-guard rule.
 
-Output: /tmp/lidl_proposal_<timestamp>.json — proposal-only, NO DB writes.
-VP Data signs off the next batch.
+v3 additions:
+  * `--pool` flag selects the candidate-query mode:
+      - `aldi-cross-list` (default, v2 behaviour): products with an Aldi alias
+        but no Lidl alias, branded non-own.
+      - `lidl-own-brand`: products whose brand matches a known Lidl exclusive
+        (Milbona / Italiamo / Vemondo / …) with no Lidl alias yet — no Aldi
+        alias requirement, since Lidl exclusives by definition have none.
+  * Phase-1.5 brand-mismatch hard reject: if a Lidl URL slug contains a known
+    brand token that does NOT match the MM product's brand, the candidate is
+    rejected with reason `competing_brand_in_slug` BEFORE any HTML fetch.
+    Catches the Vemondo → Alpro near-miss observed during Coverage Expander.
+
+Output: /tmp/lidl_proposal_<timestamp>.json (default pool) or
+        /tmp/lidl_ownbrand_proposal_<timestamp>.json (lidl-own-brand pool).
+Proposal-only — NO DB writes. VP Data signs off the next batch.
 """
+import argparse
 import gzip
 import io
 import json
@@ -85,6 +93,55 @@ VARIANT_TOKENS = (
     "whole",
     "smooth",
     "crunchy",
+)
+
+# --------------------------------------------------------------------------- #
+# v3: pool selection + brand-mismatch reject
+# --------------------------------------------------------------------------- #
+POOL_ALDI = "aldi-cross-list"
+POOL_LIDL_OWN = "lidl-own-brand"
+POOL_CHOICES = (POOL_ALDI, POOL_LIDL_OWN)
+
+# Lidl exclusive (private-label) brands we want to onboard. Lower-case, since
+# we always match against `normalise()`-d strings.
+LIDL_OWN_BRANDS = (
+    "milbona",
+    "italiamo",
+    "vemondo",
+    "combino",
+    "solevita",
+    "newgate",
+    "lupilu",
+    "dulano",
+    "pilos",
+    "trattoria verdi",
+)
+
+# Known competing brands that should never appear in a Lidl-exclusive's slug,
+# nor in the slug of a *different* national brand we're matching. Start small
+# (the issue says "grow with rejections"). All values lower-case and
+# `normalise()`-friendly.
+COMPETING_BRANDS = (
+    "alpro",
+    "coca cola",
+    "hellmann",
+    "kelloggs",
+    "kerrygold",
+    "pringles",
+    "tayto",
+    "dolmio",
+    "nestle",
+    "heinz",
+    "mccain",
+    "barilla",
+)
+
+# Master set of "known brand tokens" — used to detect the brand a Lidl slug
+# is advertising. We normalise both sides (slug and brand) with the same
+# pipeline, so multi-word brands like "coca cola" and "trattoria verdi" land
+# as space-separated lower-case tokens that survive substring matching.
+KNOWN_BRAND_TOKENS = tuple(
+    sorted(set(LIDL_OWN_BRANDS) | set(COMPETING_BRANDS), key=len, reverse=True)
 )
 
 
@@ -168,9 +225,9 @@ def fetch_lidl_sitemap_urls():
     return out
 
 
-def query_candidate_products():
-    """Branded products that have an Aldi alias but no Lidl alias."""
-    sql = """
+def _sql_aldi_cross_list() -> str:
+    """v2 behaviour: branded non-own products with an Aldi alias but no Lidl alias."""
+    return """
 SELECT p.id, p.name, COALESCE(p.brand,''), COALESCE(p.unit,'')
 FROM products p
 JOIN product_aliases a_aldi ON a_aldi.product_id = p.id AND a_aldi.store_name='Aldi'
@@ -183,6 +240,45 @@ WHERE a_lidl.id IS NULL
   AND p.brand NOT ILIKE '%simply%'
 ORDER BY p.id;
 """
+
+
+def _sql_lidl_own_brand() -> str:
+    """
+    v3 own-brand pool: Lidl-exclusive private-label products that don't yet
+    have a Lidl alias. No Aldi-alias requirement — Lidl exclusives by
+    definition won't have an Aldi cross-listing.
+
+    The brand filter is intentionally permissive (`ILIKE '%token%'`) because
+    DB rows for the same brand vary: "Milbona", "Lidl, Milbona",
+    "Bio Organic, Lidl, Milbona", etc. (See MASA-135 Ask 3 for normalisation.)
+    """
+    or_clauses = " OR ".join(
+        f"p.brand ILIKE '%{b}%'" for b in LIDL_OWN_BRANDS
+    )
+    return f"""
+SELECT p.id, p.name, COALESCE(p.brand,''), COALESCE(p.unit,'')
+FROM products p
+LEFT JOIN product_aliases a_lidl ON a_lidl.product_id = p.id AND a_lidl.store_name='Lidl'
+WHERE a_lidl.id IS NULL
+  AND p.brand IS NOT NULL AND p.brand <> ''
+  AND ({or_clauses})
+ORDER BY p.id;
+"""
+
+
+def query_candidate_products(pool: str = POOL_ALDI):
+    """
+    Pool-aware candidate query.
+
+    pool=aldi-cross-list → branded products with an Aldi alias but no Lidl alias (v2).
+    pool=lidl-own-brand  → Lidl-exclusive own-brand products with no Lidl alias (v3).
+    """
+    if pool == POOL_ALDI:
+        sql = _sql_aldi_cross_list()
+    elif pool == POOL_LIDL_OWN:
+        sql = _sql_lidl_own_brand()
+    else:
+        raise ValueError(f"Unknown pool: {pool!r}. Choices: {POOL_CHOICES}")
     res = subprocess.run([QUERY_PROD, sql], capture_output=True, text=True, check=True)
     products = []
     for line in res.stdout.splitlines():
@@ -328,6 +424,108 @@ def token_score(product, sitemap_entry):
 
 
 # --------------------------------------------------------------------------- #
+# Phase 1.5: brand-mismatch hard reject (MASA-135)
+# --------------------------------------------------------------------------- #
+def _brand_in_norm(brand_token: str, norm_text: str) -> bool:
+    """
+    Return True if `brand_token` appears as a whole-word match in
+    space-tokenised `norm_text`. Multi-word brands ("coca cola",
+    "trattoria verdi") match against the joined string.
+    """
+    if not brand_token or not norm_text:
+        return False
+    if " " in brand_token:
+        # Multi-word: substring on " " padded boundaries.
+        return f" {brand_token} " in f" {norm_text} "
+    return brand_token in norm_text.split()
+
+
+def _slug_brand_token(sitemap_norm: str) -> str | None:
+    """
+    Return the first known brand token that appears in the (normalised) Lidl
+    slug. Iteration order is longest-token-first (see KNOWN_BRAND_TOKENS) so
+    that "trattoria verdi" wins over "verdi" if both were known.
+    """
+    for tok in KNOWN_BRAND_TOKENS:
+        if _brand_in_norm(tok, sitemap_norm):
+            return tok
+    return None
+
+
+def _brand_mismatch_reason(product_brand: str, sitemap_norm: str) -> str | None:
+    """
+    Decide whether a (product, sitemap-entry) pair must be hard-rejected
+    on the brand axis BEFORE Phase-2 HTML fetch.
+
+    Returns:
+        None if the brand is consistent (or no signal either way).
+        "competing_brand_in_slug" if the slug advertises a *different* known
+        brand than the MM product's brand.
+
+    Symmetric design:
+      * MM brand is a Lidl exclusive (e.g. Vemondo) — slug must not contain
+        any competing national brand. Catches Vemondo→Alpro.
+      * MM brand is a national brand — slug must not contain a *different*
+        known brand. Catches Hellmann's vs Heinz collisions.
+    """
+    slug_tok = _slug_brand_token(sitemap_norm)
+    if slug_tok is None:
+        # Slug doesn't advertise a known brand — let Phase-2 size/variant
+        # decide. This keeps the filter conservative (no false positives on
+        # generic product slugs like "p/oat-milk-1l").
+        return None
+
+    mm_brand_norm = normalise(product_brand or "")
+    if not mm_brand_norm:
+        # No brand on MM side → can't safely match a brand-bearing slug.
+        return "competing_brand_in_slug"
+
+    # Same-brand match → keep.
+    if _brand_in_norm(slug_tok, mm_brand_norm):
+        return None
+
+    # MM brand differs from the brand the slug is advertising → hard reject.
+    return "competing_brand_in_slug"
+
+
+def apply_brand_mismatch_filter(by_url: dict) -> tuple[dict, list]:
+    """
+    Walk each URL's candidate list, drop any candidate whose MM brand
+    contradicts the slug's advertised brand, and emit rejection records.
+
+    Returns (filtered_by_url, rejections).
+    """
+    filtered: dict = {}
+    rejections: list = []
+    for url, candidates in by_url.items():
+        # All candidates for this URL share the same sitemap_norm (the URL
+        # determined the slug), so derive once.
+        slug = ""
+        if candidates:
+            # Cheap re-derive from the URL itself in case sitemap_norm wasn't
+            # carried through. Mirrors fetch_lidl_sitemap_urls() logic.
+            m = re.search(r"/p/([^/]+)/p\d+", url)
+            slug = normalise(m.group(1).replace("-", " ")) if m else ""
+
+        kept = []
+        for c in candidates:
+            reason = _brand_mismatch_reason(c["brand"], slug)
+            if reason is None:
+                kept.append(c)
+            else:
+                rejections.append(
+                    {
+                        **_proposal_record(c, url, None, c["score"]),
+                        "reason": reason,
+                        "slug_brand_token": _slug_brand_token(slug),
+                    }
+                )
+        if kept:
+            filtered[url] = kept
+    return filtered, rejections
+
+
+# --------------------------------------------------------------------------- #
 # Phase 2: HTML-gated resolution per URL group
 # --------------------------------------------------------------------------- #
 def resolve_url_group(url: str, candidates: list, fetch_log: dict, threshold: float):
@@ -436,17 +634,39 @@ def _proposal_record(product, url, lidl_size, score):
 # --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
-def main():
+def _parse_args(argv=None):
+    parser = argparse.ArgumentParser(
+        description="Lidl URL discovery — proposal-only, no DB writes."
+    )
+    parser.add_argument(
+        "--pool",
+        choices=POOL_CHOICES,
+        default=POOL_ALDI,
+        help=(
+            "Candidate pool. 'aldi-cross-list' (default) keeps v2 behaviour; "
+            "'lidl-own-brand' targets Lidl-exclusive private-label products."
+        ),
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
+    args = _parse_args(argv)
+    pool = args.pool
+
+    print(f"[{datetime.utcnow().isoformat()}] Pool: {pool}", file=sys.stderr)
     print(f"[{datetime.utcnow().isoformat()}] Fetching Lidl sitemap …", file=sys.stderr)
     sitemap = fetch_lidl_sitemap_urls()
     print(f"  {len(sitemap)} product URLs in sitemap", file=sys.stderr)
 
     print(f"[{datetime.utcnow().isoformat()}] Querying candidate products …", file=sys.stderr)
-    products = query_candidate_products()
-    print(
-        f"  {len(products)} branded products with Aldi alias but no Lidl alias",
-        file=sys.stderr,
+    products = query_candidate_products(pool=pool)
+    pool_label = (
+        "branded products with Aldi alias but no Lidl alias"
+        if pool == POOL_ALDI
+        else "Lidl-exclusive own-brand products with no Lidl alias"
     )
+    print(f"  {len(products)} {pool_label}", file=sys.stderr)
     products_with_known_size = sum(1 for p in products if p["size"])
     print(
         f"  {products_with_known_size} of those have a derivable size "
@@ -463,10 +683,18 @@ def main():
             if s >= threshold:
                 by_url.setdefault(entry["url"], []).append({**prod, "score": s})
 
+    # Phase 1.5 — brand-mismatch hard reject BEFORE any HTML fetch.
+    by_url, brand_rejections = apply_brand_mismatch_filter(by_url)
+    if brand_rejections:
+        print(
+            f"  phase1.5 brand-mismatch rejections: {len(brand_rejections)}",
+            file=sys.stderr,
+        )
+
     # Phase 2 — HTML-gated resolution per URL group.
     fetch_log: dict = {}
     proposals: list = []
-    rejected: list = []
+    rejected: list = list(brand_rejections)
     for url, group in by_url.items():
         accepted, rejs = resolve_url_group(url, group, fetch_log, threshold)
         if accepted:
@@ -485,11 +713,13 @@ def main():
 
     out = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
+        "pool": pool,
         "sitemap_url_count": len(sitemap),
         "candidate_product_count": len(products),
         "candidates_with_known_size": products_with_known_size,
         "threshold": threshold,
-        "phase1_url_groups": len(by_url),
+        "phase1_url_groups_after_brand_filter": len(by_url),
+        "phase1_5_brand_rejections": len(brand_rejections),
         "html_fetch": {
             "live_attempts": fetch_log.get("live_fetch_attempts", 0),
             "live_failures": fetch_log.get("live_fetch_failures", 0),
@@ -503,8 +733,11 @@ def main():
         "proposals": proposals,
         "rejected": rejected,
     }
+    out_basename = (
+        "lidl_ownbrand_proposal" if pool == POOL_LIDL_OWN else "lidl_proposal"
+    )
     out_path = Path(
-        f"/tmp/lidl_proposal_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.json"
+        f"/tmp/{out_basename}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.json"
     )
     out_path.write_text(json.dumps(out, indent=2))
     print(f"\nWrote {out_path}")
