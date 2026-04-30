@@ -1,33 +1,21 @@
 name: Discover Lidl Aliases (Weekly)
 
-# Weekly Lidl URL discovery for MASA-114 / MASA-117.
-# Emits a JSON proposal of Lidl URLs that probably match MM products with an
-# Aldi alias but no Lidl alias. NEVER writes to DB or API — VP Data reviews
-# the artifact and creates aliases manually (or via a follow-up tool).
+# Weekly Lidl URL discovery for MASA-114 / MASA-135 (v3, lidl-own-brand pool).
+# Emits a JSON proposal of Lidl URLs that probably match MM products. NEVER
+# writes to DB or API — VP Data reviews the artifact and creates aliases
+# manually (or via a follow-up tool).
 #
 # Schedule: Sundays 10:00 UTC — after the 08:00 UTC promotions scan in
 # daily-scraping.yml so the candidate set has fresh signal.
+#
+# CLI: see `python discover_lidl_aliases.py --help`. The v3 script only
+# accepts `--pool {aldi-cross-list,lidl-own-brand}`. Threshold/limit/verify
+# inputs that existed in v1 (MASA-117) were removed in MASA-119.
 
 on:
   schedule:
     - cron: '0 10 * * 0'  # Sundays 10:00 UTC
   workflow_dispatch:
-    inputs:
-      threshold:
-        description: 'Match threshold (0..1)'
-        required: false
-        default: '0.55'
-        type: string
-      limit:
-        description: 'Cap candidate volume (blank = no cap)'
-        required: false
-        default: ''
-        type: string
-      no_verify_collisions:
-        description: 'Skip JSON-LD verification for collision URLs'
-        required: false
-        default: false
-        type: boolean
 
 jobs:
   discover:
@@ -59,23 +47,7 @@ jobs:
           SCRAPER_PASSWORD: ${{ secrets.SCRAPER_PASSWORD }}
         run: |
           set -euo pipefail
-          THRESHOLD="${{ github.event.inputs.threshold || '0.55' }}"
-          LIMIT_FLAG=""
-          if [ -n "${{ github.event.inputs.limit || '' }}" ]; then
-            LIMIT_FLAG="--limit ${{ github.event.inputs.limit }}"
-          fi
-          NO_VERIFY_FLAG=""
-          if [ "${{ github.event.inputs.no_verify_collisions || 'false' }}" = "true" ]; then
-            NO_VERIFY_FLAG="--no-verify-collisions"
-          fi
-
-          mkdir -p out
-          python discover_lidl_aliases.py \
-            --source api \
-            --threshold "$THRESHOLD" \
-            $LIMIT_FLAG \
-            $NO_VERIFY_FLAG \
-            --output-dir out
+          python discover_lidl_aliases.py --pool lidl-own-brand
 
       - name: Upload proposal artifact
         if: always()
@@ -83,29 +55,35 @@ jobs:
         with:
           name: lidl-discovery-${{ github.run_number }}
           path: |
-            out/lidl_discovery_*.json
+            /tmp/lidl_ownbrand_proposal_*.json
             discover_lidl_*.log
           retention-days: 30
+          if-no-files-found: warn
 
       - name: Surface summary in run log
         if: always()
         run: |
-          echo "📊 Lidl Discovery Summary"
-          echo "========================="
-          JSON=$(ls -t out/lidl_discovery_*.json 2>/dev/null | head -1 || true)
+          echo "📊 Lidl Discovery Summary (v3 — lidl-own-brand pool)"
+          echo "===================================================="
+          JSON=$(ls -t /tmp/lidl_ownbrand_proposal_*.json 2>/dev/null | head -1 || true)
           if [ -z "$JSON" ]; then
             echo "❌ No proposal JSON produced — see run log above."
             exit 1
           fi
           jq -r '
-            "  Source:                    \(.source)",
-            "  Sitemap URLs:              \(.sitemap_url_count)",
-            "  Candidate products:        \(.candidate_product_count)",
-            "  Threshold:                 \(.threshold)",
-            "  Raw matches:               \(.raw_match_count)",
-            "  Unambiguous (slug-only):   \(.unambiguous_count)",
-            "  Collision URLs:            \(.collision_url_count)",
-            "  Recovered via JSON-LD:     \(.collision_resolved_count)",
-            "  Still ambiguous:           \(.collision_unresolved_count)",
-            "  Total promotable:          \(.proposals | length)"
+            "  Generated at:                \(.generated_at)",
+            "  Pool:                        \(.pool)",
+            "  Sitemap URLs:                \(.sitemap_url_count)",
+            "  Candidate products:          \(.candidate_product_count)",
+            "  Candidates w/ known size:    \(.candidates_with_known_size)",
+            "  Threshold:                   \(.threshold)",
+            "  Phase 1 URL groups:          \(.phase1_url_groups_after_brand_filter)",
+            "  Phase 1.5 brand rejections:  \(.phase1_5_brand_rejections)",
+            "  HTML live fetches:           \(.html_fetch.live_attempts) (failures=\(.html_fetch.live_failures), cache_hits=\(.html_fetch.cache_hits))",
+            "  HTML no-size:                \(.html_fetch.no_size_in_html)",
+            "  Unambiguous proposals:       \(.unambiguous_count)",
+            "  Rejected:                    \(.rejected_count)"
           ' "$JSON"
+          echo ""
+          echo "  Rejection breakdown:"
+          jq -r '.rejection_breakdown | to_entries[] | "    \(.key): \(.value)"' "$JSON"
