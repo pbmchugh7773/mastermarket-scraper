@@ -158,6 +158,10 @@ jobs:
             RUN_TYPE="retry"
           fi
 
+          # Expose RUN_TYPE to the validation step so it can relax the
+          # silent-ingestion check on retry-mode no-op runs (MASA-147).
+          echo "RUN_TYPE=$RUN_TYPE" >> "$GITHUB_ENV"
+
           # Start virtual display for headless Chrome
           Xvfb :99 -screen 0 1920x1080x24 > /dev/null 2>&1 &
 
@@ -178,14 +182,22 @@ jobs:
         if: always()
         env:
           STORE_NAME: ${{ matrix.store }}
-        # Loud-fail health check (MASA-108). Detects silent ingestion failures
-        # like the MASA-106 4h outage where every API call returned 401 but the
-        # workflow reported success. Hard-fails the job if:
+          RUN_TYPE: ${{ env.RUN_TYPE }}
+        # Loud-fail health check (MASA-108, tuned in MASA-147). Detects silent
+        # ingestion failures like the MASA-106 4h outage where every API call
+        # returned 401 but the workflow reported success. Hard-fails the job if:
         #   - log file missing (scraper crashed pre-logging)
         #   - "❌ Authentication failed/error" > 0 (initial auth fatal)
-        #   - PROCESSED > 0 and UPLOADS < 5% of PROCESSED (silent failure)
         #   - 401-retry-thrashing > 50 (post-MASA-106 helper running hot ⇒ JWT TTL too short)
-        # Skips upload-percent check if PROCESSED = 0 (retry-mode no-op is valid).
+        #   - PROCESSED >= MIN_PROCESSED and UPLOADS < 5% of PROCESSED (silent failure)
+        #
+        # MIN_PROCESSED gate (MASA-147): retry-mode 6AM/8AM batches typically
+        # process only a handful of stragglers — 0 uploads from 3 processed is
+        # not a silent-ingestion outage. We require PROCESSED >= 50 in retry
+        # mode before applying the upload-percent check. Main batches (4AM)
+        # process ~700 products, so the threshold trips immediately on a real
+        # outage (MASA-106 saw 700 processed, 0 uploaded). Promotions and
+        # manual runs keep the original PROCESSED > 0 trigger.
         run: |
           set -u
           LOG="scrape_${STORE_NAME}.log"
@@ -202,8 +214,18 @@ jobs:
           UPLOADS=$(grep -E "Uploaded:\s+[0-9]+" "$LOG" | grep -oE "Uploaded:\s+[0-9]+" | grep -oE "[0-9]+" | tail -1)
           PROCESSED=${PROCESSED:-0}
           UPLOADS=${UPLOADS:-0}
+          RUN_TYPE=${RUN_TYPE:-retry}
 
-          echo "::notice::${STORE_NAME} health: processed=$PROCESSED uploads=$UPLOADS auth_fails=$AUTH_FAILS auth_retries=$AUTH_RETRIES"
+          # Retry-mode runs are no-ops when there are no stragglers to process;
+          # only fire the silent-ingestion alarm once the run is large enough
+          # that 0 uploads is statistically meaningful.
+          if [ "$RUN_TYPE" = "retry" ]; then
+            MIN_PROCESSED=50
+          else
+            MIN_PROCESSED=1
+          fi
+
+          echo "::notice::${STORE_NAME} health: run_type=$RUN_TYPE processed=$PROCESSED uploads=$UPLOADS auth_fails=$AUTH_FAILS auth_retries=$AUTH_RETRIES min_processed=$MIN_PROCESSED"
 
           FAIL=0
           if [ "$AUTH_FAILS" -gt 0 ]; then
@@ -214,17 +236,19 @@ jobs:
             echo "::error::${STORE_NAME}: $AUTH_RETRIES 401-retry events — JWT TTL likely too short, MASA-107 territory."
             FAIL=1
           fi
-          if [ "$PROCESSED" -gt 0 ]; then
+          if [ "$PROCESSED" -ge "$MIN_PROCESSED" ]; then
             PCT=$(( UPLOADS * 100 / PROCESSED ))
             if [ "$UPLOADS" -lt 5 ] || [ "$PCT" -lt 5 ]; then
-              echo "::error::${STORE_NAME}: silent-ingestion alarm — $UPLOADS uploads from $PROCESSED processed (${PCT}%, threshold 5%)."
+              echo "::error::${STORE_NAME}: silent-ingestion alarm — $UPLOADS uploads from $PROCESSED processed (${PCT}%, threshold 5%, run_type=$RUN_TYPE)."
               FAIL=1
             fi
+          else
+            echo "::notice::${STORE_NAME}: skipping upload-percent check — $PROCESSED processed below MIN_PROCESSED=$MIN_PROCESSED for run_type=$RUN_TYPE (retry-mode no-op is valid)."
           fi
           if [ "$FAIL" -ne 0 ]; then
             exit 1
           fi
-          echo "✅ ${STORE_NAME} health check passed: $UPLOADS/$PROCESSED uploaded, $AUTH_FAILS fatal auth fails, $AUTH_RETRIES re-auth events."
+          echo "✅ ${STORE_NAME} health check passed: $UPLOADS/$PROCESSED uploaded (run_type=$RUN_TYPE), $AUTH_FAILS fatal auth fails, $AUTH_RETRIES re-auth events."
 
       - name: 📊 Upload Results Summary
         if: always()
