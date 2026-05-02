@@ -211,9 +211,15 @@ class DunnesPromotionDetectionTests(unittest.TestCase):
         self.assertEqual(result['price_override'], 2.25)
         self.assertAlmostEqual(result['promotion_discount_value'], 0.74, places=2)
 
-    def test_multibuy_no_override_when_per_unit_equals_shelf(self) -> None:
+    # MASA-151: when bundle math shows no real saving (per-unit ≥ shelf), the
+    # row must be demoted to non-promo entirely — not just left without
+    # price_override. Pre-fix MASA-151 shipped phantom multi_buy rows where
+    # promotion_type='multi_buy' but price == original_price (21% of post-1.0.5
+    # multi_buy rows in the MASA-141 audit window).
+
+    def test_multibuy_demoted_when_per_unit_equals_shelf(self) -> None:
         """Buy 2 for €3.98 on €1.99 shelf → per_unit = €1.99 (no actual discount).
-        Should still classify but NOT set price_override / original_price."""
+        Must be demoted to non-promo; no multi_buy tag, no original_price."""
         html = """
         <html><body><main>
           <div class="product-detail">
@@ -224,9 +230,46 @@ class DunnesPromotionDetectionTests(unittest.TestCase):
         </main></body></html>
         """
         result = self.scraper.detect_dunnes_promotion_data(html, current_price=1.99)
-        self.assertEqual(result['promotion_type'], 'multi_buy')
+        self.assertIsNone(result.get('promotion_type'))
+        self.assertIsNone(result.get('promotion_text'))
         self.assertIsNone(result.get('price_override'))
-        # original_price stays None — caller falls back to shelf price.
+        self.assertIsNone(result.get('original_price'))
+
+    def test_multibuy_demoted_when_bundle_pricier_than_shelf(self) -> None:
+        """MASA-151 leak repro: Cadbury Snack 43g €1.70 + 'Buy 2 for €3.50'
+        → per_unit €1.75 > shelf €1.70 (bundle is *pricier*). Pre-fix this
+        shipped as multi_buy with price = original_price = €1.70."""
+        html = """
+        <html><body><main>
+          <div class="product-detail">
+            <h1>Cadbury Snack 43g</h1>
+            <span class="ProductPrice">€1.70</span>
+            <span class="promo-badge">Buy 2 for €3.50</span>
+          </div>
+        </main></body></html>
+        """
+        result = self.scraper.detect_dunnes_promotion_data(html, current_price=1.70)
+        self.assertIsNone(
+            result.get('promotion_type'),
+            f"MASA-151 leak: phantom multi_buy when bundle pricier than shelf: {result}",
+        )
+        self.assertIsNone(result.get('price_override'))
+        self.assertIsNone(result.get('original_price'))
+
+    def test_multibuy_demoted_for_any_x_for_when_no_saving(self) -> None:
+        """MASA-151 leak repro for the any_x_for branch: 0% Greek yogurt €2.20 +
+        'Any 2 for €4.50' → per_unit €2.25 > shelf €2.20."""
+        html = """
+        <html><body><main>
+          <div class="product-detail">
+            <h1>0% Greek Yogurt</h1>
+            <span class="ProductPrice">€2.20</span>
+            <span class="promo-badge">Any 2 for €4.50</span>
+          </div>
+        </main></body></html>
+        """
+        result = self.scraper.detect_dunnes_promotion_data(html, current_price=2.20)
+        self.assertIsNone(result.get('promotion_type'))
         self.assertIsNone(result.get('original_price'))
 
     def test_loose_x_for_y_pattern_no_longer_matches(self) -> None:

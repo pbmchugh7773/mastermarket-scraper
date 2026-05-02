@@ -472,21 +472,31 @@ class ApifyDunnesScraper:
             # price = X/N (deal unit) and original_price = current_price (shelf
             # unit). Pre-fix shipped 58/58 multi_buy rows with price == original
             # and failed the "real reduction evidence" exit criterion.
+            # MASA-151: only tag as multi_buy if the bundle math actually
+            # saves money. Pre-fix, the regex match alone set promotion_type,
+            # so "Buy 2 for €3.50" on a €1.70 shelf shipped as multi_buy
+            # even though per-unit (€1.75) was pricier than shelf — 21% of
+            # post-1.0.5 multi_buy rows were these phantom bundles.
             if ptype == 'buy_x_for' and len(groups) >= 2:
                 qty = int(groups[0])
                 total = float(groups[1].replace(',', '.'))
                 if not _bundle_math_ok(qty, total):
                     continue
-                promotion_data['promotion_type'] = 'multi_buy'
-                promotion_data['promotion_text'] = f'Buy {qty} for {total:.2f}'
                 if current_price and qty > 0:
                     per_unit = round(total / qty, 2)
                     if per_unit < current_price:
+                        promotion_data['promotion_type'] = 'multi_buy'
+                        promotion_data['promotion_text'] = f'Buy {qty} for {total:.2f}'
                         promotion_data['price_override'] = per_unit
                         promotion_data['original_price'] = round(current_price, 2)
                         promotion_data['promotion_discount_value'] = round(
                             current_price - per_unit, 2
                         )
+                    # per_unit >= current_price → leave row as non-promo.
+                else:
+                    # current_price unknown — keep legacy tag-only behaviour.
+                    promotion_data['promotion_type'] = 'multi_buy'
+                    promotion_data['promotion_text'] = f'Buy {qty} for {total:.2f}'
                 return promotion_data
 
             elif ptype == 'any_x_for' and len(groups) >= 2:
@@ -494,33 +504,41 @@ class ApifyDunnesScraper:
                 total = float(groups[1].replace(',', '.'))
                 if not _bundle_math_ok(qty, total):
                     continue
-                promotion_data['promotion_type'] = 'multi_buy'
-                promotion_data['promotion_text'] = f'Any {qty} for {total:.2f}'
                 if current_price and qty > 0:
                     per_unit = round(total / qty, 2)
                     if per_unit < current_price:
+                        promotion_data['promotion_type'] = 'multi_buy'
+                        promotion_data['promotion_text'] = f'Any {qty} for {total:.2f}'
                         promotion_data['price_override'] = per_unit
                         promotion_data['original_price'] = round(current_price, 2)
                         promotion_data['promotion_discount_value'] = round(
                             current_price - per_unit, 2
                         )
+                else:
+                    promotion_data['promotion_type'] = 'multi_buy'
+                    promotion_data['promotion_text'] = f'Any {qty} for {total:.2f}'
                 return promotion_data
 
             elif ptype == 'bogo' and len(groups) >= 2:
                 buy_qty = int(groups[0])
                 free_qty = int(groups[1])
-                promotion_data['promotion_type'] = 'multi_buy'
-                promotion_data['promotion_text'] = f'Buy {buy_qty} Get {free_qty} Free'
+                # BOGO math always saves when free_qty > 0; this guard mirrors
+                # the buy_x_for branch for invariant uniformity.
                 if current_price and buy_qty > 0 and free_qty > 0:
                     per_unit = round(
                         (current_price * buy_qty) / (buy_qty + free_qty), 2
                     )
                     if per_unit < current_price:
+                        promotion_data['promotion_type'] = 'multi_buy'
+                        promotion_data['promotion_text'] = f'Buy {buy_qty} Get {free_qty} Free'
                         promotion_data['price_override'] = per_unit
                         promotion_data['original_price'] = round(current_price, 2)
                         promotion_data['promotion_discount_value'] = round(
                             current_price - per_unit, 2
                         )
+                else:
+                    promotion_data['promotion_type'] = 'multi_buy'
+                    promotion_data['promotion_text'] = f'Buy {buy_qty} Get {free_qty} Free'
                 return promotion_data
 
         # MASA-115: gate fixed_amount_off / percentage_off on parseable

@@ -156,33 +156,53 @@ function detectPromotion(html, currentPrice) {
                 continue;
             }
             const prefix = type === 'any_x_for' ? 'Any' : 'Buy';
-            result.promotionType = 'multi_buy';
-            result.promotionText = `${prefix} ${qty} for €${total.toFixed(2)}`;
+            // MASA-151: only tag as multi_buy if the bundle math actually
+            // saves money. Pre-fix, the regex match alone set promotionType,
+            // so "Buy 2 for €3.50" on a €1.70 shelf shipped as multi_buy
+            // even though per-unit (€1.75) was pricier than shelf — 21% of
+            // post-1.0.5 multi_buy rows were these phantom bundles.
             if (currentPrice && qty > 0) {
                 const perUnit = Math.round((total / qty) * 100) / 100;
                 if (perUnit < currentPrice) {
+                    result.promotionType = 'multi_buy';
+                    result.promotionText = `${prefix} ${qty} for €${total.toFixed(2)}`;
                     result.priceOverride = perUnit;
                     result.originalPrice = Math.round(currentPrice * 100) / 100;
                     result.promotionDiscountValue =
                         Math.round((currentPrice - perUnit) * 100) / 100;
                 }
+                // perUnit >= currentPrice → no real saving, leave result as
+                // a non-promo row (all promotion fields stay null).
+            } else {
+                // currentPrice unknown — can't verify the saving, but the
+                // mechanic regex matched. Tag without price_override (legacy
+                // behaviour, downstream callers handle null original_price).
+                result.promotionType = 'multi_buy';
+                result.promotionText = `${prefix} ${qty} for €${total.toFixed(2)}`;
             }
             return result;
         } else if (type === 'bogo') {
             const buyQty = parseInt(match[1], 10);
             const freeQty = parseInt(match[2], 10);
-            result.promotionType = 'multi_buy';
-            result.promotionText = `Buy ${buyQty} Get ${freeQty} Free`;
+            // MASA-151: same demotion guard as buy_x_for. BOGO math is
+            // always a saving when freeQty > 0, so this branch is mostly
+            // defensive — but keeps the invariant uniform across all
+            // multi-buy mechanics.
             if (currentPrice && buyQty > 0 && freeQty > 0) {
                 const perUnit = Math.round(
                     ((currentPrice * buyQty) / (buyQty + freeQty)) * 100,
                 ) / 100;
                 if (perUnit < currentPrice) {
+                    result.promotionType = 'multi_buy';
+                    result.promotionText = `Buy ${buyQty} Get ${freeQty} Free`;
                     result.priceOverride = perUnit;
                     result.originalPrice = Math.round(currentPrice * 100) / 100;
                     result.promotionDiscountValue =
                         Math.round((currentPrice - perUnit) * 100) / 100;
                 }
+            } else {
+                result.promotionType = 'multi_buy';
+                result.promotionText = `Buy ${buyQty} Get ${freeQty} Free`;
             }
             return result;
         }
