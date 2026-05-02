@@ -20,6 +20,24 @@ python3 batch_verify.py --store all             # everything
 python3 batch_verify.py --store supervalu --limit 5   # smoke test
 ```
 
+### Backfilling bot-blocked rows (MASA-75)
+
+When the existing `output/ground_truth.csv` has rows with
+`scrape_status=bot_blocked` (40 rows from the 2026-04-20 run), pass
+`--include-bot-blocked` to re-attempt them — the dispatcher will skip rows in
+all other terminal statuses (`ok`, `404_removed`, `parse_error`, `error`):
+
+```bash
+python3 batch_verify.py --store aldi    --include-bot-blocked   # 15 rows
+python3 batch_verify.py --store dunnes  --include-bot-blocked   # 24 rows
+python3 batch_verify.py --store tesco   --include-bot-blocked   # 1 row
+```
+
+The default `requests`-based parsers will likely re-fail with `bot_blocked`
+since Cloudflare's challenge is consistent — the flag is the *enabler* for
+the subpass, but a separate Apify-actor-based parser path is required to
+actually break through (see "Known gaps" below).
+
 No production data is modified by this script — it's pure HTTP GET + parse.
 
 ## Output schema
@@ -76,10 +94,19 @@ MASA-71 cleanup in the intervening days reduced the pool):
 
 ## Known gaps / next phase
 
-- **Aldi, Dunnes, SuperValu price data** — requires a Selenium / Playwright
-  pass. The existing store scrapers in the parent repo already handle this;
-  reuse their extractors with the URLs in `output/ground_truth.csv` where
-  `scrape_status != 'ok'`.
+- **40 bot-blocked rows (MASA-75)** — backfill subpass needs an
+  Apify-actor-based parser path, NOT plain Selenium. The original spec
+  said "reuse existing Selenium scrapers", but the production scrapers
+  in this repo are Apify-based (`apify_dunnes_scraper.py`,
+  `apify_tesco_scraper.py`, plus `apify-actors/{dunnes,tesco}-scraper/`
+  for the actor source). Aldi has no standalone scraper here — the
+  15 Aldi rows will need a new actor or a Cloudflare-bypass path.
+  The `--include-bot-blocked` flag (this commit) prepares the dispatcher
+  for that subpass; the Apify-runner parser modules are the next chunk
+  of work.
+- **SuperValu 129 `parse_error` rows** — not in MASA-75 scope. Name+size
+  already extracted are sufficient for remapping; brand/image/price will
+  be recovered during the next post-remap daily scraper run.
 - **Category** — not emitted by the store JSON-LD in most cases. Can be
   derived from the breadcrumb trail if needed in a later pass.
 

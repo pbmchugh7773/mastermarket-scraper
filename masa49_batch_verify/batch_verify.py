@@ -104,12 +104,25 @@ def load_input(path: Path) -> list[dict]:
         return list(csv.DictReader(fh))
 
 
-def load_done_ids(path: Path) -> set[str]:
-    """Resumable: skip alias_ids already present in output CSV."""
+def load_done_ids(path: Path, include_bot_blocked: bool = False) -> set[str]:
+    """Resumable: skip alias_ids already present in output CSV.
+
+    When ``include_bot_blocked`` is True, rows previously marked
+    ``scrape_status=bot_blocked`` are NOT considered done — the dispatcher will
+    re-attempt them (intended for the Selenium/Apify backfill subpass per
+    MASA-75). All other terminal statuses (``ok``, ``404_removed``,
+    ``parse_error``, ``error``) remain skipped.
+    """
     if not path.exists():
         return set()
     with path.open() as fh:
-        return {row["alias_id"] for row in csv.DictReader(fh)}
+        reader = csv.DictReader(fh)
+        if include_bot_blocked:
+            return {
+                row["alias_id"] for row in reader
+                if row.get("scrape_status") != "bot_blocked"
+            }
+        return {row["alias_id"] for row in reader}
 
 
 def append_result(path: Path, result: ScrapeResult) -> None:
@@ -156,9 +169,13 @@ PARSERS: dict[str, Callable[[requests.Session, dict], ScrapeResult]] = {
 }
 
 
-def run(store_filter: str, limit: Optional[int]) -> tuple[int, dict]:
+def run(
+    store_filter: str,
+    limit: Optional[int],
+    include_bot_blocked: bool = False,
+) -> tuple[int, dict]:
     rows = load_input(INPUT_CSV)
-    done = load_done_ids(OUTPUT_CSV)
+    done = load_done_ids(OUTPUT_CSV, include_bot_blocked=include_bot_blocked)
     session = build_session()
 
     processed = 0
@@ -199,9 +216,21 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--store", required=True, choices=["all", "tesco", "aldi", "supervalu", "dunnes"])
     ap.add_argument("--limit", type=int, default=None)
+    ap.add_argument(
+        "--include-bot-blocked",
+        action="store_true",
+        help=(
+            "Re-attempt rows previously marked scrape_status=bot_blocked "
+            "(MASA-75 subpass). Other terminal statuses remain skipped."
+        ),
+    )
     args = ap.parse_args()
 
-    processed, counts = run(args.store, args.limit)
+    processed, counts = run(
+        args.store,
+        args.limit,
+        include_bot_blocked=args.include_bot_blocked,
+    )
     print(f"\nProcessed: {processed}")
     for k, v in sorted(counts.items()):
         print(f"  {k}: {v}")
