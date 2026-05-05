@@ -348,6 +348,24 @@ const crawler = new PuppeteerCrawler({
         // Brief wait for initial page load (reduced from 3s to save bandwidth)
         await page.waitForTimeout(1500);
 
+        // Wait until the main-product canonical price meta tag has been populated.
+        // <meta itemprop="price" content="€X.XX"> is rendered server-side ONLY for
+        // the page's main product (recommendations don't emit it). Without this wait
+        // the page sometimes returns hydrated recommendation data with the main
+        // product card still empty, causing the regex parser to capture promos from
+        // adjacent product carousels — see issue with product 8395 (Coca-Cola Zero 2L).
+        try {
+            await page.waitForFunction(
+                () => {
+                    const meta = document.querySelector('meta[itemprop="price"]');
+                    return meta && /€\s*\d+[.,]\d{2}/.test(meta.getAttribute('content') || '');
+                },
+                { timeout: 15000 }
+            );
+        } catch (e) {
+            log.warning(`meta[itemprop="price"] never populated within 15s for ${url}`);
+        }
+
         // Check for Cloudflare challenge
         const title = await page.title();
         if (title.includes('Just a moment') || title.includes('Checking your browser')) {
@@ -379,14 +397,39 @@ const crawler = new PuppeteerCrawler({
         // Get page content
         const html = await page.content();
 
-        // Try to extract from JSON-LD first
+        // Primary price source: <meta itemprop="price" content="€X.XX"> in <head>.
+        // This is canonical for the page's main product (set by Dunnes' SSR), so it
+        // can never accidentally pick up a recommended product's price. Falls through
+        // to JSON-LD and HTML regex if missing.
+        let price = null;
+        try {
+            const metaPrice = await page.$eval(
+                'meta[itemprop="price"]',
+                (el) => el.getAttribute('content')
+            );
+            if (metaPrice) {
+                const m = metaPrice.match(/(\d+[.,]\d{2})/);
+                if (m) {
+                    const parsed = parseFloat(m[1].replace(',', '.'));
+                    if (parsed >= 0.01 && parsed <= 1000 && parsed !== 1) {
+                        price = parsed;
+                    }
+                }
+            }
+        } catch (e) {
+            // No meta itemprop="price" — fall through
+        }
+
+        // Try to extract from JSON-LD next
         const jsonLdScripts = await page.$$eval(
             'script[type="application/ld+json"]',
             (scripts) => scripts.map((s) => s.textContent)
         );
 
         let productData = extractFromJsonLd(jsonLdScripts);
-        let price = productData?.price;
+        if (!price) {
+            price = productData?.price;
+        }
         let productTitle = productData?.title || '';
 
         // Fallback: extract price from HTML
@@ -415,6 +458,28 @@ const crawler = new PuppeteerCrawler({
 
         // Detect promotions
         const promotionData = detectPromotion(html, price);
+
+        // Sanity check: a legitimate multi-buy must give a per-unit price LOWER
+        // than the canonical price (otherwise it's not a discount). If per-unit
+        // ≥ canonical, the promo was captured from a recommended product where
+        // the main price doesn't apply. Drop it.
+        if (promotionData.promotionType === 'multi_buy' && promotionData.promotionText) {
+            const m = promotionData.promotionText.match(/(\d+)\s*for\s*€?\s*(\d+(?:[.,]\d{2})?)/i);
+            if (m) {
+                const qty = parseInt(m[1], 10);
+                const total = parseFloat(m[2].replace(',', '.'));
+                if (qty > 0 && total > 0) {
+                    const perUnit = total / qty;
+                    if (perUnit >= price) {
+                        log.warning(`Dropping multi-buy promo for ${url}: canonical €${price} ≤ implied per-unit €${perUnit.toFixed(2)} (not a discount, likely from another product)`);
+                        promotionData.promotionType = null;
+                        promotionData.promotionText = null;
+                        promotionData.promotionDiscountValue = null;
+                        promotionData.originalPrice = null;
+                    }
+                }
+            }
+        }
 
         // Build result object
         const result = {
