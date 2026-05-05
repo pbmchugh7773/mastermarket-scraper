@@ -943,12 +943,14 @@ class SimpleLocalScraper:
                         continue
 
         # === 3. Detect multi-buy offers (very common at SuperValu) ===
-        # First, try to find the actual promotion badge text from SuperValu's HTML structure
-        # SuperValu uses "promotionBadgeComponent-testId" with text like "2 for €13"
-        promo_badge_match = re.search(r'promotionBadgeComponent[^>]*>([^<]+)<', html_content, re.IGNORECASE)
-        if promo_badge_match:
-            badge_text = promo_badge_match.group(1).strip()
-            # Check if it's a multi-buy format like "2 for €13"
+        # First, try to find the actual promotion badge text from SuperValu's HTML structure.
+        # SuperValu uses "promotionBadgeComponent-testId" multiple times per page (e.g.
+        # "Great Value", "Real Rewards Price", "3 for €5") — iterate ALL matches and pick
+        # the first one whose text is in multi-buy shape, otherwise the non-multi-buy
+        # badges (like "Great Value") swallow the slot and the real promo is missed.
+        for badge_match in re.finditer(r'promotionBadgeComponent[^>]*>([^<]+)<', html_content, re.IGNORECASE):
+            badge_text = badge_match.group(1).strip()
+            # Multi-buy shape: "2 for €13", "3 for €5" — accept optional decimals on the price
             multi_match = re.match(r'(\d+)\s*for\s*€?\s*(\d+(?:[.,]\d{2})?)', badge_text, re.IGNORECASE)
             if multi_match:
                 qty = int(multi_match.group(1))
@@ -961,12 +963,15 @@ class SimpleLocalScraper:
                     if regular_total > price:
                         promotion_data['promotion_discount_value'] = round(regular_total - price, 2)
                 logger.info(f"🏷️ SuperValu multi-buy from badge: {promotion_data['promotion_text']}")
+                break
 
         # Fallback to pattern matching if badge not found
         if not promotion_data.get('promotion_type') == 'multi_buy':
+            # Allow optional decimals on the total price ("3 for €5" matches as well as "3 for €5.00").
+            # Without this, SuperValu pages with whole-euro totals were missed (e.g. product 8395).
             multi_buy_patterns = [
-                (r'any\s*(\d+)\s*for\s*€\s*(\d+[.,]\d{2})', 'any'),     # "Any 3 for €5.00" - requires €
-                (r'(\d+)\s*for\s*€\s*(\d+[.,]\d{2})', 'for'),           # "3 for €5.00" - requires €
+                (r'any\s*(\d+)\s*for\s*€\s*(\d+(?:[.,]\d{2})?)', 'any'),  # "Any 3 for €5" or "Any 3 for €5.00"
+                (r'(\d+)\s*for\s*€\s*(\d+(?:[.,]\d{2})?)', 'for'),         # "3 for €5" or "3 for €5.00"
                 (r'buy\s*(\d+)\s*get\s*(\d+)\s*free', 'bogo'),          # "Buy 2 Get 1 Free"
                 (r'bogof', 'bogof'),                                     # Buy One Get One Free
                 (r'buy\s*one\s*get\s*one', 'b1g1'),                     # Buy One Get One
