@@ -279,6 +279,112 @@ def _parse_jsonld_product(html: str) -> Optional[dict]:
     return None
 
 
+# Patterns for §5 payload-gate HTML checks.
+NOINDEX_META_RE = re.compile(
+    r'<meta[^>]+name=["\']robots["\'][^>]+content=["\'][^"\']*noindex',
+    re.I,
+)
+EXPIRED_OFFER_PHRASES = (
+    "currently unavailable",
+    "out of stock",
+    "this offer has ended",
+)
+
+
+def _extract_brand(jsonld: dict) -> str:
+    """Brand can be a string or a `{"@type": "Brand", "name": "..."}` object."""
+    brand = jsonld.get("brand")
+    if isinstance(brand, str):
+        return brand.strip()
+    if isinstance(brand, dict):
+        name = brand.get("name")
+        if isinstance(name, str):
+            return name.strip()
+    if isinstance(brand, list) and brand:
+        head = brand[0]
+        if isinstance(head, str):
+            return head.strip()
+        if isinstance(head, dict):
+            name = head.get("name")
+            if isinstance(name, str):
+                return name.strip()
+    return ""
+
+
+def _extract_image(jsonld: dict) -> str:
+    """`image` may be string, list of strings, or list of ImageObject dicts."""
+    image = jsonld.get("image")
+    if isinstance(image, str):
+        return image.strip()
+    if isinstance(image, list) and image:
+        head = image[0]
+        if isinstance(head, str):
+            return head.strip()
+        if isinstance(head, dict):
+            url = head.get("url") or head.get("contentUrl")
+            if isinstance(url, str):
+                return url.strip()
+    if isinstance(image, dict):
+        url = image.get("url") or image.get("contentUrl")
+        if isinstance(url, str):
+            return url.strip()
+    return ""
+
+
+def _extract_price(jsonld: dict) -> Optional[float]:
+    """`offers.price` may be number-as-string under `offers` or nested in `priceSpecification`."""
+    offers = jsonld.get("offers")
+    if isinstance(offers, list) and offers:
+        offers = offers[0]
+    if not isinstance(offers, dict):
+        return None
+    raw = offers.get("price")
+    if raw is None:
+        spec = offers.get("priceSpecification")
+        if isinstance(spec, dict):
+            raw = spec.get("price")
+    if raw is None:
+        return None
+    try:
+        return float(str(raw).replace(",", "."))
+    except (TypeError, ValueError):
+        return None
+
+
+def _extract_breadcrumb_leaf(jsonld: dict, html: str) -> str:
+    """
+    Prefer JSON-LD `category` on the Product node. Fallback to scanning the
+    page for a separate `BreadcrumbList` script. Returns lower-case leaf.
+    """
+    cat = jsonld.get("category")
+    if isinstance(cat, str) and cat.strip():
+        # Path-style category like "Bakery > Bread" → take last segment.
+        leaf = cat.strip().rsplit(">", 1)[-1].strip().lower()
+        return leaf
+    # Fallback: BreadcrumbList in any other JSON-LD script.
+    for match in JSONLD_SCRIPT_RE.finditer(html):
+        raw = match.group(1).strip()
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        candidates = [data] if isinstance(data, dict) else []
+        if isinstance(data, dict) and isinstance(data.get("@graph"), list):
+            candidates.extend(n for n in data["@graph"] if isinstance(n, dict))
+        for node in candidates:
+            if node.get("@type") == "BreadcrumbList":
+                items = node.get("itemListElement") or []
+                if isinstance(items, list) and items:
+                    last = items[-1]
+                    if isinstance(last, dict):
+                        item = last.get("item") or last.get("name")
+                        if isinstance(item, dict):
+                            item = item.get("name") or ""
+                        if isinstance(item, str) and item.strip():
+                            return item.strip().lower()
+    return ""
+
+
 def payload_gate(candidate: _Candidate) -> tuple[Optional[_Candidate], Optional[RejectionRecord]]:
     """
     Post-fetch validation per MASA-138 §5 (payload gate).
@@ -292,12 +398,53 @@ def payload_gate(candidate: _Candidate) -> tuple[Optional[_Candidate], Optional[
 
     Mutates candidate with parsed fields on success.
     """
-    raise NotImplementedError(
-        "MASA-155 skeleton: payload gate body. "
-        "Implementation: call _parse_jsonld_product, extract name/brand/"
-        "offers.price/image, check expired_offer/noindex via "
-        "extract_page_text_signals, populate candidate fields."
-    )
+    html = candidate.raw_html
+    # noindex check first — cheapest, applies regardless of JSON-LD presence.
+    if NOINDEX_META_RE.search(html):
+        return None, RejectionRecord(
+            url=candidate.url, gate="payload", reason_code="noindex_meta"
+        )
+
+    jsonld = _parse_jsonld_product(html)
+    if jsonld is None:
+        return None, RejectionRecord(
+            url=candidate.url, gate="payload", reason_code="not_product_jsonld"
+        )
+    candidate.json_ld = jsonld
+
+    image = _extract_image(jsonld)
+    if not image:
+        return None, RejectionRecord(
+            url=candidate.url, gate="payload", reason_code="missing_image",
+            json_ld_excerpt=json.dumps({k: jsonld.get(k) for k in ("@type", "name")})[:500],
+        )
+
+    price = _extract_price(jsonld)
+    if price is None:
+        return None, RejectionRecord(
+            url=candidate.url, gate="payload", reason_code="no_price",
+            json_ld_excerpt=json.dumps({"offers": jsonld.get("offers")})[:500],
+        )
+
+    # Expired-offer check on visible page text, not raw HTML
+    # (avoids false positives in script tags or HTML comments).
+    signals = extract_page_text_signals(html)
+    text_lower = signals.get("text", "").lower()
+    for phrase in EXPIRED_OFFER_PHRASES:
+        if phrase in text_lower:
+            return None, RejectionRecord(
+                url=candidate.url, gate="payload", reason_code="expired_offer",
+                json_ld_excerpt=phrase,
+            )
+
+    candidate.image_url = image
+    candidate.price = price
+    name = jsonld.get("name")
+    candidate.name = name.strip() if isinstance(name, str) else ""
+    candidate.brand = _extract_brand(jsonld)
+    candidate.breadcrumb_leaf = _extract_breadcrumb_leaf(jsonld, html)
+    candidate.size_text = extract_size_from_html(html) or ""
+    return candidate, None
 
 
 # ---------------------------------------------------------------------------
