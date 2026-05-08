@@ -70,6 +70,48 @@ PASSWORD = os.getenv('SCRAPER_PASSWORD', 'pricerIE')
 COUNTRY = os.getenv('SCRAPER_COUNTRY', 'IE')
 CURRENCY = os.getenv('SCRAPER_CURRENCY', 'EUR')
 
+# PDP URL patterns per supermarket. The fragment we test against is the FINAL
+# response URL after redirects — if the alias's scraper_url silently redirects
+# to a category landing page (e.g. /shop/en-IE/browse/...), the final URL won't
+# match the per-store PDP regex and the scraper aborts before extracting bogus
+# prices from category-page HTML. Calibrated from production sample URLs as of
+# 2026-05-08; if a store changes URL conventions, update here.
+PDP_PATTERNS = {
+    'tesco':         re.compile(r'/products/\d+', re.IGNORECASE),
+    'aldi':          re.compile(r'/p/[a-z0-9-]+', re.IGNORECASE),
+    'supervalu':     re.compile(r'/shop/[a-z0-9-/]+/\d{6,}', re.IGNORECASE),
+    'lidl':          re.compile(r'/p/[a-z0-9-]+/p\d+', re.IGNORECASE),
+    'dunnes':        re.compile(r'-\d{6,}\.html', re.IGNORECASE),
+    'dunnes stores': re.compile(r'-\d{6,}\.html', re.IGNORECASE),
+}
+
+
+def _validate_pdp_redirect(store: str, requested_url: str, final_url: str):
+    """Return (is_valid, error_message_or_None).
+
+    A "valid" outcome is either: no redirect happened, or the redirect landed on
+    another URL that still matches the store's PDP convention (e.g. www→non-www,
+    locale canonicalisation). A redirect to a path that does NOT match the PDP
+    regex (e.g. /browse/category/...) is reported as invalid so the caller can
+    abort and skip price extraction.
+
+    Args:
+        store: Store name as used in alias['store_name'] — case-insensitive.
+        requested_url: URL the scraper asked for.
+        final_url: response.url for `requests`, or driver.current_url for Selenium.
+    """
+    if not final_url:
+        return True, None  # nothing to compare against; let caller proceed
+    requested = (requested_url or '').rstrip('/').lower()
+    final = final_url.rstrip('/').lower()
+    if requested == final:
+        return True, None
+    pattern = PDP_PATTERNS.get((store or '').lower())
+    if pattern and pattern.search(final):
+        return True, None
+    return False, f"Redirected to non-PDP page: {final_url}"
+
+
 class SimpleLocalScraper:
     """
     MasterMarket Price Scraper - Main scraping engine
@@ -121,6 +163,10 @@ class SimpleLocalScraper:
         self.api_token = None
         self.session = requests.Session()
         self.debug_prices = debug_prices
+        # Set by any scrape_* method when the alias URL redirected to a non-PDP
+        # page; consumed by scrape_store to log the failure via update-status
+        # and skip the upload. Reset to None at the start of each per-alias loop.
+        self._last_redirect_error: Optional[str] = None
 
     def normalize_text_encoding(self, text: str) -> str:
         """
@@ -1597,6 +1643,14 @@ class SimpleLocalScraper:
             # Quick initial check - often price is available immediately
             time.sleep(1)  # Reduced from 3s to 1s
 
+            # Anti-redirect guard: if Aldi rewrote our PDP URL to a category page,
+            # bail before parsing any prices from non-PDP HTML.
+            ok, redirect_err = _validate_pdp_redirect('aldi', url, self.driver.current_url)
+            if not ok:
+                logger.warning(f"🚫 Aldi alias redirected: {redirect_err}")
+                self._last_redirect_error = redirect_err
+                return (None, None)
+
             price = None
             promotion_data = None
 
@@ -1726,6 +1780,16 @@ class SimpleLocalScraper:
                     time.sleep(3)  # Reduced initial wait
                 except Exception as e:
                     logger.debug(f"⚠️ Tesco page load issue: {e}")
+
+                # Anti-redirect guard: Tesco silently redirects discontinued PDPs
+                # to /shop/en-IE/browse/<category>/. Without this check, the
+                # extraction stack would parse prices from the category page's
+                # JSON-LD/regex fallback and upload bogus data (the original bug).
+                ok, redirect_err = _validate_pdp_redirect('tesco', url, self.driver.current_url)
+                if not ok:
+                    logger.warning(f"🚫 Tesco alias redirected: {redirect_err}")
+                    self._last_redirect_error = redirect_err
+                    return None
 
                 # Quick check for error page (Akamai block)
                 page_title = self.driver.title
@@ -1975,7 +2039,14 @@ class SimpleLocalScraper:
 
             # Make request with timeout
             response = session.get(url, headers=headers, timeout=30, allow_redirects=True)
-            
+
+            # Anti-redirect guard (mirror of the Selenium primary path).
+            ok, redirect_err = _validate_pdp_redirect('tesco', url, response.url)
+            if not ok:
+                logger.warning(f"🚫 Tesco alias redirected (requests fallback): {redirect_err}")
+                self._last_redirect_error = redirect_err
+                return None
+
             if response.status_code == 200:
                 html_content = response.text
                 logger.info(f"✅ Successfully fetched Tesco page with requests ({len(html_content)} chars)")
@@ -2368,6 +2439,16 @@ class SimpleLocalScraper:
             # Make request with reasonable timeout
             response = requests.get(url, headers=headers, timeout=25, allow_redirects=True)
 
+            # Anti-redirect guard: SuperValu serves a category landing page when a
+            # SKU is no longer carried; the existing "Storefront EN" detection
+            # below catches some of these but not all. Redirect-based detection
+            # is more reliable across product types.
+            ok, redirect_err = _validate_pdp_redirect('supervalu', url, response.url)
+            if not ok:
+                logger.warning(f"🚫 SuperValu alias redirected: {redirect_err}")
+                self._last_redirect_error = redirect_err
+                return (None, None)
+
             if response.status_code == 200:
                 html_content = response.text
                 logger.info(f"✅ Successfully fetched SuperValu page with requests ({len(html_content)} chars)")
@@ -2619,6 +2700,15 @@ class SimpleLocalScraper:
             self.driver.get(url)
             time.sleep(5)  # Initial wait for page load
 
+            # Anti-redirect guard: Dunnes can land on a category/listing page if
+            # the product is delisted. Skip BEFORE the Cloudflare wait loop so we
+            # don't burn 30-60s on a page that won't yield a valid PDP anyway.
+            ok, redirect_err = _validate_pdp_redirect('dunnes stores', url, self.driver.current_url)
+            if not ok:
+                logger.warning(f"🚫 Dunnes alias redirected: {redirect_err}")
+                self._last_redirect_error = redirect_err
+                return (None, None)
+
             # Check if we got blocked
             page_title = self.driver.title
             logger.info(f"Page title: {page_title}")
@@ -2787,6 +2877,16 @@ class SimpleLocalScraper:
             }
 
             response = requests.get(url, headers=headers, timeout=15, allow_redirects=True)
+
+            # Anti-redirect guard: Lidl rotates URLs weekly per their seasonal
+            # offers system (CLAUDE.md gotcha) — expired SKUs can land on a
+            # category page. Detect and abort before extracting JSON-LD prices
+            # from a category landing page.
+            ok, redirect_err = _validate_pdp_redirect('lidl', url, response.url)
+            if not ok:
+                logger.warning(f"🚫 Lidl alias redirected: {redirect_err}")
+                self._last_redirect_error = redirect_err
+                return None
 
             if response.status_code == 200:
                 html_content = response.text
@@ -3003,7 +3103,14 @@ class SimpleLocalScraper:
                 
                 # Make request with extended timeout for GitHub Actions
                 response = requests.get(url, headers=headers, timeout=45, allow_redirects=True)
-                
+
+                # Anti-redirect guard (mirror of the Selenium primary path).
+                ok, redirect_err = _validate_pdp_redirect('dunnes stores', url, response.url)
+                if not ok:
+                    logger.warning(f"🚫 Dunnes alias redirected (requests fallback): {redirect_err}")
+                    self._last_redirect_error = redirect_err
+                    return None
+
                 if response.status_code == 200:
                     html_content = response.text
                     logger.info(f"✅ Successfully fetched Dunnes page with requests ({len(html_content)} chars)")
@@ -3386,10 +3493,15 @@ class SimpleLocalScraper:
                     continue
             
             start_time = time.time()
-            
+
             # Scrape based on store
             price = None
             scraper_promotion_data = None  # Promotion data returned directly from scraper
+
+            # Reset redirect guard before each per-alias scrape; the scrape_*
+            # methods set self._last_redirect_error when they detect that the
+            # alias URL silently redirected to a non-PDP page.
+            self._last_redirect_error = None
 
             if store_name.lower() == 'aldi':
                 # Aldi scraper now returns (price, promotion_data) tuple
@@ -3406,6 +3518,28 @@ class SimpleLocalScraper:
                 price = self.scrape_lidl(alias['scraper_url'], alias['alias_name'])
 
             elapsed = time.time() - start_time
+
+            # Anti-redirect handling: if any scrape_* method flagged a redirect to
+            # a non-PDP page, report the failure to the backend and skip upload.
+            # An admin can then mark the alias unavailable via the admin UI.
+            if not price and self._last_redirect_error:
+                logger.warning(
+                    f"🚫 REDIRECT: {alias.get('alias_name', '?')} — {self._last_redirect_error}"
+                )
+                self.update_scraping_status(
+                    alias_id=alias['id'],
+                    success=False,
+                    error_message=self._last_redirect_error,
+                )
+                results.append({
+                    'alias_id': alias['id'],
+                    'name': alias['alias_name'],
+                    'price': None,
+                    'uploaded': False,
+                    'time': elapsed,
+                    'redirect_detected': True,
+                })
+                continue
 
             # Check if product was removed/discontinued from store
             if not price and scraper_promotion_data and scraper_promotion_data.get('product_removed'):
