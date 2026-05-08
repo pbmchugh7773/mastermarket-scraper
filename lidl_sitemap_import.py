@@ -34,8 +34,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+from urllib.parse import urlparse
+
 from discover_lidl_common import (
     COMPETING_BRANDS,
+    KNOWN_BRAND_TOKENS,
     LIDL_OWN_BRANDS,
     _brand_mismatch_reason,
     _slug_brand_token,
@@ -43,6 +46,7 @@ from discover_lidl_common import (
     extract_size_from_html,
     fetch_lidl_page,
     fetch_lidl_sitemap_urls,
+    normalise,
 )
 
 # ---------------------------------------------------------------------------
@@ -164,7 +168,21 @@ CONFIDENCE_AUTO_ACCEPT = 0.85
 CONFIDENCE_HUMAN_REVIEW = 0.60
 
 # Lidl product URL pattern: /p/{slug}/p{digits}.
-LIDL_PRODUCT_URL_RE = re.compile(r"/p/[^/]+/p(\d+)/?$")
+LIDL_PRODUCT_URL_RE = re.compile(r"/p/(?P<slug>[^/]+)/p(?P<sku>\d+)/?$")
+
+# §5 image-host whitelist.
+#
+# Source of truth is `web/next.config.js` `images.domains` in the MasterMarket
+# main repo — this scraper repo does not have direct access to it. Any host
+# added here MUST also be added there before the first Phase-1.3 INSERT, or
+# the new Lidl rows will render as broken images on the web frontend.
+#
+# The Lidl IE storefront serves all product images via the Schwarz Group
+# imgproxy CDN (verify empirically with `curl -sI` on a real product page;
+# do not infer from marketing-domain — see feedback memory 2026-04-29).
+LIDL_IMAGE_HOST_WHITELIST: frozenset[str] = frozenset({
+    "imgproxy-retcat.assets.schwarz",
+})
 
 # JSON-LD detection — `<script type="application/ld+json">…</script>`.
 JSONLD_SCRIPT_RE = re.compile(
@@ -243,7 +261,7 @@ def url_gate(url: str, already_imported_skus: set[str]) -> tuple[Optional[_Candi
     m = LIDL_PRODUCT_URL_RE.search(url)
     if not m:
         return None, RejectionRecord(url=url, gate="url", reason_code="bad_url_pattern")
-    sku = m.group(1)
+    sku = m.group("sku")
     if sku in already_imported_skus:
         return None, RejectionRecord(url=url, gate="url", reason_code="already_imported")
     return _Candidate(url=url, sku=sku), None
@@ -451,26 +469,138 @@ def payload_gate(candidate: _Candidate) -> tuple[Optional[_Candidate], Optional[
 # Gate 3 — Insert gate (pre-DB-write)
 # ---------------------------------------------------------------------------
 
+def _slug_from_url(url: str) -> str:
+    """Extract `{slug}` from `/p/{slug}/p{digits}` URL pattern."""
+    m = LIDL_PRODUCT_URL_RE.search(url)
+    return m.group("slug") if m else ""
+
+
+def _brand_is_known(brand: str) -> bool:
+    """
+    True if `brand` (after normalisation) appears in LIDL_OWN_BRANDS or
+    any other KNOWN_BRAND_TOKENS entry. Multi-word brands ("coca cola")
+    match as space-separated tokens after normalise().
+    """
+    if not brand:
+        return False
+    brand_norm = normalise(brand)
+    if not brand_norm:
+        return False
+    # Exact match against the canonical brand list (post-normalisation).
+    for token in KNOWN_BRAND_TOKENS:
+        if normalise(token) == brand_norm:
+            return True
+    return False
+
+
+def _brand_in_lidl_own_brands(brand: str) -> bool:
+    if not brand:
+        return False
+    brand_norm = normalise(brand)
+    return any(normalise(b) == brand_norm for b in LIDL_OWN_BRANDS)
+
+
+def _image_host(image_url: str) -> str:
+    try:
+        return urlparse(image_url).hostname or ""
+    except (ValueError, TypeError):
+        return ""
+
+
+def _compute_confidence(candidate: _Candidate, breadcrumb_hub: str) -> tuple[float, dict]:
+    """
+    Apply MASA-138 §4.2 weights. Returns (score, features) where features is
+    a debug-friendly dict of which signals contributed.
+
+    `well_formed_product_jsonld` is implicitly true because we got past
+    payload_gate; we still record it explicitly for the rejection-record
+    audit trail.
+    `size_from_jsonld` is currently always False — Phase-1.2 extracts size
+    from HTML signals, not JSON-LD weight/volume. Wired here so the next
+    chunk that adds JSON-LD size extraction flips the bit without touching
+    this scoring function.
+    """
+    features = {
+        "well_formed_product_jsonld": True,
+        "breadcrumb_unambiguous": bool(breadcrumb_hub),
+        "size_from_jsonld": False,  # TODO: flip when JSON-LD size extracted
+        "brand_in_lidl_own_brands": _brand_in_lidl_own_brands(candidate.brand),
+        "image_host_whitelisted": _image_host(candidate.image_url) in LIDL_IMAGE_HOST_WHITELIST,
+    }
+    score = sum(CONFIDENCE_WEIGHTS[k] for k, present in features.items() if present)
+    return round(score, 2), features
+
+
 def insert_gate(candidate: _Candidate) -> tuple[Optional[ImportProposal], Optional[RejectionRecord]]:
     """
     Insert gate per MASA-138 §5.
 
     Rejects:
-      - unknown_brand              — brand not in LIDL_OWN_BRANDS / KNOWN_BRAND_TOKENS
-      - competing_brand_in_slug    — slug carries a brand from COMPETING_BRANDS
-                                     (Vemondo→Alpro class — see MASA-135)
-      - image_host_not_whitelisted — image_url host not in next.config.js allowlist
-      - size_source_conflict       — JSON-LD size disagrees with slug-derived size
       - unknown_breadcrumb_leaf    — breadcrumb leaf not in LIDL_BREADCRUMB_TO_HUB
+      - unknown_brand              — brand not in LIDL_OWN_BRANDS / KNOWN_BRAND_TOKENS
+      - competing_brand_in_slug    — slug carries a different brand than the
+                                     JSON-LD-declared brand (Vemondo→Alpro class)
+      - image_host_not_whitelisted — image_url host not in LIDL_IMAGE_HOST_WHITELIST
+      - size_source_conflict       — JSON-LD size disagrees with slug-derived size
+                                     (TODO: needs JSON-LD weight/volume extraction)
 
+    Order is cheapest-first to short-circuit on the most common rejects.
     Computes confidence per §4.2 weights. Returns ImportProposal on success.
     """
-    raise NotImplementedError(
-        "MASA-155 skeleton: insert gate body. "
-        "Implementation: brand canonicalise via LIDL_OWN_BRANDS, "
-        "_brand_mismatch_reason, breadcrumb→hub via LIDL_BREADCRUMB_TO_HUB, "
-        "image host check, confidence score from CONFIDENCE_WEIGHTS."
-    )
+    # 1. Breadcrumb → hub. Cheapest dict lookup; rejects free-text categories
+    #    like "Lidl Surprises" that the seed table doesn't cover.
+    hub = LIDL_BREADCRUMB_TO_HUB.get(candidate.breadcrumb_leaf)
+    if hub is None:
+        return None, RejectionRecord(
+            url=candidate.url, gate="insert", reason_code="unknown_breadcrumb_leaf",
+            json_ld_excerpt=f"breadcrumb_leaf={candidate.breadcrumb_leaf!r}",
+        )
+
+    # 2. Brand must be in our universe of known brands. Empty brand or
+    #    free-text brand we don't recognise → reject (rules-doc principle:
+    #    "missing > wrong").
+    if not _brand_is_known(candidate.brand):
+        return None, RejectionRecord(
+            url=candidate.url, gate="insert", reason_code="unknown_brand",
+            json_ld_excerpt=f"brand={candidate.brand!r}",
+        )
+
+    # 3. Brand-in-slug consistency check (MASA-135 v3 hard reject).
+    #    `_brand_mismatch_reason` returns "competing_brand_in_slug" if the
+    #    slug advertises a different known brand than the product JSON-LD.
+    slug = _slug_from_url(candidate.url)
+    sitemap_norm = normalise(slug.replace("-", " "))
+    mismatch = _brand_mismatch_reason(candidate.brand, sitemap_norm)
+    if mismatch is not None:
+        return None, RejectionRecord(
+            url=candidate.url, gate="insert", reason_code=mismatch,
+            json_ld_excerpt=f"brand={candidate.brand!r}, slug={slug!r}",
+        )
+
+    # 4. Image host must be whitelisted in web/next.config.js.
+    image_host = _image_host(candidate.image_url)
+    if image_host not in LIDL_IMAGE_HOST_WHITELIST:
+        return None, RejectionRecord(
+            url=candidate.url, gate="insert", reason_code="image_host_not_whitelisted",
+            json_ld_excerpt=f"image_host={image_host!r}",
+        )
+
+    # 5. size_source_conflict — TODO when JSON-LD weight/volume extraction lands.
+
+    # All gates passed. Compute confidence.
+    confidence, features = _compute_confidence(candidate, hub)
+    candidate.confidence_features = features
+
+    return ImportProposal(
+        proposed_name=candidate.name,
+        proposed_brand=candidate.brand,
+        proposed_category=hub,
+        proposed_unit=candidate.size_text,
+        image_url=candidate.image_url,
+        json_ld_price=candidate.price,
+        sitemap_url=candidate.url,
+        confidence=confidence,
+    ), None
 
 
 # ---------------------------------------------------------------------------
