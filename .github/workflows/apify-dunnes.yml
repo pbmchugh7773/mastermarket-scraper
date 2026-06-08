@@ -97,10 +97,14 @@ jobs:
 
       - name: 🩺 Validate scrape success
         if: always()
-        # Loud-fail health check (MASA-108). Detects silent ingestion failures
-        # like the MASA-106 4h outage where every API call returned 401 but the
-        # workflow reported success. Hard-fails the job if:
+        # Loud-fail health check (MASA-108, extended 2026-06-08 with Apify
+        # quota detection after the Tesco 4-day outage). Detects silent
+        # ingestion failures like the MASA-106 401-retry outage AND Apify
+        # free-tier compute exhaustion (the failure mode that hit Tesco on
+        # 2026-06-04, where actor.call() returns "exceed your remaining usage"
+        # and the script ships with zero or partial uploads). Hard-fails if:
         #   - log file missing (scraper crashed pre-logging)
+        #   - Apify quota exhausted (>= 1 hit on quota pattern)
         #   - "Authentication failed:" > 0 (initial auth fatal)
         #   - TOTAL > 0 and UPLOADS < 5% of TOTAL (silent failure)
         #   - 401-retry-thrashing > 50 (post-MASA-106 helper running hot)
@@ -114,14 +118,19 @@ jobs:
 
           AUTH_FAILS=$(grep -cE "Authentication failed:" "$LOG" || true)
           AUTH_RETRIES=$(grep -cE "401 on .* re-authenticating and retrying" "$LOG" || true)
+          QUOTA_ERR=$(grep -cE "exceed your remaining usage|exceeded.*monthly usage|Account is locked|insufficient credits" "$LOG" || true)
           TOTAL=$(grep -E "Total aliases:\s+[0-9]+" "$LOG" | grep -oE "[0-9]+" | tail -1)
           UPLOADS=$(grep -E "Prices uploaded:\s+[0-9]+" "$LOG" | grep -oE "[0-9]+" | tail -1)
           TOTAL=${TOTAL:-0}
           UPLOADS=${UPLOADS:-0}
 
-          echo "::notice::dunnes health: total_aliases=$TOTAL uploads=$UPLOADS auth_fails=$AUTH_FAILS auth_retries=$AUTH_RETRIES"
+          echo "::notice::dunnes health: total_aliases=$TOTAL uploads=$UPLOADS auth_fails=$AUTH_FAILS auth_retries=$AUTH_RETRIES quota_err=$QUOTA_ERR"
 
           FAIL=0
+          if [ "$QUOTA_ERR" -gt 0 ]; then
+            echo "::error::dunnes: Apify quota/credits exhausted — top up at https://console.apify.com/billing/subscription (APIFY_API_TOKEN account)."
+            FAIL=1
+          fi
           if [ "$AUTH_FAILS" -gt 0 ]; then
             echo "::error::dunnes: $AUTH_FAILS fatal auth failures detected."
             FAIL=1

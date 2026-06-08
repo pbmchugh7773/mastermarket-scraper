@@ -147,7 +147,7 @@ def test_silent_outage_main_batch_fails(tmp_path: Path):
 
     # Main batches set RUN_TYPE=retry in the workflow (all scheduled runs use
     # --retry-mode), so we test the 700/0 outage with run_type=retry — the
-    # MIN_PROCESSED=50 gate must still let it trip the silent-ingestion alarm.
+    # MIN_PROCESSED=200 gate must still let it trip the silent-ingestion alarm.
     result = _run_validator(tmp_path, log, run_type="retry")
 
     assert result.returncode == 1
@@ -156,18 +156,45 @@ def test_silent_outage_main_batch_fails(tmp_path: Path):
 
 
 def test_silent_outage_at_threshold_boundary(tmp_path: Path):
-    """PROCESSED=50 exactly trips the gate; PROCESSED=49 does not."""
-    log_50 = _summary(processed=50, uploaded=0)
-    log_49 = _summary(processed=49, uploaded=0)
+    """PROCESSED=200 exactly trips the gate; PROCESSED=199 does not.
 
-    at_threshold = _run_validator(tmp_path / "at", log_50, run_type="retry")
-    below_threshold = _run_validator(tmp_path / "below", log_49, run_type="retry")
+    Threshold raised 50 → 200 on 2026-06-08 after the Tesco Apify-quota
+    outage exposed daily-scraping retry false-positives: Aldi (~60
+    chronic anti-bot failures) and Lidl (~56 chronic URL-rotation
+    failures) were tripping the silent-ingestion alarm on every retry
+    batch even though no ingestion was actually being missed.
+    """
+    log_200 = _summary(processed=200, uploaded=0)
+    log_199 = _summary(processed=199, uploaded=0)
 
-    assert at_threshold.returncode == 1, "PROCESSED=50 must trip in retry mode"
+    at_threshold = _run_validator(tmp_path / "at", log_200, run_type="retry")
+    below_threshold = _run_validator(tmp_path / "below", log_199, run_type="retry")
+
+    assert at_threshold.returncode == 1, "PROCESSED=200 must trip in retry mode"
     assert "silent-ingestion alarm" in at_threshold.stdout
 
-    assert below_threshold.returncode == 0, "PROCESSED=49 must be treated as no-op"
+    assert below_threshold.returncode == 0, "PROCESSED=199 must be treated as no-op"
     assert "skipping upload-percent check" in below_threshold.stdout
+
+
+def test_chronic_stragglers_retry_passes(tmp_path: Path):
+    """A retry-mode batch of ~60 chronic-failure stragglers (Aldi anti-bot,
+    Lidl URL rotation) with 0 uploads MUST pass — the main batch already
+    covered everything ingest-able, the retry just confirms the same
+    products that fail every run.
+
+    This is the false-positive class that the 2026-06-08 threshold tune
+    addresses (50 → 200). Without this guard, every Mon/Thu retry batch
+    of daily-scraping shipped red on Aldi+Lidl.
+    """
+    log = _summary(processed=60, uploaded=0)
+    result = _run_validator(tmp_path, log, run_type="retry")
+
+    assert result.returncode == 0, (
+        f"60-stragglers retry must pass; stdout=\n{result.stdout}\nstderr=\n{result.stderr}"
+    )
+    assert "skipping upload-percent check" in result.stdout
+    assert "processed=60" in result.stdout
 
 
 def test_silent_outage_promotions_mode_low_processed_still_fails(tmp_path: Path):

@@ -10,12 +10,16 @@
 #   - 401-retry-thrashing > 50 (post-MASA-106 helper running hot ⇒ JWT TTL too short)
 #   - PROCESSED >= MIN_PROCESSED and UPLOADS < 5% of PROCESSED (silent failure)
 #
-# MIN_PROCESSED gate (MASA-147): retry-mode 6AM/8AM batches typically process
-# only a handful of stragglers — 0 uploads from 3 processed is not a
-# silent-ingestion outage. We require PROCESSED >= 50 in retry mode before
-# applying the upload-percent check. Main batches (4AM) process ~700 products
-# so the threshold trips immediately on a real outage. Promotions and manual
-# runs keep the original PROCESSED > 0 trigger.
+# MIN_PROCESSED gate (MASA-147, retuned 2026-06-08): retry-mode 6AM/8AM
+# batches typically process only a handful of stragglers — 0 uploads from a
+# small batch of chronic failures (Lidl URL rotation ~56, Aldi anti-bot ~60)
+# is not a silent-ingestion outage. We require PROCESSED >= 200 in retry mode
+# before applying the upload-percent check (was 50; 60-stragglers retries
+# kept firing false-positive `silent-ingestion alarm` jobs through 2026-06-08
+# — see docs/retrospectivas/2026-06-08-apify-tesco-quota-outage.md). Main
+# batches (4AM) process ~700 products so the threshold still trips
+# immediately on a real outage. Promotions and manual runs keep the original
+# PROCESSED > 0 trigger.
 #
 # Usage:
 #   validate_scrape_log.sh <log_path> <run_type> <store_name>
@@ -53,7 +57,7 @@ PROCESSED=${PROCESSED:-0}
 UPLOADS=${UPLOADS:-0}
 
 if [ "$RUN_TYPE" = "retry" ]; then
-  MIN_PROCESSED=50
+  MIN_PROCESSED=200
 else
   MIN_PROCESSED=1
 fi
