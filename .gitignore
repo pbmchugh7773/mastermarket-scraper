@@ -65,10 +65,13 @@ htmlcov/
 .env.local
 .env.production
 
-# Test files
+# Test files — scratch/debug scripts dropped at the repo root.
+# The real suite under tests/ is tracked, hence the negation: without it every
+# new tests/test_*.py needs `git add -f` and is silently skipped otherwise.
 test_*.py
 *_test.py
 debug_*.py
+!tests/**/*.py
 
 # Chrome downloads
 downloads/
