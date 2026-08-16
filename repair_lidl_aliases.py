@@ -90,3 +90,42 @@ def check_url_liveness(url):
         return resp.status_code
     except requests.RequestException:
         return None
+
+
+def index_sitemap_by_slug(sitemap):
+    """Group sitemap entries by their URL slug, so pass 1 is a dict lookup."""
+    idx = {}
+    for entry in sitemap:
+        parsed = parse_lidl_url(entry["url"])
+        if parsed is None:
+            continue
+        idx.setdefault(parsed[0], []).append(entry)
+    return idx
+
+
+def find_slug_candidate(slug, old_sku, sitemap_by_slug):
+    """
+    The sitemap entry that carries `slug` under a SKU other than `old_sku`.
+
+    Returns None when the slug is gone, when the only hit is the dead SKU
+    itself, or when several entries share the slug — that last case is
+    ambiguous and pass 2 resolves it with the size gate instead of guessing.
+    """
+    hits = [e for e in sitemap_by_slug.get(slug, []) if e["sku"] != old_sku]
+    if len(hits) != 1:
+        return None
+    return hits[0]
+
+
+def decide_slug_size(mm_size, html_size):
+    """
+    'match' | 'mismatch' | 'unverified' for the pass-1 size check.
+
+    An identical slug under a new SKU is strong evidence on its own, so a size
+    we cannot derive on either side does not veto the repair — it downgrades it
+    to slug_exact_unverified. Two sizes that are both known and disagree do
+    veto it: that is a different format sharing a slug.
+    """
+    if mm_size is None or html_size is None:
+        return "unverified"
+    return "match" if mm_size.lower() == html_size.lower() else "mismatch"
