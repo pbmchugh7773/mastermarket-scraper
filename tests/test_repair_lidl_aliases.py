@@ -17,6 +17,8 @@ if PROJECT_ROOT not in sys.path:
 
 from repair_lidl_aliases import (  # noqa: E402
     build_match_product,
+    build_repair_record,
+    build_unmatched_record,
     choose_token_outcome,
     classify_liveness,
     decide_slug_size,
@@ -240,6 +242,38 @@ class ChooseTokenOutcomeTests(unittest.TestCase):
         chosen, reason = choose_token_outcome([], [])
         self.assertIsNone(chosen)
         self.assertEqual(reason, "no_match")
+
+
+class RecordShapeTests(unittest.TestCase):
+    def test_repair_record_carries_both_urls_and_the_method(self):
+        alias = _alias(770, scraper_url="https://www.lidl.ie/p/rice-krispies/p247198")
+        product = build_match_product(
+            {"id": 55, "name": "Rice Krispies 340g", "brand": "Kellogg's", "unit": "g"}
+        )
+        entry = _entry("rice-krispies", "10000280")
+        rec = build_repair_record(alias, product, entry, "slug_exact", "340g", None)
+        self.assertEqual(rec["alias_id"], 770)
+        self.assertEqual(rec["product_id"], 55)
+        self.assertEqual(rec["old_url"], "https://www.lidl.ie/p/rice-krispies/p247198")
+        self.assertEqual(rec["new_url"], "https://www.lidl.ie/p/rice-krispies/p10000280")
+        self.assertEqual(rec["method"], "slug_exact")
+        self.assertEqual(rec["html_size"], "340g")
+        self.assertIsNone(rec["score"])
+
+    def test_repair_record_rounds_a_token_score(self):
+        alias = _alias(771)
+        product = build_match_product({"id": 56, "name": "X", "brand": "Y", "unit": "g"})
+        rec = build_repair_record(
+            alias, product, _entry("x", "1"), "token_match", "500g", 0.61234
+        )
+        self.assertEqual(rec["score"], 0.612)
+
+    def test_unmatched_record_carries_the_reason_and_no_new_url(self):
+        alias = _alias(772)
+        product = build_match_product({"id": 57, "name": "X", "brand": "Y", "unit": "g"})
+        rec = build_unmatched_record(alias, product, "no_match")
+        self.assertEqual(rec["reason"], "no_match")
+        self.assertNotIn("new_url", rec)
 
 
 if __name__ == "__main__":

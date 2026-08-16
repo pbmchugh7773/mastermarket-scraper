@@ -18,8 +18,13 @@ and never touches unmatched aliases.
 
 See docs/superpowers/specs/2026-08-10-lidl-alias-repair-design.md
 """
+import argparse
+import json
 import re
+import sys
 from collections import Counter
+from datetime import datetime, timezone
+from pathlib import Path
 
 import requests
 
@@ -31,6 +36,11 @@ from discover_lidl_aliases import (
     variant_tokens,
     token_score,
     apply_brand_mismatch_filter,
+    API_URL,
+    _api_login,
+    fetch_lidl_sitemap_urls,
+    fetch_lidl_page,
+    extract_size_from_html,
 )
 
 BROKEN_STATUSES = (404, 410)
@@ -196,3 +206,227 @@ def choose_token_outcome(survivors, rejections):
     if rejections:
         return None, Counter(rejections).most_common(1)[0][0]
     return None, "no_match"
+
+
+API_TIMEOUT = 60
+
+
+def fetch_lidl_aliases(token):
+    """Every Lidl alias, active or not — a parked alias can still be broken."""
+    resp = requests.get(
+        f"{API_URL}/api/product-aliases/store/Lidl",
+        params={"active_only": "false"},
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=API_TIMEOUT,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def fetch_all_products_by_id():
+    """/products/all-simple keyed by product id. Public endpoint, no auth."""
+    resp = requests.get(
+        f"{API_URL}/products/all-simple",
+        headers={"User-Agent": USER_AGENT},
+        timeout=API_TIMEOUT,
+    )
+    resp.raise_for_status()
+    return {row["id"]: row for row in resp.json() if row.get("id") is not None}
+
+
+def build_repair_record(alias, product, entry, method, html_size, score):
+    return {
+        "alias_id": alias["id"],
+        "product_id": product["id"],
+        "product_name": product["name"],
+        "product_brand": product["brand"],
+        "old_url": alias["scraper_url"],
+        "new_url": entry["url"],
+        "method": method,
+        "product_size": product["size"],
+        "html_size": html_size,
+        "score": round(score, 3) if score is not None else None,
+    }
+
+
+def build_unmatched_record(alias, product, reason):
+    return {
+        "alias_id": alias["id"],
+        "product_id": product["id"],
+        "product_name": product["name"],
+        "product_brand": product["brand"],
+        "old_url": alias["scraper_url"],
+        "reason": reason,
+    }
+
+
+def repair_one(alias, product, sitemap, sitemap_by_slug, fetch_log):
+    """
+    (repair_record | None, unmatched_record | None) for a single broken alias.
+
+    Pass 1 first: an identical slug under a new SKU is far stronger evidence
+    than a 0.55 token overlap, and it needs one HTML fetch instead of one per
+    candidate. A pass-1 size mismatch falls through to pass 2 rather than
+    failing outright — the slug may genuinely belong to a different format now.
+    """
+    slug, old_sku = parse_lidl_url(alias["scraper_url"])
+
+    candidate = find_slug_candidate(slug, old_sku, sitemap_by_slug)
+    if candidate is not None:
+        html = fetch_lidl_page(candidate["url"], fetch_log)
+        html_size = extract_size_from_html(html) if html else None
+        verdict = decide_slug_size(product["size"], html_size)
+        if verdict == "match":
+            return build_repair_record(
+                alias, product, candidate, "slug_exact", html_size, None
+            ), None
+        if verdict == "unverified":
+            return build_repair_record(
+                alias, product, candidate, "slug_exact_unverified", html_size, None
+            ), None
+
+    survivors = []
+    rejections = []
+    scored = select_token_candidates(product, sitemap, REPAIR_THRESHOLD)
+    for entry in scored:
+        html = fetch_lidl_page(entry["url"], fetch_log)
+        if html is None:
+            rejections.append("html_fetch_failed")
+            continue
+        html_size = extract_size_from_html(html)
+        if not html_size:
+            rejections.append("no_html_size")
+            continue
+        if product["size"] is None:
+            rejections.append("unknown_mm_size")
+            continue
+        if product["size"].lower() == html_size.lower():
+            survivors.append((entry, html_size))
+        else:
+            rejections.append("size_mismatch")
+
+    chosen, reason = choose_token_outcome([e for e, _ in survivors], rejections)
+    if chosen is not None:
+        html_size = next(hs for e, hs in survivors if e["url"] == chosen["url"])
+        score = token_score(product, chosen)
+        return build_repair_record(
+            alias, product, chosen, "token_match", html_size, score
+        ), None
+    return None, build_unmatched_record(alias, product, reason)
+
+
+def _parse_args(argv=None):
+    parser = argparse.ArgumentParser(
+        description="Repair Lidl aliases whose scraper_url now 404s."
+    )
+    parser.add_argument(
+        "--apply",
+        action="store_true",
+        help=(
+            "Write the proposed URLs back via PUT /api/product-aliases/{id}. "
+            "Without this the run is proposal-only. Unmatched aliases are "
+            "never touched either way."
+        ),
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Process at most N broken aliases. For smoke-testing a change.",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
+    args = _parse_args(argv)
+    fetch_log = {}
+
+    print("Fetching Lidl sitemap …", file=sys.stderr)
+    sitemap = fetch_lidl_sitemap_urls()
+    sitemap_by_slug = index_sitemap_by_slug(sitemap)
+    print(f"  {len(sitemap)} product URLs", file=sys.stderr)
+
+    token = _api_login()
+    aliases = fetch_lidl_aliases(token)
+    broken = select_broken_aliases(aliases)
+    print(f"  {len(broken)} aliases flagged broken", file=sys.stderr)
+
+    products_by_id = fetch_all_products_by_id()
+
+    repairs, unmatched = [], []
+    verified = 0
+    for alias in broken[: args.limit]:
+        row = products_by_id.get(alias["product_id"])
+        if row is None:
+            unmatched.append(
+                {
+                    "alias_id": alias["id"],
+                    "product_id": alias["product_id"],
+                    "product_name": alias.get("alias_name", ""),
+                    "product_brand": "",
+                    "old_url": alias["scraper_url"],
+                    "reason": "product_not_found",
+                }
+            )
+            continue
+        product = build_match_product(row)
+
+        state = classify_liveness(check_url_liveness(alias["scraper_url"]))
+        if state != "broken":
+            reason = (
+                "alias_recovered"
+                if state == "recovered"
+                else "liveness_check_inconclusive"
+            )
+            unmatched.append(build_unmatched_record(alias, product, reason))
+            continue
+        verified += 1
+
+        repair, miss = repair_one(
+            alias, product, sitemap, sitemap_by_slug, fetch_log
+        )
+        if repair is not None:
+            repairs.append(repair)
+        else:
+            unmatched.append(miss)
+
+    applied, failed = (0, 0)
+    if args.apply:
+        applied, failed = apply_repairs(repairs, token)
+
+    out = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "sitemap_url_count": len(sitemap),
+        "broken_alias_count": len(broken),
+        "verified_404_count": verified,
+        "repairs": repairs,
+        "unmatched": unmatched,
+        "counts_by_method": _count_by(repairs, "method"),
+        "counts_by_reason": _count_by(unmatched, "reason"),
+        "applied": applied,
+        "apply_failures": failed,
+    }
+    out_path = Path(
+        f"/tmp/lidl_repair_proposal_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.json"
+    )
+    out_path.write_text(json.dumps(out, indent=2))
+
+    print(f"\nWrote {out_path}")
+    print(f"  broken aliases:     {len(broken)}")
+    print(f"  verified 404:       {verified}")
+    print(f"  repairs proposed:   {len(repairs)}  {out['counts_by_method']}")
+    print(f"  unmatched:          {len(unmatched)}  {out['counts_by_reason']}")
+    if args.apply:
+        print(f"  applied:            {applied} (failures={failed})")
+    for r in repairs[:15]:
+        print(f"  [{r['method']}] {r['product_name'][:50]}")
+        print(f"      {r['old_url']}  →  {r['new_url']}")
+    return 1 if failed else 0
+
+
+def _count_by(records, key):
+    return dict(sorted(Counter(r[key] for r in records).items(), key=lambda kv: -kv[1]))
+
+
+if __name__ == "__main__":
+    sys.exit(main())
