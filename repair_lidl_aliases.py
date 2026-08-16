@@ -315,6 +315,40 @@ def repair_one(alias, product, sitemap, sitemap_by_slug, fetch_log):
     return None, build_unmatched_record(alias, product, reason)
 
 
+def _put_scraper_url(alias_id, payload, token):
+    resp = requests.put(
+        f"{API_URL}/api/product-aliases/{alias_id}",
+        json=payload,
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=API_TIMEOUT,
+    )
+    resp.raise_for_status()
+
+
+def apply_repairs(repairs, token, put_fn=None):
+    """
+    Write each accepted repair's new URL back. Returns (applied, failed).
+
+    ProductAliasUpdate has no required fields, so the body carries scraper_url
+    alone — no risk of clobbering alias_name or scrape_frequency_hours by
+    round-tripping a whole object. One failure is logged and the batch
+    continues; main() exits non-zero if any failed.
+    """
+    put_fn = put_fn or _put_scraper_url
+    applied = failed = 0
+    for repair in repairs:
+        try:
+            put_fn(repair["alias_id"], {"scraper_url": repair["new_url"]}, token)
+            applied += 1
+        except Exception as exc:  # noqa: BLE001 — one bad alias must not abort
+            failed += 1
+            print(
+                f"  ! alias {repair['alias_id']} update failed: {exc}",
+                file=sys.stderr,
+            )
+    return applied, failed
+
+
 def _parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description="Repair Lidl aliases whose scraper_url now 404s."

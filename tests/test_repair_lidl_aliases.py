@@ -16,6 +16,7 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 from repair_lidl_aliases import (  # noqa: E402
+    apply_repairs,
     build_match_product,
     build_repair_record,
     build_unmatched_record,
@@ -274,6 +275,38 @@ class RecordShapeTests(unittest.TestCase):
         rec = build_unmatched_record(alias, product, "no_match")
         self.assertEqual(rec["reason"], "no_match")
         self.assertNotIn("new_url", rec)
+
+
+class ApplyRepairsTests(unittest.TestCase):
+    def _repairs(self, n):
+        return [
+            {"alias_id": i, "new_url": f"https://www.lidl.ie/p/x/p{i}"}
+            for i in range(1, n + 1)
+        ]
+
+    def test_sends_one_put_per_repair_with_only_scraper_url(self):
+        calls = []
+
+        def fake_put(alias_id, payload, token):
+            calls.append((alias_id, payload, token))
+
+        applied, failed = apply_repairs(self._repairs(2), "tok", put_fn=fake_put)
+        self.assertEqual((applied, failed), (2, 0))
+        self.assertEqual([c[0] for c in calls], [1, 2])
+        self.assertEqual(calls[0][1], {"scraper_url": "https://www.lidl.ie/p/x/p1"})
+        self.assertEqual(calls[0][2], "tok")
+
+    def test_one_failure_does_not_stop_the_batch(self):
+        def fake_put(alias_id, payload, token):
+            if alias_id == 2:
+                raise RuntimeError("boom")
+
+        applied, failed = apply_repairs(self._repairs(3), "tok", put_fn=fake_put)
+        self.assertEqual((applied, failed), (2, 1))
+
+    def test_empty_batch_is_a_no_op(self):
+        applied, failed = apply_repairs([], "tok", put_fn=lambda *a: None)
+        self.assertEqual((applied, failed), (0, 0))
 
 
 if __name__ == "__main__":
