@@ -6,20 +6,28 @@ docs/superpowers/specs/2026-08-10-lidl-alias-repair-design.md
 """
 from __future__ import annotations
 
+import contextlib
+import io
+import json
 import os
+import pathlib
 import sys
+import tempfile
 import unittest
+from unittest import mock
 
 TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.abspath(os.path.join(TESTS_DIR, ".."))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
+import repair_lidl_aliases as rla  # noqa: E402
 from repair_lidl_aliases import (  # noqa: E402
     apply_repairs,
     build_match_product,
     build_repair_record,
     build_unmatched_record,
+    check_url_liveness,
     choose_token_outcome,
     classify_liveness,
     decide_slug_size,
@@ -27,6 +35,7 @@ from repair_lidl_aliases import (  # noqa: E402
     index_sitemap_by_slug,
     parse_lidl_url,
     REPAIR_THRESHOLD,
+    repair_one,
     select_broken_aliases,
     select_token_candidates,
 )
@@ -307,6 +316,347 @@ class ApplyRepairsTests(unittest.TestCase):
     def test_empty_batch_is_a_no_op(self):
         applied, failed = apply_repairs([], "tok", put_fn=lambda *a: None)
         self.assertEqual((applied, failed), (0, 0))
+
+
+PDP = "https://www.lidl.ie/p/parmigiano-reggiano-dop/p111"
+PASS1_URL = "https://www.lidl.ie/p/parmigiano-reggiano-dop/p222"
+PASS2_URL = "https://www.lidl.ie/p/italiamo-parmigiano-reggiano-dop/p333"
+CATEGORY_URL = "https://www.lidl.ie/c/cheese-and-dairy/s10068094"
+
+
+def _size_html(size):
+    """Minimal page HTML that extract_size_from_html() reads a size out of."""
+    return f"<html><body><span>{size}</span></body></html>"
+
+
+NO_SIZE_HTML = "<html><body><span>Delicious and creamy</span></body></html>"
+
+
+class LivenessRedirectTests(unittest.TestCase):
+    """A 200 that landed off the Lidl PDP pattern must not read as recovered."""
+
+    def test_200_that_did_not_redirect_is_recovered(self):
+        self.assertEqual(classify_liveness(200, PDP, PDP), "recovered")
+
+    def test_200_redirected_to_another_pdp_is_recovered(self):
+        """www→non-www and locale canonicalisation are legitimate."""
+        self.assertEqual(classify_liveness(200, PDP, PASS1_URL), "recovered")
+
+    def test_200_redirected_to_a_category_page_is_inconclusive(self):
+        """The failure mode this guards: a dead PDP bounced to a listing page
+        would otherwise mark the whole fleet self-healed and propose nothing."""
+        self.assertEqual(classify_liveness(200, PDP, CATEGORY_URL), "inconclusive")
+
+    def test_404_stays_broken_regardless_of_where_it_landed(self):
+        self.assertEqual(classify_liveness(404, PDP, CATEGORY_URL), "broken")
+
+    def test_missing_final_url_leaves_a_200_recovered(self):
+        """No redirect evidence either way — do not invent a rejection."""
+        self.assertEqual(classify_liveness(200, PDP, None), "recovered")
+        self.assertEqual(classify_liveness(200), "recovered")
+
+
+class CheckUrlLivenessTests(unittest.TestCase):
+    def test_returns_status_and_final_url(self):
+        resp = mock.Mock(status_code=200, url=CATEGORY_URL)
+        with mock.patch.object(rla.requests, "get", return_value=resp):
+            self.assertEqual(check_url_liveness(PDP), (200, CATEGORY_URL))
+
+    def test_request_failure_is_none_none(self):
+        with mock.patch.object(
+            rla.requests, "get", side_effect=rla.requests.RequestException("boom")
+        ):
+            self.assertEqual(check_url_liveness(PDP), (None, None))
+
+
+class RepairOneTests(unittest.TestCase):
+    """
+    Routing between pass 1 and pass 2. Every HTML fetch is stubbed, so these
+    are offline and deterministic.
+
+    Fixture: the alias points at .../parmigiano-reggiano-dop/p111. The sitemap
+    carries that same slug under a new SKU (p222 — pass 1's candidate) and a
+    brand-prefixed variant (p333) that pass 2 scores at 1.0. Which URL comes
+    back therefore says which pass produced the repair.
+    """
+
+    def setUp(self):
+        self.alias = _alias(770, scraper_url=PDP)
+        self.product = build_match_product(
+            {
+                "id": 55,
+                "name": "Parmigiano Reggiano DOP 500g",
+                "brand": "Italiamo",
+                "unit": "g",
+            }
+        )
+        self.sitemap = [
+            _entry("parmigiano-reggiano-dop", "222"),
+            _entry("italiamo-parmigiano-reggiano-dop", "333"),
+        ]
+        self.by_slug = index_sitemap_by_slug(self.sitemap)
+        self.fetched = []
+
+    def _run(self, pages):
+        def fake_fetch(url, fetch_log):
+            self.fetched.append(url)
+            return pages.get(url)
+
+        with mock.patch.object(rla, "fetch_lidl_page", side_effect=fake_fetch):
+            return repair_one(
+                self.alias, self.product, self.sitemap, self.by_slug, {}
+            )
+
+    def test_pass1_size_match_is_accepted(self):
+        repair, miss = self._run({PASS1_URL: _size_html("500g")})
+        self.assertIsNone(miss)
+        self.assertEqual(repair["method"], "slug_exact")
+        self.assertEqual(repair["new_url"], PASS1_URL)
+        self.assertEqual(self.fetched, [PASS1_URL], "pass 1 should stop on a match")
+
+    def test_pass1_page_fetched_but_sizeless_is_accepted_as_unverified(self):
+        """'unverified' keeps its meaning: the page WAS retrieved, it just had
+        no size to check the slug against."""
+        repair, miss = self._run({PASS1_URL: NO_SIZE_HTML})
+        self.assertIsNone(miss)
+        self.assertEqual(repair["method"], "slug_exact_unverified")
+        self.assertEqual(repair["new_url"], PASS1_URL)
+        self.assertIsNone(repair["html_size"])
+
+    def test_pass1_size_mismatch_falls_through_to_pass2(self):
+        repair, miss = self._run(
+            {PASS1_URL: _size_html("750g"), PASS2_URL: _size_html("500g")}
+        )
+        self.assertIsNone(miss)
+        self.assertEqual(repair["method"], "token_match")
+        self.assertEqual(repair["new_url"], PASS2_URL)
+
+    def test_pass1_fetch_failure_falls_through_to_pass2(self):
+        """
+        Regression: fetch_lidl_page returns None both for a transport failure
+        and for a candidate that itself 404s. Pass 1 used to read that as
+        decide_slug_size(size, None) == 'unverified' and accept it, proposing a
+        URL that was never retrieved — under --apply, one dead URL written over
+        another. Pass 2 always rejected the same condition, so the weaker
+        evidence path was the more permissive one.
+        """
+        repair, miss = self._run({PASS1_URL: None, PASS2_URL: _size_html("500g")})
+        self.assertIsNone(miss)
+        self.assertEqual(repair["method"], "token_match")
+        self.assertEqual(repair["new_url"], PASS2_URL)
+        self.assertNotEqual(
+            repair["new_url"], PASS1_URL, "never propose a URL that 404'd on us"
+        )
+
+    def test_pass1_fetch_failure_with_no_pass2_rescue_is_unmatched(self):
+        repair, miss = self._run({PASS1_URL: None, PASS2_URL: None})
+        self.assertIsNone(repair)
+        self.assertEqual(miss["reason"], "html_fetch_failed")
+        self.assertNotIn("new_url", miss)
+
+    def test_pass2_size_mismatch_everywhere_is_unmatched(self):
+        repair, miss = self._run(
+            {PASS1_URL: _size_html("750g"), PASS2_URL: _size_html("750g")}
+        )
+        self.assertIsNone(repair)
+        self.assertEqual(miss["reason"], "size_mismatch")
+
+    def test_unknown_mm_size_short_circuits_pass2_without_fetching(self):
+        """Pass 2 can only accept on a size equality, so a product with no
+        derivable size is a foregone rejection — do not pay a live fetch per
+        candidate to discover that, and do not let the reason be a Counter
+        tie-break against no_html_size."""
+        self.product = build_match_product(
+            {"id": 56, "name": "Parmigiano Reggiano DOP", "brand": "Italiamo",
+             "unit": "portion"}
+        )
+        self.assertIsNone(self.product["size"])
+        self.alias = _alias(771, scraper_url="https://www.lidl.ie/p/gone-slug/p111")
+
+        repair, miss = self._run({PASS2_URL: _size_html("500g")})
+        self.assertIsNone(repair)
+        self.assertEqual(miss["reason"], "unknown_mm_size")
+        self.assertEqual(self.fetched, [], "no candidate should have been fetched")
+
+
+def _product_row(pid, name, brand, unit):
+    return {"id": pid, "name": name, "brand": brand, "unit": unit}
+
+
+class MainTests(unittest.TestCase):
+    """
+    End-to-end orchestration with every network call stubbed: the sitemap, the
+    API login, the alias and product fetches, the liveness probe, the page
+    fetch and the PUT.
+    """
+
+    def setUp(self):
+        self.sitemap = [
+            _entry("parmigiano-reggiano-dop", "222"),
+            _entry("italiamo-parmigiano-reggiano-dop", "333"),
+        ]
+        self.repairable = _alias(770, product_id=55, scraper_url=PDP)
+        self.unmatchable = _alias(
+            771, product_id=56, scraper_url="https://www.lidl.ie/p/gone-slug/p999"
+        )
+        self.products = {
+            55: _product_row(55, "Parmigiano Reggiano DOP 500g", "Italiamo", "g"),
+            56: _product_row(56, "Mystery Item", "Kania", "portion"),
+        }
+        self.pages = {PASS1_URL: _size_html("500g"), PASS2_URL: _size_html("500g")}
+
+    def _run_main(self, argv=(), aliases=None, liveness=None, put_side_effect=None):
+        """(exit_code, proposal_dict, put_calls) for a fully stubbed run."""
+        aliases = self.repairable if aliases is None else aliases
+        aliases = aliases if isinstance(aliases, list) else [aliases]
+        liveness = liveness or {}
+        put_calls = []
+
+        def fake_liveness(url):
+            return liveness.get(url, (404, url))
+
+        def fake_page(url, fetch_log):
+            return self.pages.get(url)
+
+        def fake_put(alias_id, payload, token):
+            put_calls.append((alias_id, payload, token))
+            if put_side_effect is not None:
+                put_side_effect(alias_id, payload, token, self.out_path)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            def fake_path(p):
+                # Keep main's filename, redirect it out of /tmp for the test.
+                self.out_path = pathlib.Path(tmp) / pathlib.Path(p).name
+                return self.out_path
+
+            with mock.patch.object(
+                rla, "fetch_lidl_sitemap_urls", return_value=self.sitemap
+            ), mock.patch.object(
+                rla, "_api_login", return_value="tok"
+            ), mock.patch.object(
+                rla, "fetch_lidl_aliases", return_value=aliases
+            ), mock.patch.object(
+                rla, "fetch_all_products_by_id", return_value=self.products
+            ), mock.patch.object(
+                rla, "check_url_liveness", side_effect=fake_liveness
+            ), mock.patch.object(
+                rla, "fetch_lidl_page", side_effect=fake_page
+            ), mock.patch.object(
+                rla, "_put_scraper_url", side_effect=fake_put
+            ), mock.patch.object(
+                rla, "Path", fake_path
+            ), contextlib.redirect_stdout(
+                io.StringIO()
+            ), contextlib.redirect_stderr(
+                io.StringIO()
+            ):
+                code = rla.main(list(argv))
+            proposal = json.loads(self.out_path.read_text())
+        return code, proposal, put_calls
+
+    def test_run_without_apply_issues_no_writes(self):
+        """The core safety property: proposal-only unless --apply is passed."""
+        code, proposal, puts = self._run_main(argv=[])
+        self.assertEqual(code, 0)
+        self.assertEqual(len(proposal["repairs"]), 1, "a repair was available")
+        self.assertEqual(puts, [], "no PUT may be issued without --apply")
+        self.assertEqual(proposal["applied"], 0)
+        self.assertEqual(proposal["apply_failures"], 0)
+
+    def test_apply_writes_the_proposed_url(self):
+        code, proposal, puts = self._run_main(argv=["--apply"])
+        self.assertEqual(code, 0)
+        self.assertEqual(len(puts), 1)
+        alias_id, payload, token = puts[0]
+        self.assertEqual(alias_id, 770)
+        self.assertEqual(payload, {"scraper_url": proposal["repairs"][0]["new_url"]})
+        self.assertEqual(token, "tok")
+        self.assertEqual(proposal["applied"], 1)
+
+    def test_unmatched_aliases_are_never_written(self):
+        code, proposal, puts = self._run_main(
+            argv=["--apply"], aliases=[self.repairable, self.unmatchable]
+        )
+        self.assertEqual([p["alias_id"] for p in proposal["repairs"]], [770])
+        self.assertEqual([u["alias_id"] for u in proposal["unmatched"]], [771])
+        self.assertEqual(
+            [alias_id for alias_id, _, _ in puts],
+            [770],
+            "an unmatched alias must never reach the write path",
+        )
+
+    def test_proposal_is_on_disk_before_the_first_put(self):
+        """
+        Every old_url lives only in memory until the JSON lands. If the PUTs
+        ran first, a crash mid-batch would leave rewritten aliases with nothing
+        to roll back from.
+        """
+        seen = []
+
+        def inspect(alias_id, payload, token, out_path):
+            seen.append(
+                json.loads(out_path.read_text()) if out_path.exists() else None
+            )
+
+        code, proposal, puts = self._run_main(
+            argv=["--apply"], put_side_effect=inspect
+        )
+        self.assertEqual(len(seen), 1)
+        on_disk = seen[0]
+        self.assertIsNotNone(on_disk, "proposal file must exist before any PUT")
+        self.assertEqual(
+            [r["old_url"] for r in on_disk["repairs"]],
+            [r["old_url"] for r in proposal["repairs"]],
+            "the full repair list must be persisted before the first write",
+        )
+
+    def test_apply_failure_is_counted_in_the_rewritten_file_and_exit_code(self):
+        def boom(alias_id, payload, token, out_path):
+            raise RuntimeError("api down")
+
+        code, proposal, puts = self._run_main(argv=["--apply"], put_side_effect=boom)
+        self.assertEqual(code, 1)
+        self.assertEqual(proposal["applied"], 0)
+        self.assertEqual(proposal["apply_failures"], 1)
+
+    def test_recovered_alias_is_reported_not_repaired(self):
+        code, proposal, puts = self._run_main(
+            argv=["--apply"], liveness={PDP: (200, PDP)}
+        )
+        self.assertEqual(proposal["repairs"], [])
+        self.assertEqual(proposal["unmatched"][0]["reason"], "alias_recovered")
+        self.assertEqual(proposal["verified_404_count"], 0)
+        self.assertEqual(puts, [], "a healthy alias must not be rewritten")
+
+    def test_inconclusive_alias_is_reported_not_repaired(self):
+        code, proposal, puts = self._run_main(
+            argv=["--apply"], liveness={PDP: (403, PDP)}
+        )
+        self.assertEqual(proposal["repairs"], [])
+        self.assertEqual(
+            proposal["unmatched"][0]["reason"], "liveness_check_inconclusive"
+        )
+        self.assertEqual(puts, [])
+
+    def test_200_redirected_off_the_pdp_is_not_treated_as_recovered(self):
+        """A category-page bounce is inconclusive, not proof of recovery — and
+        an inconclusive alias is still never written."""
+        code, proposal, puts = self._run_main(
+            argv=["--apply"], liveness={PDP: (200, CATEGORY_URL)}
+        )
+        self.assertEqual(
+            proposal["unmatched"][0]["reason"], "liveness_check_inconclusive"
+        )
+        self.assertEqual(puts, [])
+
+    def test_limit_caps_the_number_of_aliases_processed(self):
+        code, proposal, puts = self._run_main(
+            argv=["--limit", "1"], aliases=[self.repairable, self.unmatchable]
+        )
+        self.assertEqual(
+            len(proposal["repairs"]) + len(proposal["unmatched"]),
+            1,
+        )
 
 
 if __name__ == "__main__":

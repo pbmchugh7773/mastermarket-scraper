@@ -2,8 +2,8 @@
 """
 Lidl broken-alias repair.
 
-64 of Lidl's 77 aliases point at URLs that now return HTTP 404: Lidl rotates
-the SKU segment of its product URLs while the product stays on sale.
+Most of Lidl's aliases point at URLs that now return HTTP 404: Lidl rotates the
+SKU segment of its product URLs while the product stays on sale.
 discover_lidl_aliases.py cannot fix these — its candidate query excludes any
 product that already has a Lidl alias, and these have one. Retiring them would
 lose real coverage, since the products are still listed.
@@ -15,6 +15,11 @@ Two passes:
 
 Proposal-only by default. `--apply` updates scraper_url for accepted repairs
 and never touches unmatched aliases.
+
+Scale drifts week to week as Lidl rotates its range, so treat any figure here
+as a dated observation rather than a fixture: on 2026-08-10 the design run saw
+64 of 77 aliases broken, and on 2026-08-16 a live proposal-only run saw a
+1431-URL sitemap and 11 pass-1 slug hits.
 
 See docs/superpowers/specs/2026-08-10-lidl-alias-repair-design.md
 """
@@ -31,6 +36,7 @@ import requests
 from discover_lidl_aliases import (
     USER_AGENT,
     HTTP_TIMEOUT,
+    API_TIMEOUT,
     normalise,
     product_size,
     variant_tokens,
@@ -82,23 +88,54 @@ def select_broken_aliases(aliases):
     return out
 
 
-def classify_liveness(status):
+def landed_on_pdp(requested_url, final_url):
     """
-    'broken' | 'recovered' | 'inconclusive' for a liveness-check status.
+    True when a redirect chain ending at `final_url` is still on a Lidl PDP.
 
-    Only 404/410 justify replacing a URL. A 200 means the alias fixed itself
-    and must be left alone. Anything else — 403, 500, a timeout surfacing as
-    None — is inconclusive: repairing on it would swap a good URL for a guess.
+    Delegates to simple_local_to_prod._validate_pdp_redirect so the Lidl PDP
+    regex has exactly one definition in the repo (PDP_PATTERNS['lidl']). That
+    module is imported lazily and not at module scope: importing it runs
+    logging.basicConfig() — which hijacks the root logger — and drags in
+    selenium, webdriver_manager and bs4 for a helper that is three lines of
+    regex. No final URL to compare against means no redirect evidence either
+    way, which the helper already treats as "proceed".
+    """
+    from simple_local_to_prod import _validate_pdp_redirect
+
+    ok, _reason = _validate_pdp_redirect("lidl", requested_url, final_url)
+    return ok
+
+
+def classify_liveness(status, requested_url=None, final_url=None):
+    """
+    'broken' | 'recovered' | 'inconclusive' for a liveness-check result.
+
+    Only 404/410 justify replacing a URL. A 200 normally means the alias fixed
+    itself and must be left alone — but only if it is still a 200 for a product
+    page. Lidl is known to bounce expired SKUs onto a category landing page,
+    which answers 200 for a URL that no longer sells anything; treating that as
+    'recovered' would make a dead fleet look self-healed and suppress every
+    repair. A 200 that redirected off the PDP pattern is therefore inconclusive.
+    Anything else — 403, 500, a timeout surfacing as None — is inconclusive too:
+    repairing on it would swap a good URL for a guess.
     """
     if status in BROKEN_STATUSES:
         return "broken"
     if status == 200:
+        if not landed_on_pdp(requested_url, final_url):
+            return "inconclusive"
         return "recovered"
     return "inconclusive"
 
 
 def check_url_liveness(url):
-    """HTTP status for `url`, or None if the request could not complete."""
+    """
+    (status, final_url) for `url`, or (None, None) if the request failed.
+
+    The final URL is returned alongside the status because the status alone
+    cannot distinguish a live PDP from a redirect to a category page — see
+    classify_liveness.
+    """
     try:
         resp = requests.get(
             url,
@@ -106,9 +143,9 @@ def check_url_liveness(url):
             timeout=HTTP_TIMEOUT,
             allow_redirects=True,
         )
-        return resp.status_code
+        return resp.status_code, resp.url
     except requests.RequestException:
-        return None
+        return None, None
 
 
 def index_sitemap_by_slug(sitemap):
@@ -140,10 +177,14 @@ def decide_slug_size(mm_size, html_size):
     """
     'match' | 'mismatch' | 'unverified' for the pass-1 size check.
 
-    An identical slug under a new SKU is strong evidence on its own, so a size
-    we cannot derive on either side does not veto the repair — it downgrades it
-    to slug_exact_unverified. Two sizes that are both known and disagree do
-    veto it: that is a different format sharing a slug.
+    Only called once the candidate page has actually been retrieved, so
+    'unverified' means "the HTML is in hand but no size could be read out of
+    it, or the MM product has none to compare against" — never "the page could
+    not be fetched", which repair_one handles before it gets here. An identical
+    slug under a new SKU is strong evidence on its own, so an underivable size
+    does not veto the repair; it downgrades it to slug_exact_unverified. Two
+    sizes that are both known and disagree do veto it: that is a different
+    format sharing a slug.
     """
     if mm_size is None or html_size is None:
         return "unverified"
@@ -208,9 +249,6 @@ def choose_token_outcome(survivors, rejections):
     return None, "no_match"
 
 
-API_TIMEOUT = 60
-
-
 def fetch_lidl_aliases(token):
     """Every Lidl alias, active or not — a parked alias can still be broken."""
     resp = requests.get(
@@ -266,24 +304,41 @@ def repair_one(alias, product, sitemap, sitemap_by_slug, fetch_log):
 
     Pass 1 first: an identical slug under a new SKU is far stronger evidence
     than a 0.55 token overlap, and it needs one HTML fetch instead of one per
-    candidate. A pass-1 size mismatch falls through to pass 2 rather than
-    failing outright — the slug may genuinely belong to a different format now.
+    candidate. Two things make pass 1 fall through to pass 2 rather than fail
+    outright:
+      * a size mismatch — the slug may genuinely belong to a different format
+        now, and pass 2 can tell the formats apart;
+      * a failed fetch — fetch_lidl_page returns None both for a transport
+        failure and for a candidate that itself 404s, so an unretrieved page is
+        no evidence at all. Accepting it would propose a URL we never saw, and
+        under --apply would overwrite one dead URL with another and count it a
+        success. Pass 2 rejects the same condition as html_fetch_failed, so the
+        weaker-evidence path must not be the more permissive one.
     """
     slug, old_sku = parse_lidl_url(alias["scraper_url"])
 
     candidate = find_slug_candidate(slug, old_sku, sitemap_by_slug)
     if candidate is not None:
         html = fetch_lidl_page(candidate["url"], fetch_log)
-        html_size = extract_size_from_html(html) if html else None
-        verdict = decide_slug_size(product["size"], html_size)
-        if verdict == "match":
-            return build_repair_record(
-                alias, product, candidate, "slug_exact", html_size, None
-            ), None
-        if verdict == "unverified":
-            return build_repair_record(
-                alias, product, candidate, "slug_exact_unverified", html_size, None
-            ), None
+        if html is not None:
+            html_size = extract_size_from_html(html)
+            verdict = decide_slug_size(product["size"], html_size)
+            if verdict == "match":
+                return build_repair_record(
+                    alias, product, candidate, "slug_exact", html_size, None
+                ), None
+            if verdict == "unverified":
+                return build_repair_record(
+                    alias, product, candidate, "slug_exact_unverified", html_size, None
+                ), None
+
+    # Pass 2 accepts only on an MM-size/HTML-size equality, so a product with no
+    # derivable size cannot survive it no matter what the sitemap offers. Bail
+    # before the loop: inside it, this cost one 0.5-1.5s live fetch per candidate
+    # to reach a foregone rejection, and left the reported reason to a Counter
+    # tie-break between unknown_mm_size and no_html_size.
+    if product["size"] is None:
+        return None, build_unmatched_record(alias, product, "unknown_mm_size")
 
     survivors = []
     rejections = []
@@ -296,9 +351,6 @@ def repair_one(alias, product, sitemap, sitemap_by_slug, fetch_log):
         html_size = extract_size_from_html(html)
         if not html_size:
             rejections.append("no_html_size")
-            continue
-        if product["size"] is None:
-            rejections.append("unknown_mm_size")
             continue
         if product["size"].lower() == html_size.lower():
             survivors.append((entry, html_size))
@@ -405,7 +457,8 @@ def main(argv=None):
             continue
         product = build_match_product(row)
 
-        state = classify_liveness(check_url_liveness(alias["scraper_url"]))
+        status, final_url = check_url_liveness(alias["scraper_url"])
+        state = classify_liveness(status, alias["scraper_url"], final_url)
         if state != "broken":
             reason = (
                 "alias_recovered"
@@ -425,9 +478,6 @@ def main(argv=None):
             unmatched.append(miss)
 
     applied, failed = (0, 0)
-    if args.apply:
-        applied, failed = apply_repairs(repairs, token)
-
     out = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "sitemap_url_count": len(sitemap),
@@ -443,7 +493,17 @@ def main(argv=None):
     out_path = Path(
         f"/tmp/lidl_repair_proposal_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.json"
     )
+    # Persist BEFORE mutating production. Every old_url exists only in memory
+    # until this lands, so a crash mid-batch — or a failing write after the PUTs
+    # — would leave rewritten aliases with nothing to roll back from. The second
+    # write below only decorates the same file with the outcome counts.
     out_path.write_text(json.dumps(out, indent=2))
+
+    if args.apply:
+        applied, failed = apply_repairs(repairs, token)
+        out["applied"] = applied
+        out["apply_failures"] = failed
+        out_path.write_text(json.dumps(out, indent=2))
 
     print(f"\nWrote {out_path}")
     print(f"  broken aliases:     {len(broken)}")
