@@ -16,12 +16,16 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 from repair_lidl_aliases import (  # noqa: E402
+    build_match_product,
+    choose_token_outcome,
     classify_liveness,
     decide_slug_size,
     find_slug_candidate,
     index_sitemap_by_slug,
     parse_lidl_url,
+    REPAIR_THRESHOLD,
     select_broken_aliases,
+    select_token_candidates,
 )
 
 
@@ -163,6 +167,79 @@ class DecideSlugSizeTests(unittest.TestCase):
 
     def test_both_missing_is_unverified(self):
         self.assertEqual(decide_slug_size(None, None), "unverified")
+
+
+class BuildMatchProductTests(unittest.TestCase):
+    def test_emits_keys_the_matching_engine_consumes(self):
+        p = build_match_product(
+            {"id": 7, "name": "Barista Oat Milk 1L", "brand": "Vemondo", "unit": "l"}
+        )
+        self.assertEqual(
+            set(p), {"id", "name", "brand", "unit", "norm", "size", "variant"}
+        )
+        self.assertEqual(p["id"], 7)
+
+    def test_null_brand_name_and_unit_become_empty_strings(self):
+        p = build_match_product({"id": 7, "name": None, "brand": None, "unit": None})
+        self.assertEqual(p["name"], "")
+        self.assertEqual(p["brand"], "")
+        self.assertEqual(p["unit"], "")
+
+
+class SelectTokenCandidatesTests(unittest.TestCase):
+    def test_keeps_entries_at_or_above_threshold(self):
+        product = build_match_product(
+            {"id": 1, "name": "Parmigiano Reggiano DOP", "brand": "Italiamo", "unit": "g"}
+        )
+        sitemap = [
+            _entry("italiamo-parmigiano-reggiano-dop", "111"),
+            _entry("dulano-chicken-nuggets", "222"),
+        ]
+        urls = [e["url"] for e in select_token_candidates(product, sitemap, REPAIR_THRESHOLD)]
+        self.assertIn("https://www.lidl.ie/p/italiamo-parmigiano-reggiano-dop/p111", urls)
+        self.assertNotIn("https://www.lidl.ie/p/dulano-chicken-nuggets/p222", urls)
+
+    def test_drops_candidate_whose_slug_advertises_a_competing_brand(self):
+        """Phase-1.5 brand hard reject — the Vemondo/Alpro near-miss."""
+        product = build_match_product(
+            {"id": 1, "name": "Barista Oat Milk", "brand": "Vemondo", "unit": "l"}
+        )
+        sitemap = [_entry("alpro-alpro-barista-oat-milk", "333")]
+        self.assertEqual(select_token_candidates(product, sitemap, REPAIR_THRESHOLD), [])
+
+    def test_returns_empty_when_nothing_scores(self):
+        product = build_match_product(
+            {"id": 1, "name": "Completely Unrelated Item", "brand": "Milbona", "unit": "g"}
+        )
+        sitemap = [_entry("dulano-chicken-nuggets", "222")]
+        self.assertEqual(select_token_candidates(product, sitemap, REPAIR_THRESHOLD), [])
+
+
+class ChooseTokenOutcomeTests(unittest.TestCase):
+    def test_single_survivor_is_accepted(self):
+        entry = _entry("rice-krispies", "1")
+        chosen, reason = choose_token_outcome([entry], [])
+        self.assertEqual(chosen["sku"], "1")
+        self.assertIsNone(reason)
+
+    def test_several_survivors_is_ambiguous(self):
+        chosen, reason = choose_token_outcome(
+            [_entry("a", "1"), _entry("b", "2")], []
+        )
+        self.assertIsNone(chosen)
+        self.assertEqual(reason, "ambiguous")
+
+    def test_no_survivors_reports_the_commonest_rejection(self):
+        chosen, reason = choose_token_outcome(
+            [], ["size_mismatch", "size_mismatch", "no_html_size"]
+        )
+        self.assertIsNone(chosen)
+        self.assertEqual(reason, "size_mismatch")
+
+    def test_no_survivors_and_no_rejections_is_no_match(self):
+        chosen, reason = choose_token_outcome([], [])
+        self.assertIsNone(chosen)
+        self.assertEqual(reason, "no_match")
 
 
 if __name__ == "__main__":

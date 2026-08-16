@@ -19,10 +19,19 @@ and never touches unmatched aliases.
 See docs/superpowers/specs/2026-08-10-lidl-alias-repair-design.md
 """
 import re
+from collections import Counter
 
 import requests
 
-from discover_lidl_aliases import USER_AGENT, HTTP_TIMEOUT
+from discover_lidl_aliases import (
+    USER_AGENT,
+    HTTP_TIMEOUT,
+    normalise,
+    product_size,
+    variant_tokens,
+    token_score,
+    apply_brand_mismatch_filter,
+)
 
 BROKEN_STATUSES = (404, 410)
 REPAIR_THRESHOLD = 0.55
@@ -129,3 +138,61 @@ def decide_slug_size(mm_size, html_size):
     if mm_size is None or html_size is None:
         return "unverified"
     return "match" if mm_size.lower() == html_size.lower() else "mismatch"
+
+
+def build_match_product(row):
+    """
+    Reshape a /products/all-simple row into what the matching engine expects.
+
+    Same key set select_candidate_products() produces in discover_lidl_aliases,
+    so token_score() and apply_brand_mismatch_filter() accept it unchanged.
+    """
+    name = (row.get("name") or "").strip()
+    brand = (row.get("brand") or "").strip()
+    unit = (row.get("unit") or "").strip()
+    return {
+        "id": row.get("id"),
+        "name": name,
+        "brand": brand,
+        "unit": unit,
+        "norm": normalise(f"{brand} {name}"),
+        "size": product_size(name, unit),
+        "variant": variant_tokens(name),
+    }
+
+
+def select_token_candidates(product, sitemap, threshold):
+    """
+    Sitemap entries scoring >= threshold for `product`, after the phase-1.5
+    brand-mismatch hard reject.
+
+    Discovery groups by URL because it asks "which product wins this URL".
+    Repair knows the product and wants its URLs, so it builds a one-candidate
+    group per URL and reuses the same filter.
+    """
+    by_url = {}
+    entry_by_url = {}
+    for entry in sitemap:
+        score = token_score(product, entry)
+        if score >= threshold:
+            by_url[entry["url"]] = [{**product, "score": score}]
+            entry_by_url[entry["url"]] = entry
+    kept, _rejections = apply_brand_mismatch_filter(by_url)
+    return [entry_by_url[url] for url in kept]
+
+
+def choose_token_outcome(survivors, rejections):
+    """
+    (chosen_entry, reason) for one product's pass-2 candidates.
+
+    Exactly one survivor is the repair. Several means the size gate could not
+    separate them. None means we report why the closest candidates failed, so
+    the reviewer can tell "wrong size on file" from "nothing resembled it".
+    """
+    if len(survivors) == 1:
+        return survivors[0], None
+    if len(survivors) > 1:
+        return None, "ambiguous"
+    if rejections:
+        return None, Counter(rejections).most_common(1)[0][0]
+    return None, "no_match"
