@@ -20,6 +20,10 @@ See docs/superpowers/specs/2026-08-10-lidl-alias-repair-design.md
 """
 import re
 
+import requests
+
+from discover_lidl_aliases import USER_AGENT, HTTP_TIMEOUT
+
 BROKEN_STATUSES = (404, 410)
 REPAIR_THRESHOLD = 0.55
 
@@ -57,3 +61,32 @@ def select_broken_aliases(aliases):
         out.append(alias)
     out.sort(key=lambda a: a["id"])
     return out
+
+
+def classify_liveness(status):
+    """
+    'broken' | 'recovered' | 'inconclusive' for a liveness-check status.
+
+    Only 404/410 justify replacing a URL. A 200 means the alias fixed itself
+    and must be left alone. Anything else — 403, 500, a timeout surfacing as
+    None — is inconclusive: repairing on it would swap a good URL for a guess.
+    """
+    if status in BROKEN_STATUSES:
+        return "broken"
+    if status == 200:
+        return "recovered"
+    return "inconclusive"
+
+
+def check_url_liveness(url):
+    """HTTP status for `url`, or None if the request could not complete."""
+    try:
+        resp = requests.get(
+            url,
+            headers={"User-Agent": USER_AGENT},
+            timeout=HTTP_TIMEOUT,
+            allow_redirects=True,
+        )
+        return resp.status_code
+    except requests.RequestException:
+        return None

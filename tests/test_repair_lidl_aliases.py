@@ -16,6 +16,7 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 from repair_lidl_aliases import (  # noqa: E402
+    classify_liveness,
     parse_lidl_url,
     select_broken_aliases,
 )
@@ -87,6 +88,24 @@ class SelectBrokenAliasesTests(unittest.TestCase):
     def test_result_is_ordered_by_alias_id(self):
         out = select_broken_aliases([_alias(30), _alias(10), _alias(20)])
         self.assertEqual([a["id"] for a in out], [10, 20, 30])
+
+
+class ClassifyLivenessTests(unittest.TestCase):
+    def test_404_and_410_are_broken(self):
+        self.assertEqual(classify_liveness(404), "broken")
+        self.assertEqual(classify_liveness(410), "broken")
+
+    def test_200_is_recovered(self):
+        self.assertEqual(classify_liveness(200), "recovered")
+
+    def test_server_error_is_inconclusive(self):
+        """A 500 or a 403 is not evidence the product is gone."""
+        self.assertEqual(classify_liveness(500), "inconclusive")
+        self.assertEqual(classify_liveness(403), "inconclusive")
+
+    def test_none_is_inconclusive(self):
+        """None means timeout or connection error — never repair on that."""
+        self.assertEqual(classify_liveness(None), "inconclusive")
 
 
 if __name__ == "__main__":
