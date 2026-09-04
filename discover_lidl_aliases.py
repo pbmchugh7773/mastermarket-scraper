@@ -32,7 +32,6 @@ import json
 import os
 import random
 import re
-import subprocess
 import sys
 import time
 import urllib.error
@@ -40,9 +39,19 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
+import requests
+
 LIDL_SITEMAP_URL = "https://www.lidl.ie/p/export/IE/en/product_sitemap.xml.gz"
-QUERY_PROD = "/home/pbmchugh7773/projects/MasterMarket/scripts/query_prod.sh"
 USER_AGENT = "Mozilla/5.0 (compatible; MasterMarket-Discovery/0.2)"
+
+# Candidate products come from the public REST API, not from psql. The previous
+# implementation shelled out to a `query_prod.sh` living under a developer's
+# home directory, which meant the weekly GitHub Actions run died with
+# FileNotFoundError before it ever reached the matching phase (MASA-135).
+API_URL = os.getenv("API_URL", "https://api.mastermarketapp.com").rstrip("/")
+SCRAPER_USERNAME = os.getenv("SCRAPER_USERNAME", "")
+SCRAPER_PASSWORD = os.getenv("SCRAPER_PASSWORD", "")
+API_TIMEOUT = 60
 CACHE_DIR = Path.home() / ".cache" / "mastermarket" / "lidl_html"
 CACHE_TTL_SECONDS = 24 * 3600
 LIVE_FETCH_MIN_DELAY = 0.5
@@ -225,80 +234,147 @@ def fetch_lidl_sitemap_urls():
     return out
 
 
-def _sql_aldi_cross_list() -> str:
-    """v2 behaviour: branded non-own products with an Aldi alias but no Lidl alias."""
-    return """
-SELECT p.id, p.name, COALESCE(p.brand,''), COALESCE(p.unit,'')
-FROM products p
-JOIN product_aliases a_aldi ON a_aldi.product_id = p.id AND a_aldi.store_name='Aldi'
-LEFT JOIN product_aliases a_lidl ON a_lidl.product_id = p.id AND a_lidl.store_name='Lidl'
-WHERE a_lidl.id IS NULL
-  AND p.brand IS NOT NULL AND p.brand <> ''
-  AND p.brand NOT IN ('Aldi','Lidl','Tesco','SuperValu','Dunnes','Dunnes Stores')
-  AND p.brand NOT ILIKE '%aldi%'
-  AND p.brand NOT ILIKE '%specially selected%'
-  AND p.brand NOT ILIKE '%simply%'
-ORDER BY p.id;
-"""
+# Own-brand / store-brand rows excluded from the aldi-cross-list pool. Mirrors
+# the `NOT IN (...)` exact list and the three `NOT ILIKE '%…%'` predicates the
+# SQL used, in that order.
+CROSS_LIST_STORE_BRANDS = (
+    "Aldi",
+    "Lidl",
+    "Tesco",
+    "SuperValu",
+    "Dunnes",
+    "Dunnes Stores",
+)
+CROSS_LIST_BRAND_SUBSTRINGS = ("aldi", "specially selected", "simply")
 
 
-def _sql_lidl_own_brand() -> str:
-    """
-    v3 own-brand pool: Lidl-exclusive private-label products that don't yet
-    have a Lidl alias. No Aldi-alias requirement — Lidl exclusives by
-    definition won't have an Aldi cross-listing.
-
-    The brand filter is intentionally permissive (`ILIKE '%token%'`) because
-    DB rows for the same brand vary: "Milbona", "Lidl, Milbona",
-    "Bio Organic, Lidl, Milbona", etc. (See MASA-135 Ask 3 for normalisation.)
-    """
-    or_clauses = " OR ".join(
-        f"p.brand ILIKE '%{b}%'" for b in LIDL_OWN_BRANDS
+def _api_login() -> str:
+    """POST /auth/login → bearer token for the alias endpoints."""
+    if not SCRAPER_USERNAME or not SCRAPER_PASSWORD:
+        raise RuntimeError(
+            "SCRAPER_USERNAME and SCRAPER_PASSWORD must be set — "
+            "/api/product-aliases/store/{store} requires authentication."
+        )
+    resp = requests.post(
+        f"{API_URL}/auth/login",
+        data={"username": SCRAPER_USERNAME, "password": SCRAPER_PASSWORD},
+        timeout=API_TIMEOUT,
     )
-    return f"""
-SELECT p.id, p.name, COALESCE(p.brand,''), COALESCE(p.unit,'')
-FROM products p
-LEFT JOIN product_aliases a_lidl ON a_lidl.product_id = p.id AND a_lidl.store_name='Lidl'
-WHERE a_lidl.id IS NULL
-  AND p.brand IS NOT NULL AND p.brand <> ''
-  AND ({or_clauses})
-ORDER BY p.id;
-"""
+    resp.raise_for_status()
+    token = resp.json().get("access_token")
+    if not token:
+        raise RuntimeError("auth/login succeeded but returned no access_token")
+    return token
 
 
-def query_candidate_products(pool: str = POOL_ALDI):
+def fetch_all_products() -> list:
     """
-    Pool-aware candidate query.
+    GET /products/all-simple — id/name/brand/unit for every MM product.
+
+    Public endpoint (no auth), which is why the candidate filter below can be
+    exercised locally without scraper credentials.
+    """
+    resp = requests.get(
+        f"{API_URL}/products/all-simple",
+        headers={"User-Agent": USER_AGENT},
+        timeout=API_TIMEOUT,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def fetch_alias_product_ids(store_name: str, token: str) -> set:
+    """
+    Product IDs that already carry an alias for `store_name`.
+
+    active_only=false is deliberate: the SQL this replaces joined
+    product_aliases with no is_active predicate, so a parked alias still
+    counted as "already covered". Leaving the endpoint default (true) would
+    re-propose URLs that already exist but are temporarily inactive.
+    """
+    resp = requests.get(
+        f"{API_URL}/api/product-aliases/store/{store_name}",
+        params={"active_only": "false"},
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=API_TIMEOUT,
+    )
+    resp.raise_for_status()
+    return {
+        alias["product_id"]
+        for alias in resp.json()
+        if alias.get("product_id") is not None
+    }
+
+
+def select_candidate_products(products, lidl_product_ids, aldi_product_ids, pool):
+    """
+    Pure re-implementation of the two candidate SQL queries — no I/O.
 
     pool=aldi-cross-list → branded products with an Aldi alias but no Lidl alias (v2).
     pool=lidl-own-brand  → Lidl-exclusive own-brand products with no Lidl alias (v3).
+
+    The own-brand brand test stays a permissive substring match, matching the
+    old `ILIKE '%token%'`: DB rows for one brand vary ("Milbona",
+    "Lidl, Milbona", "Bio Organic, Lidl, Milbona" — MASA-135 Ask 3).
     """
-    if pool == POOL_ALDI:
-        sql = _sql_aldi_cross_list()
-    elif pool == POOL_LIDL_OWN:
-        sql = _sql_lidl_own_brand()
-    else:
+    if pool not in POOL_CHOICES:
         raise ValueError(f"Unknown pool: {pool!r}. Choices: {POOL_CHOICES}")
-    res = subprocess.run([QUERY_PROD, sql], capture_output=True, text=True, check=True)
-    products = []
-    for line in res.stdout.splitlines():
-        parts = [p.strip() for p in line.split("|")]
-        if len(parts) < 4 or not parts[0].isdigit():
+
+    candidates = []
+    for prod in products:
+        pid = prod.get("id")
+        if pid is None or pid in lidl_product_ids:
             continue
-        pid, name, brand, unit = int(parts[0]), parts[1], parts[2], parts[3]
-        size = product_size(name, unit)
-        products.append(
+
+        brand = (prod.get("brand") or "").strip()
+        if not brand:  # p.brand IS NOT NULL AND p.brand <> ''
+            continue
+        brand_lc = brand.lower()
+
+        if pool == POOL_ALDI:
+            if pid not in aldi_product_ids:
+                continue
+            if brand in CROSS_LIST_STORE_BRANDS:
+                continue
+            if any(sub in brand_lc for sub in CROSS_LIST_BRAND_SUBSTRINGS):
+                continue
+        else:  # POOL_LIDL_OWN
+            if not any(own in brand_lc for own in LIDL_OWN_BRANDS):
+                continue
+
+        name = (prod.get("name") or "").strip()
+        unit = (prod.get("unit") or "").strip()
+        candidates.append(
             {
                 "id": pid,
                 "name": name,
                 "brand": brand,
                 "unit": unit,
                 "norm": normalise(f"{brand} {name}"),
-                "size": size,
+                "size": product_size(name, unit),
                 "variant": variant_tokens(name),
             }
         )
-    return products
+
+    candidates.sort(key=lambda p: p["id"])  # ORDER BY p.id
+    return candidates
+
+
+def query_candidate_products(pool: str = POOL_ALDI):
+    """Fetch products + existing aliases from the API, then filter by pool."""
+    if pool not in POOL_CHOICES:
+        raise ValueError(f"Unknown pool: {pool!r}. Choices: {POOL_CHOICES}")
+
+    products = fetch_all_products()
+    token = _api_login()
+    lidl_product_ids = fetch_alias_product_ids("Lidl", token)
+    # Only the cross-list pool needs the Aldi side; skip the call otherwise.
+    aldi_product_ids = (
+        fetch_alias_product_ids("Aldi", token) if pool == POOL_ALDI else set()
+    )
+    return select_candidate_products(
+        products, lidl_product_ids, aldi_product_ids, pool
+    )
 
 
 # --------------------------------------------------------------------------- #
