@@ -76,10 +76,15 @@ CURRENCY = os.getenv('SCRAPER_CURRENCY', 'EUR')
 # match the per-store PDP regex and the scraper aborts before extracting bogus
 # prices from category-page HTML. Calibrated from production sample URLs as of
 # 2026-05-08; if a store changes URL conventions, update here.
+# Real shapes (from scrape logs, 2026-09-03):
+#   aldi       https://www.aldi.ie/product/hellmanns-light-mayo-000000000443821002
+#   supervalu  https://shop.supervalu.ie/sm/delivery/rsid/5550/product/<slug>-id-1356498000
+#              https://shop.supervalu.ie/product/<slug>-id-1356498000
+# Pinned by tests/test_validate_pdp_redirect.py.
 PDP_PATTERNS = {
     'tesco':         re.compile(r'/products/\d+', re.IGNORECASE),
-    'aldi':          re.compile(r'/p/[a-z0-9-]+', re.IGNORECASE),
-    'supervalu':     re.compile(r'/shop/[a-z0-9-/]+/\d{6,}', re.IGNORECASE),
+    'aldi':          re.compile(r'/product/[a-z0-9-]+', re.IGNORECASE),
+    'supervalu':     re.compile(r'/product/[a-z0-9-]+-id-\d+', re.IGNORECASE),
     'lidl':          re.compile(r'/p/[a-z0-9-]+/p\d+', re.IGNORECASE),
     'dunnes':        re.compile(r'-\d{6,}\.html', re.IGNORECASE),
     'dunnes stores': re.compile(r'-\d{6,}\.html', re.IGNORECASE),
