@@ -1,0 +1,103 @@
+name: Repair Lidl Aliases
+
+# Manual-only. Finds Lidl aliases whose scraper_url now 404s, verifies each
+# one is really dead, and proposes replacement URLs from the Lidl sitemap
+# (see repair_lidl_aliases.py). With apply=true the accepted repairs are
+# written back via PUT /api/product-aliases/{id}; with deactivate_unmatched=true
+# (only honoured together with apply) aliases the tool found NO candidate for
+# (reason "no_match") are marked unavailable so they stop eating retry slots.
+#
+# Recommended flow: run once with apply=false, read the artifact, then run
+# again with apply=true (+ deactivate_unmatched=true if the no_match list
+# looks right).
+
+on:
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: 'Write repaired URLs back (false = proposal only)'
+        required: false
+        type: boolean
+        default: false
+      deactivate_unmatched:
+        description: 'Also mark "no_match" aliases unavailable (needs apply=true)'
+        required: false
+        type: boolean
+        default: false
+      limit:
+        description: 'Process at most N broken aliases (empty = all)'
+        required: false
+        default: ''
+
+jobs:
+  repair:
+    name: Lidl alias repair
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: Install Python deps
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run repair (${{ inputs.apply && 'APPLY' || 'proposal only' }})
+        env:
+          API_URL: ${{ secrets.API_URL }}
+          SCRAPER_USERNAME: ${{ secrets.SCRAPER_USERNAME }}
+          SCRAPER_PASSWORD: ${{ secrets.SCRAPER_PASSWORD }}
+        run: |
+          set -euo pipefail
+          ARGS=""
+          if [ "${{ inputs.apply }}" = "true" ]; then
+            ARGS="$ARGS --apply"
+            echo "Mode: APPLY — accepted repairs will be written to the API"
+          else
+            echo "Mode: proposal only — nothing is written"
+          fi
+          if [ -n "${{ inputs.limit }}" ]; then
+            ARGS="$ARGS --limit ${{ inputs.limit }}"
+          fi
+          python repair_lidl_aliases.py $ARGS 2>&1 | tee repair_lidl_aliases.log
+          cp /tmp/lidl_repair_proposal_*.json .
+
+      - name: Preview unmatched aliases that would be deactivated
+        if: always()
+        run: |
+          JSON=$(ls -t lidl_repair_proposal_*.json 2>/dev/null | head -1 || true)
+          if [ -z "$JSON" ]; then
+            echo "No proposal JSON — repair step failed before writing it."
+            exit 0
+          fi
+          python mark_unmatched_unavailable.py "$JSON" 2>&1 | tee mark_unmatched_preview.log
+
+      - name: Mark "no_match" aliases unavailable
+        if: ${{ inputs.apply && inputs.deactivate_unmatched }}
+        env:
+          API_URL: ${{ secrets.API_URL }}
+          SCRAPER_USERNAME: ${{ secrets.SCRAPER_USERNAME }}
+          SCRAPER_PASSWORD: ${{ secrets.SCRAPER_PASSWORD }}
+        run: |
+          set -euo pipefail
+          JSON=$(ls -t lidl_repair_proposal_*.json | head -1)
+          python mark_unmatched_unavailable.py "$JSON" --apply 2>&1 | tee mark_unmatched.log
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lidl-repair-${{ github.run_number }}
+          path: |
+            lidl_repair_proposal_*.json
+            *.log
+          retention-days: 30
+          if-no-files-found: warn
