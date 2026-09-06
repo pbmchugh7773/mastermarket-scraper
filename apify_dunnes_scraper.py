@@ -63,6 +63,11 @@ SCRAPER_PASSWORD = os.getenv('SCRAPER_PASSWORD', 'pricerIE')
 ACTOR_ID = os.getenv('APIFY_DUNNES_ACTOR_ID', 'pbmchugh7773/dunnes-scraper')
 STORE_NAME = 'Dunnes Stores'
 STORE_LOCATION = os.getenv('SCRAPER_COUNTRY', 'IE')
+# Per-run alias cap (API max is 1000). 500 = historical default; raise via the
+# DUNNES_MAX_ALIASES repo variable once the Apify residential-proxy budget is
+# known — both daily runs hit this cap on 2026-09-03, so part of the catalogue
+# is never scraped.
+DEFAULT_MAX_ALIASES = int(os.getenv('DUNNES_MAX_ALIASES', '500'))
 CURRENCY = os.getenv('SCRAPER_CURRENCY', 'EUR')
 
 # Output directory for saving Apify JSON responses
@@ -194,7 +199,7 @@ class ApifyDunnesScraper:
     def get_dunnes_aliases(self) -> List[Dict]:
         """Get all Dunnes product aliases with scraper URLs."""
         try:
-            params = {"store_name": STORE_NAME, "limit": self.limit or 500}
+            params = {"store_name": STORE_NAME, "limit": self.limit or DEFAULT_MAX_ALIASES}
             response = self.session.get(
                 f"{API_URL}/api/product-aliases/",
                 params=params,
@@ -223,7 +228,7 @@ class ApifyDunnesScraper:
         try:
             params = {
                 'store_name': STORE_NAME,
-                'limit': self.limit or 500,
+                'limit': self.limit or DEFAULT_MAX_ALIASES,
                 'retry_mode': True,
                 'country': STORE_LOCATION
             }
@@ -245,7 +250,9 @@ class ApifyDunnesScraper:
                 aliases = []
 
             self.stats['total_aliases'] = len(aliases)
-            print(f"  Found {len(aliases)} pending aliases to retry")
+            total_pending = data.get('total_pending') if isinstance(data, dict) else None
+            self.stats['total_pending'] = total_pending
+            print(f"  Found {len(aliases)} pending aliases to retry (total pending: {total_pending}, cap: {self.limit or DEFAULT_MAX_ALIASES})")
             return aliases
 
         except requests.RequestException as e:
