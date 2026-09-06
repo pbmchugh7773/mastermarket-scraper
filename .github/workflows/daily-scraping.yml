@@ -212,8 +212,14 @@ jobs:
     needs: scrape-prices
     runs-on: ubuntu-latest
     if: always()
-    
+    permissions:
+      contents: read
+      issues: write   # scripts/notify_failure.sh opens/updates the scraper-alert issue
+
     steps:
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@v4
+
       - name: 📊 Generate Summary
         env:
           CRON_SCHEDULE: ${{ github.event.schedule }}
@@ -243,17 +249,11 @@ jobs:
       
       - name: 🚨 Notify on Failure
         if: needs.scrape-prices.result == 'failure'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          CRON_SCHEDULE: ${{ github.event.schedule }}
         run: |
-          echo "⚠️ SCRAPING FAILURE DETECTED"
-          echo "Please check the individual job logs for details."
-          echo "Common causes:"
-          echo "• API authentication issues"
-          echo "• Website anti-bot measures"
-          echo "• Network connectivity problems"
-          echo "• Chrome/Selenium configuration issues"
-          echo ""
-          echo "🔧 Troubleshooting:"
-          echo "• Verify GitHub Secrets are set correctly"
-          echo "• Check MasterMarket API status"
-          echo "• Review individual store job logs"
-          echo "• Consider manual re-run if temporary issue"
+          bash scripts/notify_failure.sh "${{ github.workflow }}" \
+            "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            "At least one store job (Aldi / SuperValu / Lidl) failed its health check. Trigger: ${{ github.event_name }}, cron: ${CRON_SCHEDULE:-manual}. Open the run and read the 🩺 Validate step of the red job."

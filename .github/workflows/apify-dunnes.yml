@@ -174,4 +174,23 @@ jobs:
       - name: Notify on failure
         if: failure()
         run: |
-          echo "::error::Apify Dunnes Scraper failed. Check logs for details."
+          echo "::error::Apify Dunnes Scraper failed — see the notify-failure job / scraper-alert issue."
+
+  notify-failure:
+    name: Alert on failure
+    needs: [scrape-dunnes]
+    if: failure()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Open or update the scraper-alert issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          bash scripts/notify_failure.sh "${{ github.workflow }}" \
+            "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            "Dunnes Apify run failed. Usual causes: Apify credit exhausted (preflight line), partial actor run (Coverage line), Cloudflare blocking the proxy pool. Read the SUMMARY block in the run log."
