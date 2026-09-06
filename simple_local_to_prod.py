@@ -39,9 +39,11 @@ import time
 import json
 import logging
 import requests
+
+from alias_lifecycle import should_mark_unavailable
 import re
 import os
-from datetime import datetime
+from datetime import date, datetime
 from typing import Optional, Dict, List, Tuple
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
@@ -59,6 +61,11 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+
+def _today() -> date:
+    """Clock hook for the dead-alias rule (patched in tests)."""
+    return date.today()
 
 # Production API configuration with environment variable support
 API_URL = os.getenv('API_URL', 'https://api.mastermarketapp.com')
@@ -163,11 +170,15 @@ class SimpleLocalScraper:
     - Performance: ~2-3s per product, expected 95%+ success rate
     """
     
-    def __init__(self, debug_prices=False):
+    def __init__(self, debug_prices=False, auto_mark_unavailable=True):
         self.driver = None
         self.api_token = None
         self.session = requests.Session()
         self.debug_prices = debug_prices
+        # Dead-alias lifecycle (2026-09): auto mark-unavailable when an alias is
+        # dead on two different scrape days. --no-auto-unavailable disables it.
+        self.auto_mark_unavailable = auto_mark_unavailable
+        self._last_failure_reason = None
         # Set by any scrape_* method when the alias URL redirected to a non-PDP
         # page; consumed by scrape_store to log the failure via update-status
         # and skip the upload. Reset to None at the start of each per-alias loop.
@@ -250,9 +261,9 @@ class SimpleLocalScraper:
             logger.error(f"❌ Authentication error: {e}")
             return False
 
-    def _authed_post(self, url: str, **kwargs):
+    def _authed_request(self, method: str, url: str, **kwargs):
         """
-        POST helper that survives mid-run JWT expiry (MASA-106).
+        Authenticated request helper (POST, PATCH, ...) that survives mid-run JWT expiry (MASA-106).
         Backend issues tokens with ACCESS_TOKEN_EXPIRE_MINUTES=60 but Apify
         runs can exceed 60 min. Two layers of defense:
           1. Proactive: re-auth if current token is older than 50 min.
@@ -263,12 +274,15 @@ class SimpleLocalScraper:
             logger.info(f"🔄 Token age {int(token_age)}s > 3000s — proactively re-authenticating")
             self.authenticate()
 
-        response = self.session.post(url, **kwargs)
+        response = self.session.request(method.upper(), url, **kwargs)
         if response.status_code == 401 and '/auth/login' not in url:
             logger.warning(f"⚠️ Got 401 on {url} — token expired mid-run, re-authenticating and retrying")
             if self.authenticate():
-                response = self.session.post(url, **kwargs)
+                response = self.session.request(method.upper(), url, **kwargs)
         return response
+
+    def _authed_post(self, url: str, **kwargs):
+        return self._authed_request('post', url, **kwargs)
 
     def setup_chrome(self) -> Optional[webdriver.Chrome]:
         """
@@ -2981,6 +2995,7 @@ class SimpleLocalScraper:
                 return None
 
             else:
+                self._last_failure_reason = f"HTTP {response.status_code}"
                 logger.warning(f"⚠️ Lidl requests failed: HTTP {response.status_code}")
                 return None
 
@@ -3268,6 +3283,7 @@ class SimpleLocalScraper:
             all_aliases = []
             page_size = min(limit, 1000)
             offset = 0
+            total_pending = None
 
             while len(all_aliases) < limit:
                 params = {
@@ -3292,19 +3308,54 @@ class SimpleLocalScraper:
                 if not aliases:
                     break
 
-                all_aliases.extend(aliases)
+                # The API has no `offset` parameter, so a second page repeats the
+                # first; keep only unseen ids and stop when a page adds nothing.
+                seen = {a.get('id') for a in all_aliases}
+                new_rows = [a for a in aliases if a.get('id') not in seen]
+                all_aliases.extend(new_rows)
                 offset += len(aliases)
 
-                if len(aliases) < page_size:
-                    break  # Last page
+                if not new_rows or len(aliases) < page_size:
+                    break  # Last page (or the API repeated it)
 
             all_aliases = all_aliases[:limit]
-            logger.info(f"🔄 Retrieved {len(all_aliases)} pending aliases for {store_name}")
+            logger.info(f"🔄 Retrieved {len(all_aliases)} pending aliases for {store_name} (total pending: {total_pending})")
             return all_aliases
 
         except Exception as e:
             logger.error(f"❌ Error getting pending aliases: {e}")
             return []
+
+    def _maybe_mark_unavailable(self, alias: Dict, error_message: str) -> bool:
+        """
+        Dead-alias lifecycle: if this alias failed with a dead-URL reason on an
+        earlier scrape day and failed with a dead-URL reason again now, mark it
+        unavailable so it leaves the pending queue. See alias_lifecycle.py.
+        """
+        if not getattr(self, 'auto_mark_unavailable', True):
+            return False
+        preset = should_mark_unavailable(alias, error_message, _today())
+        if not preset:
+            return False
+        try:
+            response = self._authed_request(
+                'patch',
+                f"{API_URL}/api/product-aliases/{alias['id']}/mark-unavailable",
+                json={'reason': preset},
+                timeout=30,
+            )
+            if response.status_code == 200:
+                hidden = (response.json() or {}).get('hidden_prices_count', 0)
+                logger.warning(
+                    f"🪦 Marked alias {alias['id']} ({alias.get('alias_name', '?')}) unavailable — "
+                    f"{preset}: dead on {str(alias.get('last_scraped_at'))[:10]} and again today; "
+                    f"{hidden} prices hidden"
+                )
+                return True
+            logger.warning(f"⚠️ mark-unavailable failed for alias {alias['id']}: {response.status_code} {response.text[:120]}")
+        except Exception as e:  # noqa: BLE001 — lifecycle must never abort the batch
+            logger.error(f"❌ mark-unavailable error for alias {alias['id']}: {e}")
+        return False
 
     def update_scraping_status(self, alias_id: int, success: bool, price: float = None,
                              error_message: str = None, promotion_type: str = None,
@@ -3376,7 +3427,7 @@ class SimpleLocalScraper:
                         data['promotion_discount_value'] = promotion_data['promotion_discount_value']
 
                     # Add promotion metadata
-                    from datetime import datetime
+                    from datetime import date, datetime
                     data['promotion_details'] = {
                         'detected_at': datetime.now().isoformat(),
                         'detection_method': 'enhanced_css_selector_analysis',
@@ -3507,6 +3558,7 @@ class SimpleLocalScraper:
             # methods set self._last_redirect_error when they detect that the
             # alias URL silently redirected to a non-PDP page.
             self._last_redirect_error = None
+            self._last_failure_reason = None
 
             if store_name.lower() == 'aldi':
                 # Aldi scraper now returns (price, promotion_data) tuple
@@ -3536,6 +3588,7 @@ class SimpleLocalScraper:
                     success=False,
                     error_message=self._last_redirect_error,
                 )
+                self._maybe_mark_unavailable(alias, self._last_redirect_error)
                 results.append({
                     'alias_id': alias['id'],
                     'name': alias['alias_name'],
@@ -3557,6 +3610,7 @@ class SimpleLocalScraper:
                     success=False,
                     error_message=f"Product removed: {reason}"
                 )
+                self._maybe_mark_unavailable(alias, f"Product removed: {reason}")
 
                 results.append({
                     'alias_id': alias['id'],
@@ -3665,14 +3719,18 @@ class SimpleLocalScraper:
 
                 logger.info(f"✅ Success: €{price:.2f} ({'uploaded' if success else 'upload failed'}) in {elapsed:.2f}s")
             else:
-                # Failed to get price
+                # Failed to get price — report the specific reason when the
+                # scrape_* method recorded one (e.g. "HTTP 404"), so the backend can
+                # tell a dead URL from a parse failure.
+                failure_reason = self._last_failure_reason or "Failed to extract price"
                 if retry_mode:
                     # Update status as failed
                     self.update_scraping_status(
                         alias_id=alias['id'],
                         success=False,
-                        error_message="Failed to extract price"
+                        error_message=failure_reason
                     )
+                    self._maybe_mark_unavailable(alias, failure_reason)
 
                 results.append({
                     'alias_id': alias['id'],
@@ -3770,6 +3828,7 @@ def main():
     parser.add_argument('--debug-prices', action='store_true', help='Enable comprehensive price analysis for debugging (shows all price types found)')
     parser.add_argument('--retry-mode', action='store_true', help='Only scrape products that failed or have no price today (for second daily run)')
     parser.add_argument('--promotions-mode', action='store_true', help='Weekly promotions scraping mode - comprehensive promotion detection across all products')
+    parser.add_argument('--no-auto-unavailable', action='store_true', help='Do not auto-mark aliases unavailable when they are dead (404/removed/redirect) on two different scrape days')
 
     args = parser.parse_args()
 
@@ -3783,7 +3842,7 @@ def main():
             stores = ['Aldi', 'Tesco', 'SuperValu', 'Dunnes Stores', 'Lidl']
 
         # Run scraper for specific product
-        scraper = SimpleLocalScraper(debug_prices=args.debug_prices)
+        scraper = SimpleLocalScraper(debug_prices=args.debug_prices, auto_mark_unavailable=not args.no_auto_unavailable)
         scraper.run(stores=stores, max_products=1000, product_id=args.product_id, retry_mode=args.retry_mode, promotions_mode=args.promotions_mode)
     else:
         # Normal operation - determine stores
@@ -3797,7 +3856,7 @@ def main():
             args.products = 2
 
         # Run scraper normally
-        scraper = SimpleLocalScraper(debug_prices=args.debug_prices)
+        scraper = SimpleLocalScraper(debug_prices=args.debug_prices, auto_mark_unavailable=not args.no_auto_unavailable)
         scraper.run(stores=stores, max_products=args.products, retry_mode=args.retry_mode, promotions_mode=args.promotions_mode)
 
 if __name__ == '__main__':

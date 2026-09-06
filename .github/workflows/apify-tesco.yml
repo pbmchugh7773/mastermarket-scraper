@@ -50,6 +50,10 @@ jobs:
           SCRAPER_PASSWORD: ${{ secrets.SCRAPER_PASSWORD }}
           SCRAPER_COUNTRY: 'IE'
           SCRAPER_CURRENCY: 'EUR'
+          # Apify guards (apify_guards.py): abort below this remaining credit,
+          # flag a run partial below this coverage.
+          APIFY_MIN_REMAINING_USD: ${{ vars.APIFY_MIN_REMAINING_USD || '0.75' }}
+          APIFY_MIN_RESULT_PCT: ${{ vars.APIFY_MIN_RESULT_PCT || '90' }}
         run: |
           ARGS=""
 

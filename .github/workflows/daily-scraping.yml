@@ -22,9 +22,9 @@ on:
   workflow_dispatch:
     inputs:
       max_products:
-        description: 'Max products per store'
+        description: 'Max products per store (API returns at most 1000 per call)'
         required: false
-        default: '700'
+        default: '1000'
         type: string
       promotions_mode:
         description: 'Enable promotions mode (captures promotional data)'
@@ -132,7 +132,11 @@ jobs:
           
           # Store Configuration
           STORE_NAME: ${{ matrix.store }}
-          MAX_PRODUCTS: ${{ github.event.inputs.max_products || '700' }}
+          # 1000 = the API's per-call maximum (it has no offset, so higher values
+          # cannot fetch more). Was 700, which capped SuperValu (~1700 aliases)
+          # to 700 per batch with ~200 dead aliases at the front of every batch.
+          # Override without a commit via the MAX_PRODUCTS repo variable.
+          MAX_PRODUCTS: ${{ github.event.inputs.max_products || vars.MAX_PRODUCTS || '1000' }}
           MANUAL_PROMOTIONS_MODE: ${{ github.event.inputs.promotions_mode || 'false' }}
           CRON_SCHEDULE: ${{ github.event.schedule }}
 

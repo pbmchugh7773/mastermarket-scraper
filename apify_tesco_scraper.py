@@ -265,6 +265,9 @@ class ApifyTescoScraper:
                     aliases = data
                 elif isinstance(data, dict):
                     aliases = data.get('aliases', [])
+                    if data.get('total_pending') is not None and not self.stats.get('total_pending'):
+                        self.stats['total_pending'] = data.get('total_pending')
+                        print(f"  API reports total pending: {data.get('total_pending')}")
                 else:
                     aliases = []
 
