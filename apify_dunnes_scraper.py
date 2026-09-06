@@ -33,6 +33,14 @@ import time
 import json
 import re
 import requests
+
+from apify_guards import (
+    evaluate_coverage,
+    evaluate_credit,
+    fetch_limits,
+    min_remaining_usd_from_env,
+    min_result_pct_from_env,
+)
 from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Optional, Any, Tuple
@@ -244,6 +252,24 @@ class ApifyDunnesScraper:
             print(f"Failed to fetch pending aliases: {e}")
             return []
 
+    def check_apify_credit(self) -> None:
+        """
+        Preflight: read the Apify account limits and refuse to launch when
+        remaining credit is below APIFY_MIN_REMAINING_USD (default 0.75).
+        A failure to *read* the limits never blocks the run.
+        """
+        try:
+            limits = fetch_limits(APIFY_TOKEN)
+        except Exception as e:  # noqa: BLE001 — guard must not be the thing that breaks the run
+            print(f"  WARNING: could not fetch Apify limits ({e}) — skipping credit preflight")
+            return
+        status = evaluate_credit(limits, min_remaining_usd_from_env())
+        self.stats['apify_remaining_usd'] = status.remaining_usd
+        self.stats['apify_cycle_end'] = status.cycle_end
+        print(f"  {status.message}")
+        if not status.ok:
+            raise RuntimeError(status.message)
+
     def run_apify_scraper(self, urls: List[str]) -> List[Dict]:
         """
         Run custom Apify Dunnes scraper actor and return results.
@@ -332,7 +358,9 @@ class ApifyDunnesScraper:
 
                 items = self.apify_client.dataset(dataset_id).list_items().items
                 elapsed = time.time() - batch_start
-                print(f"  [Batch {idx}/{len(batches)}] Got {len(items)} results in {elapsed:.1f}s (status={status})")
+                cost = run.get('usageTotalUsd')
+                print(f"  [Batch {idx}/{len(batches)}] Got {len(items)} results in {elapsed:.1f}s (status={status}"
+                      + (f", cost=${float(cost):.3f}" if cost is not None else "") + ")")
 
                 all_items.extend(items)
                 last_run_info = run
@@ -910,11 +938,26 @@ class ApifyDunnesScraper:
 
         # Step 3: Run Apify scraper
         print(f"\n[3/4] Running Apify scraper...")
+        # Apify credit preflight (2026-09-06): refuse to launch when the
+        # account is about to hit its monthly cap instead of failing inside
+        # actor.call() with "exceed your remaining usage".
+        self.check_apify_credit()
+
         results = self.run_apify_scraper(urls)
 
         if not results:
             print("ERROR: No results from Apify")
             return self.stats
+
+        # Coverage check (2026-09-06): batches that silently returned fewer
+        # results than URLs sent are a partial run. Prices found are still
+        # uploaded below; main() exits non-zero afterwards.
+        ok, pct, message = evaluate_coverage(
+            self.stats['urls_sent_to_apify'], len(results), min_result_pct_from_env()
+        )
+        self.stats['coverage_pct'] = round(pct, 1)
+        self.stats['partial_run'] = not ok
+        print(("ERROR: " if not ok else "  ") + message)
 
         # Step 4: Upload prices to MasterMarket
         print(f"\n[4/4] Uploading prices to MasterMarket...")
@@ -994,6 +1037,10 @@ class ApifyDunnesScraper:
         print(f"  Total aliases:        {self.stats['total_aliases']}")
         print(f"  URLs sent to Apify:   {self.stats['urls_sent_to_apify']}")
         print(f"  Results from Apify:   {self.stats['results_from_apify']}")
+        if 'coverage_pct' in self.stats:
+            print(f"  Coverage:             {self.stats['coverage_pct']}%" + ("  ⚠️ PARTIAL RUN" if self.stats.get('partial_run') else ""))
+        if self.stats.get('apify_remaining_usd') is not None:
+            print(f"  Apify credit left:    ${self.stats['apify_remaining_usd']:.3f} (cycle resets {str(self.stats.get('apify_cycle_end'))[:10]})")
         print(f"  Matched by URL:       {self.stats['matched_by_url']}")
         print(f"  Promotions detected:  {self.stats['promotions_detected']}")
         print(f"  Prices uploaded:      {self.stats['prices_uploaded']}")
@@ -1071,6 +1118,9 @@ def main():
 
         # Exit with error code if uploads failed
         if stats['prices_failed'] > 0 and stats['prices_uploaded'] == 0:
+            sys.exit(1)
+        if stats.get('partial_run'):
+            print("ERROR: partial Apify run — exiting with failure (prices found were uploaded)")
             sys.exit(1)
 
     except Exception as e:
