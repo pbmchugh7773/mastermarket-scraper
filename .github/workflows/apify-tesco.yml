@@ -2,10 +2,10 @@ name: Apify Tesco Scraper
 
 on:
   schedule:
-    # 2x per week — Monday + Thursday at 6AM UTC. Matches other stores.
+    # 2x per week — Monday + Thursday. Matches other stores.
     # Was 1x/week (Monday only) — 2026-04-18 freshness fix.
-    - cron: '0 6 * * 1'  # Monday
-    - cron: '0 6 * * 4'  # Thursday
+    # Minute 23, not 00: on-the-hour crons started 4–11 h late in Aug 2026.
+    - cron: '23 6 * * 1,4'  # Monday + Thursday
   workflow_dispatch:
     inputs:
       limit:
