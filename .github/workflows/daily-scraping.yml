@@ -2,15 +2,21 @@ name: Price Scraping (Mon/Thu)
 
 on:
   # All stores (Aldi, SuperValu, Lidl) run 2x per week — Monday + Thursday.
-  # Each scrape day has 3 batches: 4AM, 6AM, 8AM UTC — 700 products on the
-  # first batch, then retry-mode for any failed products on 6AM + 8AM runs.
-  # Promotions scan: Sundays 8AM UTC.
+  # Each scrape day has 3 batches (04:17, 06:17, 08:17 UTC), all in retry
+  # mode: batch 1 sees every alias as pending, batches 2/3 only the stragglers.
+  # Promotions scan: Sundays 08:17 UTC.
   # Cost-capped at 2x/week per request (was 3x Mon/Wed/Fri) — 2026-04-18.
+  # Minute 17 (not 00): GitHub's scheduler is most congested on the hour;
+  # in late Aug 2026 the :00 crons started 4–11 h late. The run mode is
+  # derived from github.event.schedule (scripts/resolve_run_mode.sh), so a
+  # late start no longer changes what the run does. If you edit a cron here,
+  # keep the day-of-week field (0 = Sunday promotions) in sync with the script
+  # and the summary job below.
   schedule:
-    - cron: '0 4 * * 1,4'  # Batch 1 — main run (Mon + Thu 4AM UTC = 5AM Irish)
-    - cron: '0 6 * * 1,4'  # Batch 2 — retry mode (Mon + Thu 6AM UTC)
-    - cron: '0 8 * * 1,4'  # Batch 3 — retry mode (Mon + Thu 8AM UTC)
-    - cron: '0 8 * * 0'    # Weekly promotions scan (Sundays)
+    - cron: '17 4 * * 1,4'  # Batch 1 — main pass (Mon + Thu)
+    - cron: '17 6 * * 1,4'  # Batch 2 — retry (Mon + Thu)
+    - cron: '17 8 * * 1,4'  # Batch 3 — retry (Mon + Thu)
+    - cron: '17 8 * * 0'    # Weekly promotions scan (Sundays)
 
   # Allow manual triggering for testing
   workflow_dispatch:
@@ -128,6 +134,7 @@ jobs:
           STORE_NAME: ${{ matrix.store }}
           MAX_PRODUCTS: ${{ github.event.inputs.max_products || '700' }}
           MANUAL_PROMOTIONS_MODE: ${{ github.event.inputs.promotions_mode || 'false' }}
+          CRON_SCHEDULE: ${{ github.event.schedule }}
 
           # Country Configuration (for multi-country scraping)
           SCRAPER_COUNTRY: 'IE'
@@ -138,24 +145,16 @@ jobs:
           echo "📊 Max products: $MAX_PRODUCTS"
           echo "🕐 Started at: $(date)"
 
-          # Detect execution mode based on time, day, and manual inputs
-          CURRENT_HOUR=$(date -u +%H)
-          CURRENT_DAY=$(date -u +%u)  # 1=Monday, 7=Sunday
-
-          # Always use --retry-mode for scheduled runs (only processes products not yet scraped today)
-          # Manual runs without retry-mode will process all products from the beginning
-          if [ "$MANUAL_PROMOTIONS_MODE" = "true" ]; then
-            echo "🎯 PROMOTIONS MODE: Manual promotions scan triggered"
+          # Mode comes from the cron that fired (github.event.schedule), not
+          # from the clock: GitHub delays these crons by hours, so `date`-based
+          # checks picked the wrong mode. See scripts/resolve_run_mode.sh.
+          RUN_TYPE=$(bash scripts/resolve_run_mode.sh "$GITHUB_EVENT_NAME" "$CRON_SCHEDULE" "$MANUAL_PROMOTIONS_MODE")
+          if [ "$RUN_TYPE" = "promotions" ]; then
+            echo "🎯 PROMOTIONS MODE: weekly promotions scan (trigger: $GITHUB_EVENT_NAME, cron: ${CRON_SCHEDULE:-manual})"
             EXTRA_FLAGS="--promotions-mode"
-            RUN_TYPE="promotions"
-          elif [ "$CURRENT_DAY" -eq "7" ]; then
-            echo "🎯 PROMOTIONS MODE: Weekly comprehensive promotions scan (Sundays)"
-            EXTRA_FLAGS="--promotions-mode"
-            RUN_TYPE="promotions"
           else
-            echo "🔄 RETRY MODE: Processing products not yet scraped today"
+            echo "🔄 RETRY MODE: products not yet scraped today (trigger: $GITHUB_EVENT_NAME, cron: ${CRON_SCHEDULE:-manual})"
             EXTRA_FLAGS="--retry-mode"
-            RUN_TYPE="retry"
           fi
 
           # Expose RUN_TYPE to the validation step so it can relax the
@@ -212,54 +211,28 @@ jobs:
     
     steps:
       - name: 📊 Generate Summary
+        env:
+          CRON_SCHEDULE: ${{ github.event.schedule }}
         run: |
-          echo "🎯 Daily Scraping Summary - $(date)"
+          echo "🎯 Scraping Summary - $(date -u)"
           echo "=================================="
-          
-          # Check results from matrix jobs
+          echo "Trigger: ${{ github.event_name }} (cron: ${CRON_SCHEDULE:-manual})"
+          # Keep these cases in sync with the schedule block at the top.
+          case "$CRON_SCHEDULE" in
+            "17 8 * * 0")   echo "Run: weekly promotions scan (Sunday)" ;;
+            "17 4 * * 1,4") echo "Run: batch 1 of 3 — main pass in retry mode (every alias is pending at day start)" ;;
+            "17 6 * * 1,4") echo "Run: batch 2 of 3 — retry of batch-1 failures" ;;
+            "17 8 * * 1,4") echo "Run: batch 3 of 3 — final retry" ;;
+            *)              echo "Run: manual dispatch" ;;
+          esac
+          echo "Stores: Aldi, SuperValu, Lidl (Tesco and Dunnes run in the Apify workflows)"
+          echo ""
           if [[ "${{ needs.scrape-prices.result }}" == "success" ]]; then
             echo "✅ All stores completed successfully"
           elif [[ "${{ needs.scrape-prices.result }}" == "failure" ]]; then
             echo "❌ Some stores failed - check individual job logs"
           else
             echo "⚠️ Mixed results - check individual job logs"
-          fi
-          
-          echo ""
-
-          # Determine run type for summary
-          CURRENT_HOUR=$(date -u +%H)
-          CURRENT_DAY=$(date -u +%u)  # 1=Monday, 7=Sunday
-
-          # Check execution type and provide appropriate summary
-          if echo "${{ needs.scrape-prices.outputs.run_type || '' }}" | grep -q "promotions" || [ "$CURRENT_DAY" -eq "7" ] && [ "$CURRENT_HOUR" -eq "8" ]; then
-            echo "📈 Expected Results (PROMOTIONS MODE):"
-            echo "• Comprehensive promotions scan for all stores"
-            echo "• Captures Clubcard prices, multi-buy deals, discounts"
-            echo "• Updates promotion_type, promotion_text, original_price fields"
-            echo "• Tesco: Enhanced Clubcard price detection"
-            echo "• All stores: Full promotional metadata capture"
-            echo "• Weekly promotions database refresh"
-          elif [ "$CURRENT_HOUR" -eq "6" ]; then
-            echo "📈 Expected Results (EARLY RETRY MODE):"
-            echo "• Quick retry of products that failed in 5:00 AM run"
-            echo "• Catches temporary failures (anti-bot, timeouts, network issues)"
-            echo "• Typical early retry success rate: 70-85%"
-            echo "• Remaining failures will be retried at 14:00 UTC"
-          elif [ "$CURRENT_HOUR" -ge "14" ]; then
-            echo "📈 Expected Results (FINAL RETRY MODE):"
-            echo "• Final attempt for products that failed in morning and early retry"
-            echo "• Processes most stubborn failures with fresh sessions"
-            echo "• Typical final retry success rate: 50-70%"
-            echo "• Combined daily success rate target: 98%+"
-          else
-            echo "📈 Expected Results (NORMAL MODE):"
-            echo "• Aldi: ~700 products per run"
-            echo "• SuperValu: ~700 products per run"
-            echo "• Lidl: ~700 products per run"
-            echo "• Schedule: Mon/Wed/Fri — 3 batches at 4AM, 6AM, 8AM UTC"
-            echo "• NOTE: Dunnes/Tesco disabled (anti-bot blocks GitHub IPs)"
-            echo "• Failed products retried in batch 2 (6AM) and batch 3 (8AM)"
           fi
           echo ""
           echo "🔗 Check results at: https://www.mastermarketapp.com/products"

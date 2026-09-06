@@ -5,8 +5,9 @@ name: Discover Lidl Aliases (Weekly)
 # writes to DB or API — VP Data reviews the artifact and creates aliases
 # manually (or via a follow-up tool).
 #
-# Schedule: Sundays 10:00 UTC — after the 08:00 UTC promotions scan in
-# daily-scraping.yml so the candidate set has fresh signal.
+# Schedule: Sundays 10:17 UTC — after the 08:17 UTC promotions scan in
+# daily-scraping.yml so the candidate set has fresh signal. (Minute 17, not
+# 00: on-the-hour crons started hours late in Aug 2026.)
 #
 # CLI: see `python discover_lidl_aliases.py --help`. The v3 script only
 # accepts `--pool {aldi-cross-list,lidl-own-brand}`. Threshold/limit/verify
@@ -14,7 +15,7 @@ name: Discover Lidl Aliases (Weekly)
 
 on:
   schedule:
-    - cron: '0 10 * * 0'  # Sundays 10:00 UTC
+    - cron: '17 10 * * 0'  # Sundays 10:17 UTC
   workflow_dispatch:
 
 jobs:

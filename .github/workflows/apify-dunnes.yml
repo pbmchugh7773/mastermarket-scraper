@@ -3,11 +3,11 @@ name: Apify Dunnes Scraper
 on:
   schedule:
     # Aligned with other stores on Mon + Thu (was Tue + Fri) — 2026-04-18.
-    - cron: '0 6 * * 1'  # Monday — main run
-    - cron: '0 6 * * 4'  # Thursday — main run
-    # Retry runs 2 hours later (8:00 AM UTC) for failed/pending products
-    - cron: '0 8 * * 1'  # Monday — retry
-    - cron: '0 8 * * 4'  # Thursday — retry
+    # Minute 23, not 00: on-the-hour crons started 4–11 h late in Aug 2026.
+    # Both runs use PENDING mode (see the run step), so the mode no longer
+    # depends on the start hour.
+    - cron: '23 6 * * 1,4'  # Mon + Thu — first pass
+    - cron: '23 8 * * 1,4'  # Mon + Thu — second pass over what is still pending
   workflow_dispatch:
     inputs:
       limit:
@@ -61,14 +61,17 @@ jobs:
         run: |
           ARGS=""
 
-          # Default: only pending products
-          # Use --all to scrape all products (scheduled 6 AM runs or manual with all_products=true)
-          CURRENT_HOUR=$(date +%H)
-          if [ "$CURRENT_HOUR" == "06" ] || [ "${{ github.event.inputs.all_products }}" == "true" ]; then
+          # Scheduled runs always use PENDING mode. With a per-run alias cap,
+          # ALL mode re-fetches the same first N aliases every time, while
+          # pending mode rotates through everything not yet scraped today —
+          # so the 06:23 and 08:23 runs cover different products. (Until
+          # 2026-09-06 ALL mode was picked by `date +%H == 06`, which the
+          # delayed scheduler never satisfied anyway.) ALL is manual-only.
+          if [ "${{ github.event.inputs.all_products }}" == "true" ]; then
             ARGS="$ARGS --all"
-            echo "Running in ALL MODE (all products)"
+            echo "Running in ALL MODE (manual all_products=true)"
           else
-            echo "Running in PENDING MODE (only pending/failed products)"
+            echo "Running in PENDING MODE (only pending/failed products; cron: ${{ github.event.schedule || 'manual' }})"
           fi
 
           # Add limit if specified
