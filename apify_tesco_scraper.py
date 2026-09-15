@@ -47,7 +47,10 @@ except ImportError:
 APIFY_TOKEN = os.getenv('APIFY_API_TOKEN')
 API_URL = os.getenv('API_URL', 'https://api.mastermarketapp.com')
 SCRAPER_USERNAME = os.getenv('SCRAPER_USERNAME', 'pricerIE@mastermarket.com')
-SCRAPER_PASSWORD = os.getenv('SCRAPER_PASSWORD', 'pricerIE')
+SCRAPER_PASSWORD = os.getenv('SCRAPER_PASSWORD', '')
+if not SCRAPER_PASSWORD:
+    print("⚠️  SCRAPER_PASSWORD is not set — backend login will fail "
+          "(no default on purpose: the old one was public and has been rotated)")
 
 # Apify Actor configuration
 ACTOR_ID = 'radeance/tesco-scraper'

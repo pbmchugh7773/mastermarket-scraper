@@ -47,7 +47,10 @@ import requests
 # Configuration
 API_URL = os.getenv('API_URL', 'https://api.mastermarketapp.com')
 USERNAME = os.getenv('SCRAPER_USERNAME', 'pricerIE@mastermarket.com')
-PASSWORD = os.getenv('SCRAPER_PASSWORD', 'pricerIE')
+PASSWORD = os.getenv('SCRAPER_PASSWORD', '')
+if not PASSWORD:
+    print("⚠️  SCRAPER_PASSWORD is not set — backend login will fail "
+          "(no default on purpose: the old one was public and has been rotated)")
 
 OUTPUT_DIR = Path(__file__).parent / 'output' / 'discovery'
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
