@@ -6,6 +6,10 @@ beautifulsoup4==4.12.2
 # HTTP Requests
 requests==2.31.0
 urllib3==2.1.0
+# Decoder for `Content-Encoding: br`. The scrapers send `Accept-Encoding: ...br`;
+# without this urllib3 hands back the compressed body as text (Lidl: 0 prices
+# from 2026-09-06). Pinned by tests/test_http_decoding.py.
+brotli==1.1.0
 
 # Fake User Agents
 fake-useragent==1.4.0
