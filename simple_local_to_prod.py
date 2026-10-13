@@ -97,6 +97,15 @@ PDP_PATTERNS = {
     'dunnes stores': re.compile(r'-\d{6,}\.html', re.IGNORECASE),
 }
 
+# Aldi delisted PDPs come in two shapes: HTTP 200 + rendered "currently not
+# available" banner + empty JSON-LD price, or HTTP 410 + "Page Error" title.
+# Prefixed with "Product removed: " by the caller, which alias_lifecycle
+# classifies as dead-URL ("discontinued"). Pinned by
+# tests/test_aldi_unavailable_detection.py.
+ALDI_UNAVAILABLE_REASON = 'Aldi product page says "currently not available"'
+ALDI_GONE_REASON = 'Aldi product page no longer exists (Page Error, HTTP 410)'
+ALDI_UNAVAILABLE_TEXT = re.compile(r'currently not available', re.IGNORECASE)
+
 
 def _validate_pdp_redirect(store: str, requested_url: str, final_url: str):
     """Return (is_valid, error_message_or_None).
@@ -745,6 +754,49 @@ class SimpleLocalScraper:
                 return str(node).lower()
 
         return page_source.lower()
+
+    def aldi_unavailable_reason(self, page_source: str) -> Optional[str]:
+        """
+        Reason string when an Aldi PDP is a delisted product, else None.
+
+        - HTTP 410 page: "Page Error" title and no JSON-LD Product.
+        - Delisted page: the rendered base-message banner says "currently not
+          available" AND no JSON-LD Product carries a price.
+
+        The banner string also lives in the __NUXT_DATA__ i18n payload of EVERY
+        Aldi page (priced ones included), so a substring check on page_source
+        would retire the whole catalog — only the rendered element counts.
+        JSON-LD `availability` is useless here (delisted pages still say InStock).
+        """
+        try:
+            soup = BeautifulSoup(page_source, 'html.parser')
+        except Exception:
+            return None
+
+        products = []
+        for script in soup.find_all('script', type='application/ld+json'):
+            try:
+                data = json.loads(script.string or '')
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if isinstance(data, dict) and data.get('@type') == 'Product':
+                products.append(data)
+
+        title = soup.title.get_text().strip() if soup.title else ''
+        if title.lower().startswith('page error') and not products:
+            return ALDI_GONE_REASON
+
+        banner = any(
+            ALDI_UNAVAILABLE_TEXT.search(node.get_text())
+            for node in soup.find_all(attrs={'data-test': 'base-message_message'})
+        )
+        if not banner:
+            return None
+        for data in products:
+            offers = data.get('offers') or {}
+            if isinstance(offers, dict) and str(offers.get('price') or '').strip():
+                return None
+        return ALDI_UNAVAILABLE_REASON
 
     def _extract_dunnes_product_scope(self, page_source: str) -> str:
         """
@@ -1675,6 +1727,13 @@ class SimpleLocalScraper:
 
             # Get page source early for promotion detection
             page_source = self.driver.page_source
+
+            # Delisted product: bail before the CSS selectors, each of which
+            # burns the 10s implicit wait on a page that has no price element.
+            unavailable_reason = self.aldi_unavailable_reason(page_source)
+            if unavailable_reason:
+                logger.warning(f"🚫 Aldi product not available: {product_name} — {unavailable_reason}")
+                return (None, {'product_removed': True, 'reason': unavailable_reason})
 
             # Method 1: JSON-LD structured data (fastest)
             scripts = self.driver.find_elements(By.XPATH, "//script[@type='application/ld+json']")
