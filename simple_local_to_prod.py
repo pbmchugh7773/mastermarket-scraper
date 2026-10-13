@@ -71,7 +71,10 @@ def _today() -> date:
 API_URL = os.getenv('API_URL', 'https://api.mastermarketapp.com')
 # API_URL = os.getenv('API_URL', 'http://192.168.1.25:8000')
 USERNAME = os.getenv('SCRAPER_USERNAME', 'pricerIE@mastermarket.com')
-PASSWORD = os.getenv('SCRAPER_PASSWORD', 'pricerIE')
+PASSWORD = os.getenv('SCRAPER_PASSWORD', '')
+if not PASSWORD:
+    print("⚠️  SCRAPER_PASSWORD is not set — backend login will fail "
+          "(no default on purpose: the old one was public and has been rotated)")
 
 # Country and currency configuration (for multi-country scraping)
 COUNTRY = os.getenv('SCRAPER_COUNTRY', 'IE')

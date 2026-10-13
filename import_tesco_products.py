@@ -429,7 +429,10 @@ def main():
 
     # Get credentials from environment
     email = os.environ.get('MASTERMARKET_EMAIL', 'testadmin@mastermarket.com')
-    password = os.environ.get('MASTERMARKET_PASSWORD', 'testadmin123')
+    password = os.environ.get('MASTERMARKET_PASSWORD', '')
+    if not password:
+        print("⚠️  MASTERMARKET_PASSWORD is not set — backend login will fail "
+              "(no default on purpose: the old one was public and has been rotated)")
 
     # Validate JSON file exists
     if not os.path.exists(args.json_file):

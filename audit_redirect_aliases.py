@@ -34,7 +34,10 @@ from simple_local_to_prod import _validate_pdp_redirect, PDP_PATTERNS
 
 API_URL = os.getenv('API_URL', 'https://api.mastermarketapp.com')
 USERNAME = os.getenv('SCRAPER_USERNAME', 'pricerIE@mastermarket.com')
-PASSWORD = os.getenv('SCRAPER_PASSWORD', 'pricerIE')
+PASSWORD = os.getenv('SCRAPER_PASSWORD', '')
+if not PASSWORD:
+    print("⚠️  SCRAPER_PASSWORD is not set — backend login will fail "
+          "(no default on purpose: the old one was public and has been rotated)")
 
 DEFAULT_TIMEOUT = 15
 DEFAULT_RATE_LIMIT_S = 1.0  # gentle on supermarket sites; raise if rate-limited
