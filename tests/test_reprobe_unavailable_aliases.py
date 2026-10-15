@@ -129,7 +129,7 @@ def test_apply_restores_only_aliases_with_a_price_and_clears_their_status():
     assert [r["alias_id"] for r in rows if r["restored"]] == [1]
     assert ("patch", f"{rp.slp.API_URL}/api/product-aliases/1/mark-available") in scraper.calls
     assert sum(1 for m, _ in scraper.calls if m == "patch") == 1
-    assert scraper.statuses == [{"alias_id": 1, "success": True}]
+    assert scraper.statuses == [{"alias_id": 1, "success": True, "price": 2.79}]
 
 
 def test_only_ids_restricts_the_probe():
@@ -145,7 +145,36 @@ def test_failed_mark_available_is_not_counted_as_restored():
     scraper._authed_request = lambda method, url, **kw: _Resp(200, aliases) if method == "get" else _Resp(500, text="boom")
     rows = rp.reprobe(scraper, ["SuperValu"], apply=True, delay=0)
     assert not any(r["restored"] for r in rows)
-    assert scraper.statuses == []
+
+
+def test_status_is_cleared_before_mark_available():
+    # A timeout the server did process must not leave the alias back in the
+    # pool with its old dead-URL streak; clearing first makes a retry safe.
+    aliases, pages = _world()
+    scraper = _FakeScraper(aliases, pages)
+    order = []
+    scraper.update_scraping_status = lambda **kw: order.append("status") or True
+    real = scraper._authed_request
+    scraper._authed_request = lambda method, url, **kw: order.append(method) or real(method, url, **kw)
+    rp.reprobe(scraper, ["SuperValu"], apply=True, delay=0)
+    assert order == ["get", "status", "patch"]
+
+
+def test_a_timeout_on_one_alias_does_not_abort_the_run():
+    aliases, pages = _world()
+    aliases.append(_retired(7))
+    pages[aliases[-1]["scraper_url"]] = 3.50
+    scraper = _FakeScraper(aliases, pages)
+    real = scraper._authed_request
+
+    def flaky(method, url, **kw):
+        if method == "patch" and url.endswith("/1/mark-available"):
+            raise TimeoutError("read timed out")
+        return real(method, url, **kw)
+
+    scraper._authed_request = flaky
+    rows = rp.reprobe(scraper, ["SuperValu"], apply=True, delay=0)
+    assert {r["alias_id"]: r["restored"] for r in rows if r["verdict"] == "alive"} == {1: False, 7: True}
 
 
 def test_unknown_store_is_rejected():

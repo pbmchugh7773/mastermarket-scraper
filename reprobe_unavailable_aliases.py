@@ -95,15 +95,27 @@ def probe(scraper: slp.SimpleLocalScraper, store: str, alias: Dict) -> Tuple[str
     return "no_price", None
 
 
-def restore(scraper: slp.SimpleLocalScraper, alias_id: int) -> bool:
-    response = scraper._authed_request(
-        "patch", f"{slp.API_URL}/api/product-aliases/{alias_id}/mark-available", timeout=30
-    )
+def restore(scraper: slp.SimpleLocalScraper, alias_id: int, price: float) -> bool:
+    """
+    Clear the dead-URL status first, then mark-available. In that order a
+    failure (or a timeout the server did process) leaves the alias still
+    unavailable with a clean status, so the next run simply retries it. The
+    other order could leave it back in the pool with the old streak, which
+    re-retires it on the first blip.
+    """
+    try:
+        if not scraper.update_scraping_status(alias_id=alias_id, success=True, price=price):
+            logger.warning(f"⚠️ alias {alias_id}: could not clear its dead-URL status — not restored")
+            return False
+        response = scraper._authed_request(
+            "patch", f"{slp.API_URL}/api/product-aliases/{alias_id}/mark-available", timeout=60
+        )
+    except Exception as e:  # noqa: BLE001 — one alias must never abort the run
+        logger.error(f"❌ alias {alias_id}: restore error ({e}) — will be retried next run")
+        return False
     if response.status_code != 200:
         logger.warning(f"⚠️ mark-available failed for alias {alias_id}: {response.status_code} {response.text[:120]}")
         return False
-    if not scraper.update_scraping_status(alias_id=alias_id, success=True):
-        logger.warning(f"⚠️ alias {alias_id} restored but its old dead-URL status was not cleared")
     return True
 
 
@@ -143,8 +155,12 @@ def reprobe(
                 continue
 
         for i, alias in enumerate(candidates, 1):
-            verdict, price = probe(scraper, store, alias)
-            restored = bool(apply and verdict == "alive" and restore(scraper, alias["id"]))
+            try:
+                verdict, price = probe(scraper, store, alias)
+            except Exception as e:  # noqa: BLE001 — one alias must never abort the run
+                logger.error(f"❌ alias {alias['id']}: probe error ({e})")
+                verdict, price = "error", None
+            restored = bool(apply and verdict == "alive" and restore(scraper, alias["id"], price))
             rows.append({
                 "alias_id": alias["id"],
                 "store": store,
