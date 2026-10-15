@@ -1,0 +1,112 @@
+name: Re-probe Retired Aliases (Weekly)
+
+# Re-checks the aliases alias_lifecycle.py retired (is_unavailable with an
+# automatic preset) and restores the ones whose store page has a price again.
+# On 2026-10-14, 115 of 349 retired SuperValu aliases were back on sale:
+# retirement hides prices, so without this it is a permanent loss.
+#
+# Schedule: Wednesdays 09:17 UTC — a non-scrape day, so the Thursday main
+# pass uploads fresh prices for whatever this restores. (Minute 17, not 00:
+# on-the-hour crons started hours late in Aug 2026.)
+#
+# Scheduled runs restore (--apply). Manual runs are proposal-only unless the
+# `apply` input is ticked. The CSV of every probe is uploaded as an artifact.
+
+on:
+  schedule:
+    - cron: '17 9 * * 3'  # Wednesdays 09:17 UTC
+  workflow_dispatch:
+    inputs:
+      stores:
+        description: 'Comma-separated stores (SuperValu, Aldi, Lidl)'
+        required: false
+        default: 'SuperValu,Aldi,Lidl'
+        type: string
+      apply:
+        description: 'Restore aliases that have a price again (unticked = proposal only)'
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  reprobe:
+    name: Re-probe retired aliases
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+
+    steps:
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: 🐍 Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: 🌐 Install Chrome Browser
+        run: |
+          wget -q -O - https://dl.google.com/linux/linux_signing_key.pub | sudo apt-key add -
+          sudo sh -c 'echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" >> /etc/apt/sources.list.d/google-chrome.list'
+          sudo apt-get update
+          sudo apt-get install -y google-chrome-stable xvfb wget unzip
+
+      - name: 📦 Install Python Dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: 🔧 Setup ChromeDriver
+        run: |
+          echo "CHROME_BIN=/usr/bin/google-chrome" >> $GITHUB_ENV
+          pip install webdriver-manager
+          python3 install_chromedriver.py
+          sudo mv /tmp/chromedriver /usr/local/bin/chromedriver
+          google-chrome --version
+          chromedriver --version
+
+      - name: 🔁 Re-probe
+        env:
+          API_URL: ${{ secrets.API_URL }}
+          SCRAPER_USERNAME: ${{ secrets.SCRAPER_USERNAME }}
+          SCRAPER_PASSWORD: ${{ secrets.SCRAPER_PASSWORD }}
+          CHROME_BIN: /usr/bin/google-chrome
+          STORES: ${{ github.event.inputs.stores || 'SuperValu,Aldi,Lidl' }}
+          # Scheduled runs restore; manual runs only when the box is ticked.
+          APPLY: ${{ github.event_name == 'schedule' || github.event.inputs.apply == 'true' }}
+        run: |
+          set -o pipefail
+          ARGS="--stores $STORES --out reprobe_results.csv"
+          if [ "$APPLY" = "true" ]; then ARGS="$ARGS --apply"; fi
+          echo "▶ python reprobe_unavailable_aliases.py $ARGS"
+          python reprobe_unavailable_aliases.py $ARGS 2>&1 | tee reprobe.log
+
+      - name: 📤 Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reprobe-${{ github.run_number }}
+          path: |
+            reprobe_results.csv
+            reprobe.log
+          retention-days: 30
+          if-no-files-found: warn
+
+  notify-failure:
+    name: Alert on failure
+    needs: [reprobe]
+    if: failure()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Open or update the scraper-alert issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          bash scripts/notify_failure.sh "${{ github.workflow }}" \
+            "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            "Weekly re-probe of retired aliases failed. Read the 'Re-probe' step output."

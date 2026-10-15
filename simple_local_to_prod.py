@@ -40,7 +40,7 @@ import json
 import logging
 import requests
 
-from alias_lifecycle import should_mark_unavailable
+from alias_lifecycle import annotate_dead_streak, should_mark_unavailable
 import re
 import os
 from datetime import date, datetime
@@ -3388,11 +3388,22 @@ class SimpleLocalScraper:
             logger.error(f"❌ Error getting pending aliases: {e}")
             return []
 
+    def _report_failure(self, alias: Dict, error_message: str) -> None:
+        """
+        Record a failed attempt on the alias and run the dead-alias lifecycle.
+        Dead-URL messages carry their streak start ("(dead since …)") so the
+        next attempt can tell how long the alias has been dead.
+        """
+        message = annotate_dead_streak(alias, error_message, _today())
+        self.update_scraping_status(alias_id=alias['id'], success=False, error_message=message)
+        self._maybe_mark_unavailable(alias, message)
+
     def _maybe_mark_unavailable(self, alias: Dict, error_message: str) -> bool:
         """
-        Dead-alias lifecycle: if this alias failed with a dead-URL reason on an
-        earlier scrape day and failed with a dead-URL reason again now, mark it
-        unavailable so it leaves the pending queue. See alias_lifecycle.py.
+        Dead-alias lifecycle: if this alias has been dead on every attempt for
+        at least MIN_DEAD_STREAK_DAYS and is dead again now, mark it unavailable
+        so it leaves the pending queue. `alias` is the state from before this
+        attempt. See alias_lifecycle.py.
         """
         if not getattr(self, 'auto_mark_unavailable', True):
             return False
@@ -3645,12 +3656,7 @@ class SimpleLocalScraper:
                 logger.warning(
                     f"🚫 REDIRECT: {alias.get('alias_name', '?')} — {self._last_redirect_error}"
                 )
-                self.update_scraping_status(
-                    alias_id=alias['id'],
-                    success=False,
-                    error_message=self._last_redirect_error,
-                )
-                self._maybe_mark_unavailable(alias, self._last_redirect_error)
+                self._report_failure(alias, self._last_redirect_error)
                 results.append({
                     'alias_id': alias['id'],
                     'name': alias['alias_name'],
@@ -3667,12 +3673,7 @@ class SimpleLocalScraper:
                 logger.warning(f"🚫 PRODUCT REMOVED: {alias.get('alias_name', '?')} — {reason}")
 
                 # Always update alias status so admin dashboard shows the correct error
-                self.update_scraping_status(
-                    alias_id=alias['id'],
-                    success=False,
-                    error_message=f"Product removed: {reason}"
-                )
-                self._maybe_mark_unavailable(alias, f"Product removed: {reason}")
+                self._report_failure(alias, f"Product removed: {reason}")
 
                 results.append({
                     'alias_id': alias['id'],
@@ -3758,8 +3759,10 @@ class SimpleLocalScraper:
                 # Upload price to community_prices (always required for price to be stored)
                 success = self.upload_price(alias, price, store_name, promotion_data=upload_promotion_data)
 
-                # In retry_mode or promotions_mode, also update alias tracking status
-                if retry_mode or (promotions_mode and promotion_type):
+                # In retry_mode or promotions_mode, also update alias tracking status.
+                # Any mode clears a previous failure: a stale failed status would
+                # otherwise carry a dead-URL streak across this success.
+                if retry_mode or (promotions_mode and promotion_type) or alias.get('last_scrape_success') is False:
                     # Update tracking fields on the alias (last_scraped_at, last_scrape_success)
                     self.update_scraping_status(
                         alias_id=alias['id'],
@@ -3786,13 +3789,7 @@ class SimpleLocalScraper:
                 # tell a dead URL from a parse failure.
                 failure_reason = self._last_failure_reason or "Failed to extract price"
                 if retry_mode:
-                    # Update status as failed
-                    self.update_scraping_status(
-                        alias_id=alias['id'],
-                        success=False,
-                        error_message=failure_reason
-                    )
-                    self._maybe_mark_unavailable(alias, failure_reason)
+                    self._report_failure(alias, failure_reason)
 
                 results.append({
                     'alias_id': alias['id'],
