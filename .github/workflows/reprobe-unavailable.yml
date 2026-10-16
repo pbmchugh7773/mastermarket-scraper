@@ -18,9 +18,9 @@ on:
   workflow_dispatch:
     inputs:
       stores:
-        description: 'Comma-separated stores (SuperValu, Aldi, Lidl)'
+        description: 'Comma-separated stores (SuperValu, Aldi, Lidl, Dunnes Stores)'
         required: false
-        default: 'SuperValu,Aldi,Lidl'
+        default: 'SuperValu,Aldi,Lidl,Dunnes Stores'
         type: string
       apply:
         description: 'Restore aliases that have a price again (unticked = proposal only)'
@@ -71,15 +71,16 @@ jobs:
           SCRAPER_USERNAME: ${{ secrets.SCRAPER_USERNAME }}
           SCRAPER_PASSWORD: ${{ secrets.SCRAPER_PASSWORD }}
           CHROME_BIN: /usr/bin/google-chrome
-          STORES: ${{ github.event.inputs.stores || 'SuperValu,Aldi,Lidl' }}
+          STORES: ${{ github.event.inputs.stores || 'SuperValu,Aldi,Lidl,Dunnes Stores' }}
           # Scheduled runs restore; manual runs only when the box is ticked.
           APPLY: ${{ github.event_name == 'schedule' || github.event.inputs.apply == 'true' }}
         run: |
           set -o pipefail
-          ARGS="--stores $STORES --out reprobe_results.csv"
-          if [ "$APPLY" = "true" ]; then ARGS="$ARGS --apply"; fi
-          echo "▶ python reprobe_unavailable_aliases.py $ARGS"
-          python reprobe_unavailable_aliases.py $ARGS 2>&1 | tee reprobe.log
+          # Array, not a string: "Dunnes Stores" contains a space.
+          ARGS=(--stores "$STORES" --out reprobe_results.csv)
+          if [ "$APPLY" = "true" ]; then ARGS+=(--apply); fi
+          echo "▶ python reprobe_unavailable_aliases.py ${ARGS[*]}"
+          python reprobe_unavailable_aliases.py "${ARGS[@]}" 2>&1 | tee reprobe.log
 
       - name: 📤 Upload results
         if: always()

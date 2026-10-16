@@ -19,7 +19,9 @@ The next regular scrape uploads a fresh price. Prices hidden at retirement
 stay hidden; they are stale by then.
 
 'manual_admin' / 'other' retirements are a human's call and never re-probed.
-Tesco and Dunnes are scraped through Apify, so they are not re-probed here.
+Dunnes is checked against its storefront catalogue API (dunnes_catalog.py),
+not scraped: alive = listed again; the next Apify run fetches the sale price.
+Tesco goes through Apify and is not re-probed here.
 
 Proposal-only by default: writes a CSV and changes nothing. --apply restores.
 
@@ -41,10 +43,11 @@ from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 import simple_local_to_prod as slp
 from alias_lifecycle import AUTO_RETIRE_PRESETS
+from dunnes_catalog import catalogue_status, dunnes_sku
 
 logger = logging.getLogger(__name__)
 
-PROBE_STORES = ("SuperValu", "Aldi", "Lidl")
+PROBE_STORES = ("SuperValu", "Aldi", "Lidl", "Dunnes Stores")
 SELENIUM_STORES = ("Aldi",)
 CSV_FIELDS = (
     "alias_id", "store", "product_id", "alias_name", "unavailable_reason",
@@ -81,6 +84,11 @@ def probe(scraper: slp.SimpleLocalScraper, store: str, alias: Dict) -> Tuple[str
         price, promo = scraper.scrape_aldi(url, name)
     elif store == "Lidl":
         price = scraper.scrape_lidl(url, name)
+    elif store == "Dunnes Stores":
+        status = catalogue_status(dunnes_sku(url))
+        if status == "listed":
+            return "alive", None
+        return ("dead (HTTP 404)" if status == "missing" else "error"), None
     else:
         return "unsupported_store", None
 
