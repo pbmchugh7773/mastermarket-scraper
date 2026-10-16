@@ -1,10 +1,13 @@
 """
-Dead-alias lifecycle (2026-09 review, P1):
+Dead-alias lifecycle (2026-09 review, P1; streak rule 2026-10-15):
 
 * scrape failures reach the backend with a specific reason (HTTP 404 instead
   of the generic "Failed to extract price"),
-* an alias that is dead on two different scrape days is marked unavailable
-  automatically via PATCH /api/product-aliases/{id}/mark-unavailable,
+* dead-URL failures carry the start of their streak ("(dead since …)"), and an
+  alias is marked unavailable via PATCH /api/product-aliases/{id}/mark-unavailable
+  only after MIN_DEAD_STREAK_DAYS of dead attempts — "dead on two different
+  days" retired 115 SuperValu products that were only briefly off the shelf,
+* a success in any mode clears a previous failure, so a streak never spans it,
 * get_pending_aliases logs the API's total_pending and never returns the
   same alias twice (the API ignores `offset`, so pages repeat).
 """
@@ -20,7 +23,14 @@ import pytest
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 import simple_local_to_prod as slp  # noqa: E402
-from alias_lifecycle import classify_dead_reason, should_mark_unavailable  # noqa: E402
+from alias_lifecycle import (  # noqa: E402
+    AUTO_RETIRE_PRESETS,
+    MIN_DEAD_STREAK_DAYS,
+    annotate_dead_streak,
+    classify_dead_reason,
+    dead_streak_start,
+    should_mark_unavailable,
+)
 
 
 # --- pure rules ----------------------------------------------------------------
@@ -28,7 +38,9 @@ from alias_lifecycle import classify_dead_reason, should_mark_unavailable  # noq
 @pytest.mark.parametrize("message, preset", [
     ("HTTP 404", "persistent_404"),
     ("HTTP 410", "persistent_404"),
+    ("HTTP 404 (dead since 2026-10-01)", "persistent_404"),
     ("Product removed: Product no longer available on SuperValu online store", "discontinued"),
+    ("Product removed: x (dead since 2026-10-01)", "discontinued"),
     ("Redirected to non-PDP page: https://www.aldi.ie/", "redirected_to_category"),
     ("Failed to extract price", None),
     ("HTTP 503", None),
@@ -39,26 +51,52 @@ def test_classify_dead_reason(message, preset):
     assert classify_dead_reason(message) == preset
 
 
+def test_auto_retire_presets_are_exactly_the_lifecycle_presets():
+    assert AUTO_RETIRE_PRESETS == {"persistent_404", "discontinued", "redirected_to_category"}
+
+
 THU = "2026-09-03T08:33:05+00:00"
-TODAY = date(2026, 9, 7)
+TODAY = date(2026, 9, 10)  # Thursday, one week after THU
 
 
 def _alias(**over):
-    base = {"id": 770, "last_scrape_success": False, "scrape_error_message": "HTTP 404", "last_scraped_at": THU}
+    base = {"id": 770, "last_scrape_success": False, "scrape_error_message": "HTTP 404 (dead since 2026-09-03)", "last_scraped_at": THU}
     base.update(over)
     return base
 
 
-def test_marks_when_dead_on_two_different_days():
+def test_marks_after_a_full_week_of_dead_attempts():
+    assert MIN_DEAD_STREAK_DAYS == 7
     assert should_mark_unavailable(_alias(), "HTTP 404", TODAY) == "persistent_404"
+
+
+def test_streak_start_comes_from_the_message_not_the_last_attempt():
+    # Last attempt was Monday, but the streak began the Thursday before.
+    alias = _alias(last_scraped_at="2026-09-07T05:00:00+00:00")
+    assert should_mark_unavailable(alias, "HTTP 404", TODAY) == "persistent_404"
+
+
+def test_not_after_sunday_then_monday():
+    # The 2026-09 rule retired here: dead Sunday, dead again Monday.
+    alias = _alias(scrape_error_message="Product removed: x (dead since 2026-09-06)",
+                   last_scraped_at="2026-09-06T09:00:00+00:00")
+    assert should_mark_unavailable(alias, "Product removed: x", date(2026, 9, 7)) is None
+
+
+def test_not_one_day_short_of_the_streak():
+    alias = _alias(scrape_error_message="HTTP 404 (dead since 2026-09-04)")
+    assert should_mark_unavailable(alias, "HTTP 404", TODAY) is None
+
+
+def test_legacy_message_falls_back_to_the_last_attempt_day():
+    old = _alias(scrape_error_message="HTTP 404", last_scraped_at="2026-09-03T08:33:05+00:00")
+    recent = _alias(scrape_error_message="HTTP 404", last_scraped_at="2026-09-07T05:00:00+00:00")
+    assert should_mark_unavailable(old, "HTTP 404", TODAY) == "persistent_404"
+    assert should_mark_unavailable(recent, "HTTP 404", TODAY) is None
 
 
 def test_preset_follows_the_current_failure():
     assert should_mark_unavailable(_alias(), "Redirected to non-PDP page: https://x/", TODAY) == "redirected_to_category"
-
-
-def test_not_when_previous_failure_was_today():
-    assert should_mark_unavailable(_alias(last_scraped_at="2026-09-07T04:20:00+00:00"), "HTTP 404", TODAY) is None
 
 
 def test_not_when_previous_attempt_succeeded():
@@ -78,7 +116,34 @@ def test_not_without_tracking_fields():
 
 
 def test_accepts_zulu_timestamps():
-    assert should_mark_unavailable(_alias(last_scraped_at="2026-09-03T08:33:05Z"), "HTTP 404", TODAY) == "persistent_404"
+    alias = _alias(scrape_error_message="HTTP 404", last_scraped_at="2026-09-03T08:33:05Z")
+    assert should_mark_unavailable(alias, "HTTP 404", TODAY) == "persistent_404"
+
+
+def test_dead_streak_start():
+    assert dead_streak_start(_alias()) == date(2026, 9, 3)
+    assert dead_streak_start(_alias(last_scrape_success=True)) is None
+    assert dead_streak_start(_alias(last_scrape_success=None)) is None
+    assert dead_streak_start(_alias(scrape_error_message="Failed to extract price")) is None
+
+
+def test_annotate_starts_a_streak_today():
+    fresh = {"id": 1, "last_scrape_success": True, "scrape_error_message": None, "last_scraped_at": THU}
+    assert annotate_dead_streak(fresh, "HTTP 404", TODAY) == "HTTP 404 (dead since 2026-09-10)"
+
+
+def test_annotate_keeps_the_running_streak_start():
+    assert annotate_dead_streak(_alias(), "Product removed: gone", TODAY) == "Product removed: gone (dead since 2026-09-03)"
+
+
+def test_annotate_does_not_stack_suffixes():
+    msg = "HTTP 404 (dead since 2026-09-03)"
+    assert annotate_dead_streak(_alias(), msg, TODAY) == msg
+
+
+def test_annotate_leaves_other_failures_alone():
+    assert annotate_dead_streak(_alias(), "Failed to extract price", TODAY) == "Failed to extract price"
+    assert annotate_dead_streak(_alias(), None, TODAY) is None
 
 
 # --- scraper integration -------------------------------------------------------
@@ -161,3 +226,52 @@ def test_get_pending_aliases_dedupes_and_logs_total_pending(caplog):
     ids = [a["id"] for a in got]
     assert len(ids) == len(set(ids)) == 1000
     assert "total pending: 1734" in caplog.text
+
+
+# --- scrape_store loop ---------------------------------------------------------
+
+def _loop_scraper(monkeypatch, alias, scrape_result):
+    """Scraper wired for one SuperValu alias; records update-status calls."""
+    scraper = _bare_scraper()
+    scraper.driver = None
+    statuses = []
+    monkeypatch.setattr(scraper, "get_pending_aliases", lambda store, limit: [alias])
+    monkeypatch.setattr(scraper, "get_product_aliases", lambda store, limit, pid=None: [alias])
+    monkeypatch.setattr(scraper, "scrape_supervalu", lambda url, name: scrape_result)
+    monkeypatch.setattr(scraper, "upload_price", lambda *a, **k: True)
+    monkeypatch.setattr(scraper, "update_scraping_status", lambda **kw: statuses.append(kw) or True)
+    monkeypatch.setattr(scraper, "_authed_request", lambda *a, **k: _Resp(200, a[1], {"hidden_prices_count": 0}))
+    monkeypatch.setattr(slp.time, "sleep", lambda s: None)
+    monkeypatch.setattr(slp, "_today", lambda: TODAY)
+    return scraper, statuses
+
+
+def _sv_alias(**over):
+    base = _alias(alias_name="Kenco Rich Coffee", product_id=1270, store_name="SuperValu",
+                  scraper_url="https://shop.supervalu.ie/product/kenco-rich-coffee-100-g-id-1")
+    base.update(over)
+    return base
+
+
+def test_removed_product_is_reported_with_its_streak_start(monkeypatch):
+    fresh = _sv_alias(last_scrape_success=True, scrape_error_message=None)
+    removed = (None, {"product_removed": True, "reason": "Product no longer available on SuperValu online store"})
+    scraper, statuses = _loop_scraper(monkeypatch, fresh, removed)
+    scraper.scrape_store("SuperValu", max_products=1, retry_mode=True)
+    assert statuses == [{
+        "alias_id": 770,
+        "success": False,
+        "error_message": "Product removed: Product no longer available on SuperValu online store (dead since 2026-09-10)",
+    }]
+
+
+def test_success_in_the_main_pass_clears_a_previous_failure(monkeypatch):
+    scraper, statuses = _loop_scraper(monkeypatch, _sv_alias(), (2.79, None))
+    scraper.scrape_store("SuperValu", max_products=1, retry_mode=False)
+    assert [s["success"] for s in statuses] == [True]
+
+
+def test_success_in_the_main_pass_skips_the_status_call_when_nothing_to_clear(monkeypatch):
+    scraper, statuses = _loop_scraper(monkeypatch, _sv_alias(last_scrape_success=True, scrape_error_message=None), (2.79, None))
+    scraper.scrape_store("SuperValu", max_products=1, retry_mode=False)
+    assert statuses == []

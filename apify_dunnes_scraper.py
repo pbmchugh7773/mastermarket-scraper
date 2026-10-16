@@ -34,6 +34,8 @@ import json
 import re
 import requests
 
+from dunnes_catalog import MISSING_MESSAGE, catalogue_status, dunnes_sku
+
 from apify_guards import (
     evaluate_coverage,
     evaluate_credit,
@@ -116,7 +118,8 @@ class ApifyDunnesScraper:
             'prices_failed': 0,
             'prices_skipped': 0,
             'matched_by_url': 0,
-            'promotions_detected': 0
+            'promotions_detected': 0,
+            'not_in_catalogue': 0,
         }
 
     @classmethod
@@ -198,6 +201,54 @@ class ApifyDunnesScraper:
             if self.authenticate_mastermarket():
                 response = self.session.post(url, **kwargs)
         return response
+
+    def retire_missing_alias(self, alias: Dict) -> bool:
+        """
+        Record the 404 and mark the alias unavailable straight away — no 7-day
+        streak here: the Dunnes API 404 is structured and checked at three
+        stores (0 of 134 flipped on re-check), and leaving the alias active
+        means Apify keeps publishing a price nobody can pay. The weekly
+        reprobe_unavailable_aliases.py run restores it if Dunnes relists it.
+        """
+        alias_id = alias.get('id')
+        if not alias_id:
+            return False
+        self.update_scraping_status(alias_id=alias_id, success=False, error_message=MISSING_MESSAGE)
+        if self.dry_run:
+            print(f"  [DRY RUN] Would mark alias {alias_id} unavailable (persistent_404)")
+            return True
+        try:
+            response = self.session.patch(
+                f'{API_URL}/api/product-aliases/{alias_id}/mark-unavailable',
+                json={'reason': 'persistent_404'}, timeout=60,
+            )
+            if response.status_code == 401 and self.authenticate_mastermarket():
+                response = self.session.patch(
+                    f'{API_URL}/api/product-aliases/{alias_id}/mark-unavailable',
+                    json={'reason': 'persistent_404'}, timeout=60,
+                )
+            if response.status_code == 200:
+                hidden = (response.json() or {}).get('hidden_prices_count', 0)
+                print(f"  🪦 Alias {alias_id} ({alias.get('alias_name', '?')}) not in Dunnes catalogue — retired, {hidden} prices hidden")
+                return True
+            print(f"  WARNING: mark-unavailable failed for alias {alias_id}: {response.status_code}")
+        except Exception as e:  # noqa: BLE001 — never abort the batch
+            print(f"  ERROR: mark-unavailable for alias {alias_id}: {e}")
+        return False
+
+    def drop_missing_from_catalogue(self, urls: List[str], aliases_by_url: Dict[str, Dict]) -> List[str]:
+        """URLs still worth sending to Apify; retires the ones Dunnes no longer lists."""
+        kept = []
+        for url in urls:
+            if catalogue_status(dunnes_sku(url)) != 'missing':
+                kept.append(url)
+                continue
+            self.stats['not_in_catalogue'] += 1
+            alias = aliases_by_url.get(url)
+            if alias:
+                self.retire_missing_alias(alias)
+            time.sleep(0.2)
+        return kept
 
     def get_dunnes_aliases(self) -> List[Dict]:
         """Get all Dunnes product aliases with scraper URLs."""
@@ -919,6 +970,7 @@ class ApifyDunnesScraper:
         url_to_product = {}
         dunnes_id_to_product = {}
         url_to_alias_id = {}
+        aliases_by_url = {}
 
         for alias in aliases:
             scraper_url = alias.get('scraper_url')
@@ -926,6 +978,7 @@ class ApifyDunnesScraper:
             alias_id = alias.get('id')
             if scraper_url and product_id:
                 url_to_product[scraper_url] = product_id
+                aliases_by_url[scraper_url] = alias
                 if alias_id:
                     url_to_alias_id[scraper_url] = alias_id
 
@@ -945,6 +998,15 @@ class ApifyDunnesScraper:
         if self.limit and len(urls) > self.limit:
             urls = urls[:self.limit]
             print(f"  Limited to {self.limit} URLs")
+
+        # Catalogue gate (2026-10-16): Apify returns a price even for products
+        # Dunnes no longer sells online. Check the storefront API first.
+        print(f"\n  Checking {len(urls)} products against the Dunnes online catalogue...")
+        urls = self.drop_missing_from_catalogue(urls, aliases_by_url)
+        print(f"  {self.stats['not_in_catalogue']} not in the catalogue (retired, not sent to Apify); {len(urls)} remain")
+        if not urls:
+            print("  Nothing left to scrape after the catalogue check")
+            return self.stats
 
         # Step 3: Run Apify scraper
         print(f"\n[3/4] Running Apify scraper...")
@@ -1056,6 +1118,7 @@ class ApifyDunnesScraper:
         print(f"  Prices uploaded:      {self.stats['prices_uploaded']}")
         print(f"  Prices failed:        {self.stats['prices_failed']}")
         print(f"  Prices skipped:       {self.stats['prices_skipped']}")
+        print(f"  Not in catalogue:     {self.stats['not_in_catalogue']} (retired, not sent to Apify)")
         if self.stats.get('urls_filtered'):
             print(f"  URLs filtered:        {self.stats['urls_filtered']}")
         print(f"  Elapsed time:         {elapsed:.1f} seconds")
